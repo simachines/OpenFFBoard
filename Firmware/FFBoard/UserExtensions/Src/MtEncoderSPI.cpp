@@ -23,7 +23,7 @@ std::array<uint8_t,256> MtEncoderSPI::tableCRC __attribute__((section (".ccmram"
 
 MtEncoderSPI::MtEncoderSPI() : SPIDevice(ENCODER_SPI_PORT,ENCODER_SPI_PORT.getFreeCsPins()[0]), CommandHandler("mtenc",CLSID_ENCODER_MTSPI,0),cpp_freertos::Thread("MTENC",256,42) {
 	MtEncoderSPI::inUse = true;
-	this->spiConfig.peripheral.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_4; // 4 = 10MHz 8 = 5MHz
+	this->spiConfig.peripheral.BaudRatePrescaler = spiPort.getClosestPrescaler(10e6).first; // 10MHz max
 	this->spiConfig.peripheral.FirstBit = SPI_FIRSTBIT_MSB;
 	this->spiConfig.peripheral.CLKPhase = SPI_PHASE_2EDGE;
 	this->spiConfig.peripheral.CLKPolarity = SPI_POLARITY_HIGH;
@@ -32,7 +32,7 @@ MtEncoderSPI::MtEncoderSPI() : SPIDevice(ENCODER_SPI_PORT,ENCODER_SPI_PORT.getFr
 	//Init CRC-8 table
 	makeCrcTable(tableCRC,POLY,8); // Mt6825, Poly X8+X2+X (+1)
 
-	restoreFlash();
+	restoreFlash(); // Also configures SPI port
 	spiPort.reserveCsPin(this->spiConfig.cs);
 
 	CommandHandler::registerCommands();
@@ -40,6 +40,9 @@ MtEncoderSPI::MtEncoderSPI() : SPIDevice(ENCODER_SPI_PORT,ENCODER_SPI_PORT.getFr
 	registerCommand("pos", MtEncoderSPI_commands::pos, "Position",CMDFLAG_GET | CMDFLAG_SET);
 	registerCommand("errors", MtEncoderSPI_commands::errors, "Parity error count",CMDFLAG_GET);
 	registerCommand("mode", MtEncoderSPI_commands::mode, "Encoder mode (MT6825=0;MT6835=1)",CMDFLAG_GET | CMDFLAG_SET | CMDFLAG_INFOSTRING);
+	registerCommand("speed", MtEncoderSPI_commands::speed, "SPI speed preset",CMDFLAG_GET | CMDFLAG_SET | CMDFLAG_INFOSTRING);
+	registerCommand("reg", MtEncoderSPI_commands::reg, "Read/Write register",CMDFLAG_GETADR | CMDFLAG_SETADR | CMDFLAG_DEBUG);
+	registerCommand("save", MtEncoderSPI_commands::save, "Save to memory",CMDFLAG_GET | CMDFLAG_DEBUG);
 	this->Start();
 }
 
@@ -49,19 +52,32 @@ MtEncoderSPI::~MtEncoderSPI() {
 }
 
 void MtEncoderSPI::restoreFlash(){
+
 	uint16_t conf_int = Flash_ReadDefault(ADR_MTENC_CONF1, 0);
-	offset = Flash_ReadDefault(ADR_MTENC_OFS, 0) << 2;
-	uint8_t cspin = conf_int & 0xF;
+
+	uint8_t cspin = conf_int & 0x3;
 	MtEncoderSPI_mode mode = static_cast<MtEncoderSPI_mode>(conf_int >> 8);
+
+	uint8_t offsetShift = 2;
+	if(mode == MtEncoderSPI_mode::mt6835){
+		offsetShift = 5;
+	}
+	offset = Flash_ReadDefault(ADR_MTENC_OFS, 0) << offsetShift;
 	setMode(mode);
 	setCsPin(cspin);
+	setSpiSpeed((conf_int >> 2) & 0x3);
 }
 
 void MtEncoderSPI::saveFlash(){
-	uint16_t conf_int = this->cspin & 0xF;
+	uint8_t offsetShift = 2;
+	if(mode == MtEncoderSPI_mode::mt6835){
+		offsetShift = 5;
+	}
+	uint16_t conf_int = this->cspin & 0x3;
+	conf_int |= (this->spiSpeedPreset & 0x3) << 2;
 	conf_int |= ((uint8_t)mode & 0xf) << 8;
 	Flash_Write(ADR_MTENC_CONF1, conf_int);
-	Flash_Write(ADR_MTENC_OFS, offset >> 2);
+	Flash_Write(ADR_MTENC_OFS, offset >> offsetShift);
 }
 
 
@@ -86,6 +102,7 @@ void MtEncoderSPI::Run(){
 		}else{
 			errors++;
 		}
+		lastUpdateTick = HAL_GetTick();
 		waitForUpdateSem.Give();
 		updateInProgress = false;
 	}
@@ -114,13 +131,13 @@ uint8_t MtEncoderSPI::readSpi(uint16_t addr){
 		uint8_t txbuf[2] = {(uint8_t)(addr | 0x80),0};
 		uint8_t rxbuf[2] = {0,0};
 		spiPort.transmitReceive(txbuf, rxbuf, 2, this,100);
+		return rxbuf[1];
 	}else if(mode == MtEncoderSPI_mode::mt6835){
 		uint8_t txbuf[3] = {(uint8_t)((addr & 0xf00) | 0x30),(uint8_t)(addr & 0xff),0};
 		uint8_t rxbuf[3] = {0,0,0};
 		spiPort.transmitReceive(txbuf, rxbuf, 3, this,100);
+		return rxbuf[2];
 	}
-
-	return rxbuf[1];
 }
 
 void MtEncoderSPI::writeSpi(uint16_t addr,uint8_t data){
@@ -132,6 +149,22 @@ void MtEncoderSPI::writeSpi(uint16_t addr,uint8_t data){
 		spiPort.transmit(txbuf, 3, this,100);
 	}
 
+}
+
+/**
+ * Saves current configuration to permanent storage
+ */
+bool MtEncoderSPI::saveEeprom(){
+	if(mode != MtEncoderSPI_mode::mt6835){
+		return false;
+	}
+	if(mode == MtEncoderSPI_mode::mt6835){
+		uint8_t txbuf[3] = {0xC0,0x00,0x00};
+		uint8_t rxbuf[3] = {0,0,0};
+		spiPort.transmitReceive(txbuf, rxbuf, 3, this,100);
+		return rxbuf[2] == 0x55;
+	}
+	return false;
 }
 
 void MtEncoderSPI::setPos(int32_t pos){
@@ -153,8 +186,6 @@ void MtEncoderSPI::spiTxRxCompleted(SPIPort* port){
  * Reads the angle and diagnostic registers in burst mode
  */
 void MtEncoderSPI::updateAngleStatus(){
-
-
 
 	if(mode == MtEncoderSPI_mode::mt6825){
 		uint8_t txbufNew[5] = {0x03 | 0x80,0,0,0,0};
@@ -234,7 +265,8 @@ int32_t MtEncoderSPI::getPosAbs(){
 	}
 	updateInProgress = true;
 	requestNewDataSem.Give(); // Start transfer
-	waitForUpdateSem.Take(10); // Wait a bit
+	if(HAL_GetTick() - lastUpdateTick > waitThresh)
+		waitForUpdateSem.Take(waitThresh); // Wait a bit
 
 	return curPos;
 }
@@ -260,6 +292,15 @@ void MtEncoderSPI::setMode(MtEncoderSPI::MtEncoderSPI_mode mode){
 	this->errors = 0;
 	this->nomag = false;
 	this->overspeed = false;
+}
+
+void MtEncoderSPI::setSpiSpeed(uint8_t preset){
+	if(preset == spiSpeedPreset){
+		return; // Ignore if no change
+	}
+	spiSpeedPreset = clip<uint8_t,uint8_t>(preset,0,spispeeds.size());
+	this->spiConfig.peripheral.BaudRatePrescaler = spiPort.getClosestPrescaler(spispeeds[spiSpeedPreset]).first;
+	initSPI();
 }
 
 
@@ -298,6 +339,40 @@ CommandStatus MtEncoderSPI::command(const ParsedCommand& cmd,std::vector<Command
 			return CommandStatus::ERR;
 		}
 		break;
+
+	case MtEncoderSPI_commands::speed:
+	{
+		if(cmd.type == CMDtype::get){
+			replies.emplace_back(spiSpeedPreset);
+		}else if(cmd.type == CMDtype::set){
+			setSpiSpeed(cmd.val);
+		}else if(cmd.type == CMDtype::info){
+			for(uint8_t i = 0; i<spispeeds.size();i++){
+				replies.emplace_back(std::to_string(this->spiPort.getClosestPrescaler(spispeeds[i]).second)  + ":" + std::to_string(i)+"\n");
+			}
+		}else{
+			return CommandStatus::ERR;
+		}
+		break;
+	}
+	case MtEncoderSPI_commands::reg:
+	{
+		if(cmd.type == CMDtype::getat){
+			replies.emplace_back(readSpi(cmd.adr));
+		}else if(cmd.type == CMDtype::setat){
+			writeSpi(cmd.adr, cmd.val);
+		}else{
+			return CommandStatus::ERR;
+		}
+		break;
+	}
+	case MtEncoderSPI_commands::save:
+	{
+		if(cmd.type == CMDtype::get){
+			replies.emplace_back(saveEeprom() ? 1 : 0);
+		}
+		break;
+	}
 	default:
 		return CommandStatus::NOT_FOUND;
 	}

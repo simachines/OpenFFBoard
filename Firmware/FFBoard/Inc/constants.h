@@ -8,7 +8,7 @@
  * For more settings see target_constants.h in a target specific folder
  */
 
-static const uint8_t SW_VERSION_INT[3] = {1,16,5}; // Version as array. 8 bit each!
+static const uint8_t SW_VERSION_INT[3] = {1,17,0}; // Version as array. 8 bit each!
 #ifndef MAX_AXIS
 #define MAX_AXIS 2 // ONLY USE 2 for now else screws HID Reports
 #endif
@@ -31,9 +31,17 @@ static const uint8_t SW_VERSION_INT[3] = {1,16,5}; // Version as array. 8 bit ea
 
 #ifdef FFBWHEEL
 #ifdef FFBWHEEL_USE_1AXIS_DESC
+#ifdef HIDAXISRES_USE_32B_DESC
+#define AXIS1_FFB_HID_DESC_32B
+#else
 #define AXIS1_FFB_HID_DESC
+#endif
+#else
+#ifdef HIDAXISRES_USE_32B_DESC
+#define AXIS2_FFB_HID_DESC_32B
 #else
 #define AXIS2_FFB_HID_DESC
+#endif
 #endif
 #endif
 
@@ -104,7 +112,7 @@ static const uint8_t SW_VERSION_INT[3] = {1,16,5}; // Version as array. 8 bit ea
 #define SIGNATURE
 #endif
 
-#if defined(FLASH_OTP_BASE) && defined(FLASH_OTP_END)
+#if (defined(FLASH_OTP_BASE) && defined(FLASH_OTP_END)) || (defined(I2C_EEPROM_OTP_ADR) && defined(I2C_PORT_EEPROM))
 #define OTPMEMORY
 #endif
 

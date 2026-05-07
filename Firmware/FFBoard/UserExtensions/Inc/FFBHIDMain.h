@@ -33,13 +33,17 @@
 #include "SelectableInputs.h"
 #include "thread.hpp"
 
-class FFBHIDMain: public FFBoardMain, public cpp_freertos::Thread, PersistentStorage,ExtiHandler,public UsbHidHandler, ErrorHandler, SelectableInputs{
+class FFBHIDMain: public FFBoardMain, public cpp_freertos::Thread, PersistentStorage,ExtiHandler,public UsbHidHandler, ErrorHandler, SelectableInputs
+#ifdef TIM_FFB
+, TimerHandler // Adds timer handler
+#endif
+{
 	enum class FFBWheel_commands : uint32_t{
 		ffbactive,axes,btntypes,lsbtn,addbtn,aintypes,lsain,addain,hidrate,hidsendspd,estop,cfrate
 	};
 
 public:
-	FFBHIDMain(uint8_t axisCount);
+	FFBHIDMain(uint8_t axisCount,bool hidAxis32b = false);
 	virtual ~FFBHIDMain();
 	void setFFBEffectsCalc(std::shared_ptr<EffectsControlItf> ffb,std::shared_ptr<EffectsCalculator> effects_calc);
 
@@ -74,6 +78,11 @@ public:
 	void errorCallback(const Error &error, bool cleared);
 
 	void systick();
+#ifdef TIM_FFB
+	void timerElapsed(TIM_HandleTypeDef* htim);
+#endif
+
+	float getCurFFBFreq();
 
 protected:
 	std::shared_ptr<EffectsControlItf> ffb;
@@ -91,9 +100,33 @@ private:
 	 * Warning: Report rate initialized by bInterval is overridden by saved speed preset at startup!
 	 */
 	void setReportRate(uint8_t rateidx);
-	uint8_t usb_report_rate = HID_BINTERVAL; //1 = 1000hz, 2 = 500hz, 3 = 333hz 4 = 250hz, 5 = 200hz 6 = 166hz, 8 = 125hz etc...
-	uint8_t usb_report_rate_idx = 0;
-	const uint8_t usb_report_rates[4] = {1,2,4,8}; // Maps stored hid speed to report rates
+	uint8_t usb_report_rate = HID_BINTERVAL; //for FS USB 1 = 1000hz, 2 = 500hz, 3 = 333hz 4 = 250hz, 5 = 200hz 6 = 166hz, 8 = 125hz etc...
+	uint8_t usb_report_rate_idx = ffbrates.defaultmode;
+#ifndef TIM_FFB
+	uint8_t ffb_rate_divider = 1;
+	uint8_t ffb_rate_counter = 0;
+#endif
+
+
+	struct FFB_update_rates{
+		struct FFB_update_rate_divider{
+			uint8_t basediv;
+			uint8_t hiddiv;
+		};
+
+#if TUD_OPT_HIGH_SPEED // divider pair <FFB div, USB div from base>
+		const uint8_t defaultmode = 3;
+		uint32_t basefreq = 8000;
+		std::array<FFB_update_rate_divider,7> dividers = {{{1,1},{2,1},{4,1},{8,1},{16,1},{32,1},{64,1}}}; // 8khz to 125hz
+#else
+		const uint8_t defaultmode = 0;
+		uint32_t basefreq = 1000;
+		std::array<FFB_update_rate_divider,4> dividers = {{{1,1},{2,1},{4,1},{8,1}}}; // 8 entries max. 1khz to 125hz
+#endif
+	};
+	const static FFB_update_rates ffbrates;
+
+	const bool hidAxis32b;
 
 	std::string usb_report_rates_names();
 
@@ -105,8 +138,8 @@ private:
 	std::vector<std::unique_ptr<ButtonSource>> btns;
 	std::vector<std::unique_ptr<AnalogSource>> analog_inputs;
 
-	reportHID_t reportHID;
-	reportHID_t lastReportHID;
+	std::unique_ptr<HID_GamepadReport_base> reportHID;
+
 	uint8_t reportSendCounter = 0;
 
 	const uint8_t analogAxisCount = 8;

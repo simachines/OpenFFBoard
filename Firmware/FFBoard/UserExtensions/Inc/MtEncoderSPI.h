@@ -19,11 +19,12 @@
 
 class MtEncoderSPI: public Encoder, public SPIDevice, public PersistentStorage, public CommandHandler,cpp_freertos::Thread{
 	enum class MtEncoderSPI_commands : uint32_t{
-		cspin,pos,errors,mode
+		cspin,pos,errors,mode,speed,reg,save
 	};
 	enum class MtEncoderSPI_mode : uint8_t{
 		mt6825,mt6835
 	};
+	const std::array<float,3> spispeeds = {10e6,5e6,2.5e6}; // Target speeds. Must double each entry
 public:
 	MtEncoderSPI();
 	virtual ~MtEncoderSPI();
@@ -57,10 +58,13 @@ public:
 
 	//bool useDMA = false; // if true uses DMA for angle updates instead of polling SPI. TODO when used with tmc external encoder using DMA will hang the interrupt randomly
 
+	void setSpiSpeed(uint8_t preset);
+
 private:
 	uint8_t readSpi(uint16_t addr);
 	void writeSpi(uint16_t addr,uint8_t data);
 	void spiTxRxCompleted(SPIPort* port);
+	bool saveEeprom();
 
 
 	bool nomag = false; // Magnet lost in last report
@@ -85,6 +89,10 @@ private:
 
 	static std::array<uint8_t,256> tableCRC;
 	const uint8_t POLY = 0x07;
+
+	uint8_t spiSpeedPreset = 0;
+	static const uint32_t waitThresh = 2; // If last sample older than x ms use wait semaphore. Else skip and use last value to speed up processing
+	uint32_t lastUpdateTick = 0;
 };
 
 #endif /* USEREXTENSIONS_SRC_MTENCODERSPI_H_ */

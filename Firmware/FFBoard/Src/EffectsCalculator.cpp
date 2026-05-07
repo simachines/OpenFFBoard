@@ -74,6 +74,15 @@ void EffectsCalculator::setActive(bool active)
 	setClipLed(active);
 }
 
+void EffectsCalculator::updateSamplerate(float newSamplerate){
+	this->calcfrequency = newSamplerate;
+	for(FFB_Effect &effect : this->effects){
+		if(effect.filter[0]){ // Update filters if effect has filters
+			setFilters(&effect);
+		}
+	}
+}
+
 
 /*
 If the metric is less than CP Offset - Dead Band, then the resulting force is given by the following formula:
@@ -179,15 +188,15 @@ int32_t EffectsCalculator::calcNonConditionEffectForce(FFB_Effect *effect) {
 
 	case FFB_EFFECT_RAMP:
 	{
-		uint32_t elapsed_time = HAL_GetTick() - effect->startTime;
+		float elapsed_time = (micros()/1000.0) - (float)effect->startTime;
 		int32_t duration = effect->duration;
-		force_vector = (int32_t)effect->startLevel + ((int32_t)elapsed_time * (effect->endLevel - effect->startLevel)) / duration;
+		force_vector = (int32_t)effect->startLevel + (elapsed_time * (effect->endLevel - effect->startLevel)) / duration;
 		break;
 	}
 
 	case FFB_EFFECT_SQUARE:
 	{
-		uint32_t elapsed_time = HAL_GetTick() - effect->startTime;
+		uint32_t elapsed_time = HAL_GetTick() - effect->startTime; // Square is ms aligned
 		int32_t force = ((elapsed_time + effect->phase) % ((uint32_t)effect->period + 2)) < (uint32_t)(effect->period + 2) / 2 ? -magnitude : magnitude;
 		force_vector = force + effect->offset;
 		break;
@@ -197,16 +206,16 @@ int32_t EffectsCalculator::calcNonConditionEffectForce(FFB_Effect *effect) {
 	{
 		int32_t force = 0;
 		int32_t offset = effect->offset;
-		uint32_t elapsed_time = HAL_GetTick() - effect->startTime;
+		float elapsed_time = micros() - ((float)effect->startTime*1000.0);
 		uint32_t phase = effect->phase;
 		uint32_t period = effect->period;
 		float periodF = period;
 
 		int32_t maxMagnitude = offset + magnitude;
 		int32_t minMagnitude = offset - magnitude;
-		uint32_t phasetime = (phase * period) / 35999;
-		uint32_t timeTemp = elapsed_time + phasetime;
-		float remainder = timeTemp % period;
+		float phasetime = (phase * period) / 35999.0;
+		uint32_t timeTemp = elapsed_time + (phasetime*1000); // timetemp in µs
+		float remainder = (timeTemp % (period*1000)) / 1000;
 		float slope = ((maxMagnitude - minMagnitude) * 2) / periodF;
 		if (remainder > (periodF / 2))
 			force = slope * (periodF - remainder);
@@ -220,16 +229,16 @@ int32_t EffectsCalculator::calcNonConditionEffectForce(FFB_Effect *effect) {
 	case FFB_EFFECT_SAWTOOTHUP:
 	{
 		float offset = effect->offset;
-		uint32_t elapsed_time = HAL_GetTick() - effect->startTime;
+		float elapsed_time = micros() - ((float)effect->startTime*1000.0);
 		uint32_t phase = effect->phase;
 		uint32_t period = effect->period;
 		float periodF = effect->period;
 
 		float maxMagnitude = offset + magnitude;
 		float minMagnitude = offset - magnitude;
-		int32_t phasetime = (phase * period) / 35999;
-		uint32_t timeTemp = elapsed_time + phasetime;
-		float remainder = timeTemp % period;
+		float phasetime = (phase * period) / 35999.0;
+		uint32_t timeTemp = elapsed_time + (phasetime*1000); // timetemp in µs
+		float remainder = (timeTemp % (period*1000)) / 1000;
 		float slope = (maxMagnitude - minMagnitude) / periodF;
 		force_vector = (int32_t)(minMagnitude + slope * (period - remainder));
 		break;
@@ -238,16 +247,16 @@ int32_t EffectsCalculator::calcNonConditionEffectForce(FFB_Effect *effect) {
 	case FFB_EFFECT_SAWTOOTHDOWN:
 	{
 		float offset = effect->offset;
-		uint32_t elapsed_time = HAL_GetTick() - effect->startTime;
+		float elapsed_time = micros() - ((float)effect->startTime*1000.0);
 		float phase = effect->phase;
 		uint32_t period = effect->period;
 		float periodF = effect->period;
 
 		float maxMagnitude = offset + magnitude;
 		float minMagnitude = offset - magnitude;
-		int32_t phasetime = (phase * period) / 35999;
-		uint32_t timeTemp = elapsed_time + phasetime;
-		float remainder = timeTemp % period;
+		float phasetime = (phase * period) / 35999.0;
+		uint32_t timeTemp = elapsed_time + (phasetime*1000); // timetemp in µs
+		float remainder = (timeTemp % (period*1000)) / 1000;
 		float slope = (maxMagnitude - minMagnitude) / periodF;
 		force_vector = (int32_t)(minMagnitude + slope * (remainder)); // reverse time
 		break;
@@ -255,7 +264,7 @@ int32_t EffectsCalculator::calcNonConditionEffectForce(FFB_Effect *effect) {
 
 	case FFB_EFFECT_SINE:
 	{
-		float t = HAL_GetTick() - effect->startTime;
+		float t = (micros()/1000.0) - (float)effect->startTime;
 		float freq = 1.0f / (float)(std::max<uint16_t>(effect->period, 2));
 		float phase = (float)effect->phase / (float)35999; //degrees
 		float sine = sinf(2.0 * M_PI * (t * freq + phase)) * magnitude;
@@ -313,7 +322,7 @@ int32_t EffectsCalculator::calcComponentForce(FFB_Effect *effect, int32_t forceV
 
 	case FFB_EFFECT_SPRING:
 	{
-		float pos = metrics->pos;
+		float pos = metrics->pos_scaled_16b;
 		result_torque -= calcConditionEffectForce(effect, pos, gain.spring, con_idx, scaler.spring, angle_ratio);
 		break;
 	}
@@ -669,12 +678,12 @@ void EffectsCalculator::logEffectState(uint8_t type,uint8_t state){
 }
 
 
-void EffectsCalculator::calcStatsEffectType(uint8_t type, int16_t force,uint8_t axis){
+void EffectsCalculator::calcStatsEffectType(uint8_t type, int32_t force,uint8_t axis){
 	if(axis >= MAX_AXIS)
 		return;
 	if(type > 0 && type < 13) {
 		uint8_t arrayLocation = type - 1;
-		effects_stats[arrayLocation].current[axis] = clip<int32_t,int16_t>(effects_stats[arrayLocation].current[axis] + force, -0x7fff, 0x7fff);
+		effects_stats[arrayLocation].current[axis] = clip<int32_t,int32_t>(effects_stats[arrayLocation].current[axis] + force, -0x7fff, 0x7fff);
 		effects_stats[arrayLocation].max[axis] = std::max(effects_stats[arrayLocation].max[axis], (int16_t)abs(force));
 	}
 }
@@ -1001,12 +1010,12 @@ int32_t EffectsCalculator::find_free_effect(uint8_t type){
  */
 uint32_t EffectsControlItf::getRate(){
 	float periodAvg = fxPeriodAvg.getAverage();
-	if((HAL_GetTick() - lastFxUpdate) > 1000 || periodAvg == 0){
+	if((micros() - lastFxUpdate) > 1000000 || periodAvg == 0){
 		// Reset average
 		fxPeriodAvg.clear();
 		return 0;
 	}else{
-		return (1000.0/periodAvg);
+		return (1000000.0/periodAvg);
 	}
 }
 
@@ -1015,22 +1024,22 @@ uint32_t EffectsControlItf::getRate(){
  */
 uint32_t EffectsControlItf::getConstantForceRate(){
 	float periodAvg = cfUpdatePeriodAvg.getAverage();
-	if((HAL_GetTick() - lastCfUpdate) > 1000 || periodAvg == 0){
+	if((micros() - lastCfUpdate) > 1000000 || periodAvg == 0){
 		// Reset average
 		cfUpdatePeriodAvg.clear();
 		return 0;
 	}else{
-		return (1000.0/periodAvg);
+		return (1000000.0/periodAvg);
 	}
 }
 
 
 void EffectsControlItf::cfUpdateEvent(){
-	cfUpdatePeriodAvg.addValue((uint32_t)(HAL_GetTick() - lastCfUpdate));
-	lastCfUpdate = HAL_GetTick();
+	cfUpdatePeriodAvg.addValue((uint32_t)(micros() - lastCfUpdate));
+	lastCfUpdate = micros();
 }
 
 void EffectsControlItf::fxUpdateEvent(){
-	fxPeriodAvg.addValue((uint32_t)(HAL_GetTick() - lastFxUpdate));
-	lastFxUpdate = HAL_GetTick();
+	fxPeriodAvg.addValue((uint32_t)(micros() - lastFxUpdate));
+	lastFxUpdate = micros();
 }

@@ -47,10 +47,10 @@ public:
 	void emergencyStop(bool reset);
 	void resetPosZero();
 
+	void updateSamplerate(float newSamplerate);
+
 private:
 	volatile Control_t* control;
-	volatile bool *p_usb_disabled;
-	volatile bool *p_emergency;
 	std::shared_ptr<EffectsCalculator> effects_calc;
 	uint16_t axis_count = 0;
 	std::vector<std::unique_ptr<Axis>> axes;

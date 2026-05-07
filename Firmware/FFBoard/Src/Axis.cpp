@@ -13,6 +13,7 @@
 #include "ODriveCAN.h"
 #include "MotorSimplemotion.h"
 #include "RmdMotorCAN.h"
+#include "critical.hpp"
 
 //////////////////////////////////////////////
 /*
@@ -282,8 +283,9 @@ uint8_t Axis::getEncType(){
 void Axis::setPos(uint16_t val)
 {
 	startForceFadeIn(0.25,0.5);
-	if(this->drv != nullptr){
-		drv->getEncoder()->setPos(val);
+	Encoder* enc_p = getEncoder();
+	if(enc_p != nullptr){
+		enc_p->setPos(val);
 	}
 }
 
@@ -292,6 +294,7 @@ MotorDriver* Axis::getDriver(){
 }
 
 Encoder* Axis::getEncoder(){
+	if(!drv) return nullptr;
 	return drv->getEncoder();
 }
 
@@ -306,7 +309,7 @@ void Axis::prepareForUpdate(){
 
 	//if (!drv->motorReady()) return;
 
-	float angle = getEncAngle(this->drv->getEncoder());
+	float angle = getEncAngle(getEncoder());
 
 	// Scale encoder value to set rotation range
 	// Update a change of range only when new range is within valid range
@@ -394,13 +397,13 @@ void Axis::setDrvType(uint8_t drvtype)
 	{
 		return;
 	}
-	this->drv.reset(nullptr);
-	MotorDriver* drv = drv_chooser.Create((uint16_t)drvtype);
+	cpp_freertos::CriticalSection::Enter();
+	this->drv.reset(drv_chooser.Create((uint16_t)drvtype));
 	if (drv == nullptr)
 	{
+		cpp_freertos::CriticalSection::Exit();
 		return;
 	}
-	this->drv = std::unique_ptr<MotorDriver>(drv);
 	this->conf.drvtype = drvtype;
 
 	// Pass encoder to driver again
@@ -408,7 +411,7 @@ void Axis::setDrvType(uint8_t drvtype)
 		this->drv->setEncoder(this->enc);
 	}
 #ifdef TMC4671DRIVER
-	if (dynamic_cast<TMC4671 *>(drv))
+	if (dynamic_cast<TMC4671 *>(drv.get()))
 	{
 		setupTMC4671();
 	}
@@ -422,6 +425,7 @@ void Axis::setDrvType(uint8_t drvtype)
 	{
 		drv->startMotor();
 	}
+	cpp_freertos::CriticalSection::Exit();
 }
 
 #ifdef TMC4671DRIVER
@@ -461,7 +465,7 @@ void Axis::setEncType(uint8_t enctype)
 		this->conf.enctype = 0; // None encoder
 	}
 
-	float angle = getEncAngle(this->drv->getEncoder());
+	float angle = getEncAngle(this->getEncoder());
 	//int32_t scaledEnc = scaleEncValue(angle, degreesOfRotation);
 	// reset metrics
 	this->resetMetrics(angle);
@@ -549,17 +553,17 @@ metric_t* Axis::getMetrics() {
 }
 
 /**
- * Returns position as 16b int scaled to gamepad range
+ * Returns position as int scaled to gamepad range
  */
 int32_t Axis::getLastScaledEnc() {
-	return  clip(metric.current.pos,-0x7fff,0x7fff);
+	return  clip(metric.current.pos_f * 0x7fffffff,-0x7fffffff,0x7fffffff); // Calc from float pos
 }
 
 /**
  * Changes intensity of idle spring when FFB is off
  */
 int32_t Axis::updateIdleSpringForce() {
-	return clip<int32_t,int32_t>((int32_t)(-metric.current.pos*idlespringscale),-idlespringclip,idlespringclip);
+	return clip<int32_t,int32_t>((int32_t)(-metric.current.pos_scaled_16b*idlespringscale),-idlespringclip,idlespringclip);
 }
 
 /*
@@ -634,7 +638,7 @@ void Axis::setFxRatio(uint8_t val) {
 void Axis::resetMetrics(float new_pos= 0) { // pos is degrees
 	metric.current = metric_t();
 	metric.current.posDegrees = new_pos;
-	std::tie(metric.current.pos,metric.current.pos_f) = scaleEncValue(new_pos, degreesOfRotation);
+	std::tie(metric.current.pos_scaled_16b,metric.current.pos_f) = scaleEncValue(new_pos, degreesOfRotation);
 	metric.previous = metric_t();
 	// Reset filters
 	speedFilter.calcBiquad();
@@ -649,13 +653,13 @@ void Axis::updateMetrics(float new_pos) { // pos is degrees
 	metric.previous = metric.current;
 
 	metric.current.posDegrees = new_pos;
-	std::tie(metric.current.pos,metric.current.pos_f) = scaleEncValue(new_pos, degreesOfRotation);
+	std::tie(metric.current.pos_scaled_16b,metric.current.pos_f) = scaleEncValue(new_pos, degreesOfRotation);
 
 
 	// compute speed and accel from raw instant speed normalized
-	float currentSpeed = (new_pos - metric.previous.posDegrees) * 1000.0; // deg/s
+	float currentSpeed = (new_pos - metric.previous.posDegrees) * this->filter_f; // deg/s
 	metric.current.speed = speedFilter.process(currentSpeed);
-	metric.current.accel = accelFilter.process((currentSpeed - _lastSpeed))* 1000.0; // deg/s/s
+	metric.current.accel = accelFilter.process((currentSpeed - _lastSpeed))* this->filter_f; // deg/s/s
 	_lastSpeed = currentSpeed;
 
 }
@@ -688,7 +692,7 @@ float Axis::getTorqueScaler(){
 }
 
 
-int32_t Axis::getTorque() { return metric.current.torque; }
+int32_t Axis::getTorque() { return metric.previous.torque; }
 
 bool Axis::isInverted() {
 	return invertAxis;
@@ -698,7 +702,7 @@ bool Axis::isInverted() {
  * Calculate soft endstop effect
  */
 int16_t Axis::updateEndstop(){
-	int8_t clipdir = cliptest<int32_t,int32_t>(metric.current.pos, -0x7fff, 0x7fff);
+	int8_t clipdir = cliptest<int32_t,int32_t>(metric.current.pos_scaled_16b, -0x7fff, 0x7fff);
 	if(clipdir == 0){
 		return 0;
 	}
@@ -786,6 +790,22 @@ bool Axis::updateTorque(int32_t* totalTorque) {
 
 	*totalTorque = torque;
 	return (torqueChanged);
+}
+
+void Axis::updateSamplerate(float newSamplerate){
+	this->filter_f = newSamplerate;
+	this->updateFilters(this->filterProfileId); // Recalculate filters
+}
+
+void Axis::updateFilters(uint8_t profileId){
+	this->filterProfileId = profileId;
+	speedFilter.setFc(filterSpeedCst[this->filterProfileId].freq / filter_f);
+	speedFilter.setQ(filterSpeedCst[this->filterProfileId].q / 100.0);
+	accelFilter.setFc(filterAccelCst[this->filterProfileId].freq / filter_f);
+	accelFilter.setQ(filterAccelCst[this->filterProfileId].q / 100.0);
+	damperFilter.setFc(filterDamperCst.freq/filter_f);
+	inertiaFilter.setFc(filterInertiaCst.freq/filter_f);
+	frictionFilter.setFc(filterFrictionCst.freq/filter_f);
 }
 
 /**
@@ -939,14 +959,14 @@ CommandStatus Axis::command(const ParsedCommand& cmd,std::vector<CommandReply>& 
 		break;
 
 	case Axis_commands::pos:
-		if (cmd.type == CMDtype::get && this->drv->getEncoder() != nullptr)
+		if (cmd.type == CMDtype::get && getEncoder() != nullptr)
 		{
-			int32_t pos = this->drv->getEncoder()->getPos();
+			int32_t pos = getEncoder()->getPos();
 			replies.emplace_back(isInverted() ? -pos : pos);
 		}
-		else if (cmd.type == CMDtype::set && this->drv->getEncoder() != nullptr)
+		else if (cmd.type == CMDtype::set && getEncoder() != nullptr)
 		{
-			this->drv->getEncoder()->setPos(isInverted() ? -cmd.val : cmd.val);
+			getEncoder()->setPos(isInverted() ? -cmd.val : cmd.val);
 		}
 		else
 		{
@@ -971,16 +991,16 @@ CommandStatus Axis::command(const ParsedCommand& cmd,std::vector<CommandReply>& 
 		break;
 
 	case Axis_commands::curpos:
-		replies.emplace_back(this->metric.current.pos);
+		replies.emplace_back(this->metric.previous.pos_scaled_16b);
 		break;
 	case Axis_commands::curtorque:
-		replies.emplace_back(this->metric.current.torque);
+		replies.emplace_back(getTorque());
 		break;
 	case Axis_commands::curspd:
-		replies.emplace_back(this->metric.current.speed);
+		replies.emplace_back(this->metric.previous.speed);
 		break;
 	case Axis_commands::curaccel:
-		replies.emplace_back(this->metric.current.accel);
+		replies.emplace_back(this->metric.previous.accel);
 		break;
 
 	case Axis_commands::reductionScaler:
@@ -999,11 +1019,7 @@ CommandStatus Axis::command(const ParsedCommand& cmd,std::vector<CommandReply>& 
 		else if (cmd.type == CMDtype::set)
 		{
 			uint32_t value = clip<uint32_t, uint32_t>(cmd.val, 0, filterSpeedCst.size()-1);
-			this->filterProfileId = value;
-			speedFilter.setFc(filterSpeedCst[this->filterProfileId].freq / filter_f);
-			speedFilter.setQ(filterSpeedCst[this->filterProfileId].q / 100.0);
-			accelFilter.setFc(filterAccelCst[this->filterProfileId].freq / filter_f);
-			accelFilter.setQ(filterAccelCst[this->filterProfileId].q / 100.0);
+			this->updateFilters(value);
 		}
 		break;
 	case Axis_commands::filterSpeed:
@@ -1024,8 +1040,8 @@ CommandStatus Axis::command(const ParsedCommand& cmd,std::vector<CommandReply>& 
 		if (cmd.type == CMDtype::get)
 		{
 			uint32_t cpr = 0;
-			if(this->drv->getEncoder() != nullptr){
-				cpr = this->drv->getEncoder()->getCpr();
+			if(this->getEncoder() != nullptr){
+				cpr = this->getEncoder()->getCpr();
 			}
 //#ifdef TMC4671DRIVER // CPR should be consistent with position. Maybe change TMC to prescale to encoder count or correct readout in UI
 //			TMC4671 *tmcdrv = dynamic_cast<TMC4671 *>(this->drv.get()); // Special case for TMC. Get the actual encoder resolution

@@ -61,7 +61,7 @@ void SystemCommands::registerCommands(){
 	CommandHandler::registerCommand("errors", FFBoardMain_commands::errors, "Read error states",CMDFLAG_GET);
 	CommandHandler::registerCommand("errorsclr", FFBoardMain_commands::errorsclr, "Reset errors",CMDFLAG_GET);
 	CommandHandler::registerCommand("heapfree", FFBoardMain_commands::heapfree, "Memory info",CMDFLAG_GET);
-#if configUSE_STATS_FORMATTING_FUNCTIONS> 0
+#if ( ( configGENERATE_RUN_TIME_STATS == 1 ) && ( configUSE_STATS_FORMATTING_FUNCTIONS > 0 ) && ( configSUPPORT_DYNAMIC_ALLOCATION == 1 ) )
 	CommandHandler::registerCommand("taskstats", FFBoardMain_commands::taskstats, "Task stats",CMDFLAG_GET);
 #endif
 	CommandHandler::registerCommand("format", FFBoardMain_commands::format, "set format=1 to erase all stored values",CMDFLAG_SET);
@@ -76,6 +76,9 @@ void SystemCommands::registerCommands(){
 #endif
 #if defined(SIGNATURE)
 	CommandHandler::registerCommand("signature", FFBoardMain_commands::signature, "Chip signature in OTP. setadr to write data. set=1 to lock",CMDFLAG_GETADR | CMDFLAG_SETADR | CMDFLAG_GET | CMDFLAG_INFOSTRING);
+#endif
+#if ( ( configUSE_TRACE_FACILITY == 1 ) && ( configUSE_STATS_FORMATTING_FUNCTIONS > 0 ) && ( configSUPPORT_DYNAMIC_ALLOCATION == 1 ) )
+	CommandHandler::registerCommand("tasklist", FFBoardMain_commands::tasklist, "Task list",CMDFLAG_GET);
 #endif
 }
 
@@ -218,7 +221,7 @@ CommandStatus SystemCommands::internalCommand(const ParsedCommand& cmd,std::vect
 			}
 
 
-		case FFBoardMain_commands::mallinfo: // UNUSED since freertos
+		case FFBoardMain_commands::mallinfo:
 		{
 			CommandReply reply;
 			struct mallinfo info = mallinfo();
@@ -238,12 +241,25 @@ CommandStatus SystemCommands::internalCommand(const ParsedCommand& cmd,std::vect
 			replies.emplace_back(xPortGetFreeHeapSize(),xPortGetMinimumEverFreeHeapSize());
 			break;
 		}
-#if configUSE_STATS_FORMATTING_FUNCTIONS>0
+#if ( ( configGENERATE_RUN_TIME_STATS == 1 ) && ( configUSE_STATS_FORMATTING_FUNCTIONS > 0 ) && ( configSUPPORT_DYNAMIC_ALLOCATION == 1 ) )
 		case FFBoardMain_commands::taskstats:
 		{
-			char repl[800];
-			vTaskGetRunTimeStats(repl);
-			replies.emplace_back("\n"+std::string(repl));
+			std::string repl;
+			repl.resize(uxTaskGetNumberOfTasks()*64,'\0');
+			vTaskGetRunTimeStats(repl.data());
+			repl.resize(repl.find_first_of('\0')); // Cut
+			replies.emplace_back("\n"+(repl));
+			break;
+		}
+#endif
+#if ( ( configUSE_TRACE_FACILITY == 1 ) && ( configUSE_STATS_FORMATTING_FUNCTIONS > 0 ) && ( configSUPPORT_DYNAMIC_ALLOCATION == 1 ) )
+		case FFBoardMain_commands::tasklist:
+		{
+			std::string repl;
+			repl.resize(uxTaskGetNumberOfTasks()*64,'\0');
+			vTaskList(repl.data());
+			repl.resize(repl.find_first_of('\0')); // Cut
+			replies.emplace_back("\n"+(repl));
 			break;
 		}
 #endif
@@ -267,6 +283,7 @@ CommandStatus SystemCommands::internalCommand(const ParsedCommand& cmd,std::vect
 			if(cmd.type == CMDtype::set && cmd.val==1){
 
 				if(Flash_Format()){
+					Flash_Write_Defaults(); // Restore default values if present
 					flag = CommandStatus::OK;
 				}else{
 					flag = CommandStatus::ERR;

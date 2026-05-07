@@ -71,7 +71,7 @@ struct AxisConfig
 struct metric_t {
 	float accel = 0;	// in deg/s²
 	float speed = 0; // in deg/s
-	int32_t pos = 0; // scaled position as 16b int -0x7fff to 0x7fff
+	int32_t pos_scaled_16b = 0; // scaled position as 16b int -0x7fff to 0x7fff matching FFB ranges
 	float pos_f = 0; // scaled position as float. -1 to 1 range
 	float posDegrees = 0; // Position in degrees. Not scaled to selected range
 	int32_t torque = 0; // total of effect + endstop torque
@@ -171,6 +171,9 @@ public:
 	bool updateTorque(int32_t* totalTorque);
 
 
+	void updateSamplerate(float newSamplerate);
+	void updateFilters(uint8_t profileId);
+
 	void setGearRatio(uint8_t numerator,uint8_t denominator);
 
 	static const std::vector<class_entry<MotorDriver>> axis1_drivers;
@@ -259,7 +262,7 @@ private:
 	const biquad_constant_t filterFrictionCst = {50, 20};
 	const biquad_constant_t filterInertiaCst = {20, 20};
 	uint8_t filterProfileId = 1; // Default medium (1) as this is the most common encoder resolution and users can go lower or higher if required.
-	const float filter_f = 1000; // 1khz
+	float filter_f = 1000; // 1khz default. should be set at runtime once the actual rate is known
 	const int32_t intFxClip = 20000;
 	uint8_t damperIntensity = 30;
 

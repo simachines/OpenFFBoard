@@ -15,6 +15,7 @@ extern IWDG_HandleTypeDef hiwdg; // Watchdog
 
 bool running = true;
 bool mainclassChosen = false;
+volatile bool forceErase = false;
 
 uint16_t main_id = 0;
 
@@ -46,6 +47,11 @@ void cppmain() {
 		Error_Handler();
 	}
 
+	if(forceErase){
+		Flash_Format();
+		Flash_Write_Defaults();
+	}
+
 //	// Check if flash is initialized
 //	uint16_t lastVersion = 0;
 //	if(!Flash_Read(ADR_SW_VERSION, &lastVersion)){ // Version never written
@@ -59,11 +65,13 @@ void cppmain() {
 	// Check if flash is initialized
 	uint16_t lastFlashVersion = 0;
 	if(!Flash_Read(ADR_FLASH_VERSION, &lastFlashVersion)){ // Version never written
+		Flash_Write_Defaults();
 		Flash_Write(ADR_FLASH_VERSION, FLASH_VERSION);
 	}
 	Flash_Read(ADR_FLASH_VERSION,&lastFlashVersion);
 	if(lastFlashVersion != FLASH_VERSION){
 		Flash_Format(); // Major version changed or could not write initial value. force a format
+		Flash_Write_Defaults();
 		Flash_Write(ADR_FLASH_VERSION, FLASH_VERSION);
 	}
 
