@@ -12,7 +12,14 @@
 #include "ledEffects.h"
 
 #ifdef USE_DSP_FUNCTIONS
-#include "arm_math.h"
+#include "arm_math_types.h"
+#include "dsp/fast_math_functions.h"
+#include "dsp/interpolation_functions.h"
+#define MATH_PI PI
+#define MATH_SIN(x) arm_sin_f32(x)
+#else
+#define MATH_PI M_PI
+#define MATH_SIN(x) sinf(x)
 #endif
 
 #define EFFECT_STATE_INACTIVE 0
@@ -108,7 +115,7 @@ An inertia condition uses axis acceleration as the metric.
 void EffectsCalculator::calculateEffects(std::vector<std::unique_ptr<Axis>> &axes)
 {
 	int axisCount = axes.size();
-	int64_t forces[MAX_AXIS] = {0};
+	int32_t forces[MAX_AXIS] = {0};
 
 	if(isActive()){
 		int32_t force = 0;
@@ -179,25 +186,30 @@ int32_t EffectsCalculator::calcNonConditionEffectForce(FFB_Effect *effect) {
 
 	int32_t force_vector = 0;
 	
-	// Get interpolated magnitude (or amplitude)
-	float interpolated_magnitude = evaluateReconstructionFilter(
-        &effect->recon_magnitude,    // Use the new structure
-        (float)effect->magnitude     // Fallback value (for NONE mode)
-    );
+    int32_t magnitude = 0;
+    int32_t offset_lrf = 0;
 
-    // Get interpolated offset
-    float interpolated_offset_float = evaluateReconstructionFilter(
-        &effect->recon_offset,       // Use the new structure
-        (float)effect->offset		 // Fallback value (for NONE mode)
-    );
-    int32_t offset_lrf = (int32_t)interpolated_offset_float;
+    // Only calculate reconstruction and envelope if the effect actually uses them
+    if (effect->type != FFB_EFFECT_RAMP) {
+        // Get interpolated magnitude (or amplitude)
+        float interpolated_magnitude = evaluateReconstructionFilter(
+            &effect->recon_magnitude,    // Use the new structure
+            (float)effect->magnitude     // Fallback value (for NONE mode)
+        );
 
-	// Magnitude with envelope if used
-    int32_t magnitude; 
-	if(effect->useEnvelope){
-        magnitude = getEnvelopeMagnitude(effect, (int32_t)interpolated_magnitude);
-	} else {
-        magnitude = (int32_t)interpolated_magnitude;
+        // Get interpolated offset
+        float interpolated_offset_float = evaluateReconstructionFilter(
+            &effect->recon_offset,       // Use the new structure
+            (float)effect->offset		 // Fallback value (for NONE mode)
+        );
+        offset_lrf = (int32_t)interpolated_offset_float;
+
+        // Magnitude with envelope if used
+        if(effect->useEnvelope){
+            magnitude = getEnvelopeMagnitude(effect, (int32_t)interpolated_magnitude);
+        } else {
+            magnitude = (int32_t)interpolated_magnitude;
+        }
     }
 
 
@@ -290,11 +302,7 @@ int32_t EffectsCalculator::calcNonConditionEffectForce(FFB_Effect *effect) {
 		float t = (micros()/1000.0) - (float)effect->startTime;
 		float freq = 1.0f / (float)(std::max<uint16_t>(effect->period, 2));
 		float phase = (float)effect->phase / (float)35999; //degrees
-#ifdef USE_DSP_FUNCTIONS
-		float sine = arm_sin_f32(2.0f * PI * (t * freq + phase)) * magnitude;
-#else
-		float sine = sinf(2.0f * M_PI * (t * freq + phase)) * magnitude;
-#endif
+		float sine = MATH_SIN(2.0f * MATH_PI * (t * freq + phase)) * magnitude;
 		force_vector = (int32_t)(offset_lrf + sine);
 		break;
 	}
@@ -392,13 +400,8 @@ int32_t EffectsCalculator::calculateEffectForceOnAxis(FFB_Effect *effect, int32_
 			float rampupFactor = 1.0;
 			if (fabs (speed) < speedRampupCeil) {								// if speed in the range to rampup we apply a sinus curbe to ramup
 
-#ifdef USE_DSP_FUNCTIONS
-				float phaseRad = PI * ((fabsf (speed) / speedRampupCeil) - 0.5f);// we start to compute the normalized angle (speed / normalizedSpeed@5%) and translate it of -1/2PI to translate sin on 1/2 periode
-				rampupFactor = ( 1.0f + arm_sin_f32(phaseRad ) ) / 2.0f;			// sin value is -1..1 range, we translate it to 0..2 and we scale it by 2
-#else
-				float phaseRad = M_PI * ((fabsf (speed) / speedRampupCeil) - 0.5f);// we start to compute the normalized angle (speed / normalizedSpeed@5%) and translate it of -1/2PI to translate sin on 1/2 periode
-				rampupFactor = ( 1.0f + sinf(phaseRad ) ) / 2.0f;			// sin value is -1..1 range, we translate it to 0..2 and we scale it by 2
-#endif
+				float phaseRad = MATH_PI * ((fabsf (speed) / speedRampupCeil) - 0.5f);// we start to compute the normalized angle (speed / normalizedSpeed@5%) and translate it of -1/2PI to translate sin on 1/2 periode
+				rampupFactor = ( 1.0f + MATH_SIN(phaseRad ) ) / 2.0f;			// sin value is -1..1 range, we translate it to 0..2 and we scale it by 2
 			}
 
 			int8_t sign = speed >= 0 ? 1 : -1;
@@ -558,15 +561,11 @@ void EffectsCalculator::setFilters(FFB_Effect *effect){
 
 void EffectsCalculator::updateEffectReconstruction(FFB_Effect* effect, float new_magnitude, float new_offset, bool is_periodic)
 {
-	// Update target variables (for NONE mode and fallback)
-    effect->magnitude = (int16_t)new_magnitude;
-
     // Push new magnitude into recon structure
     pushReconstructionSample(&effect->recon_magnitude, new_magnitude);
 
     // Push new offset into recon structure if periodic
     if (is_periodic) {
-        effect->offset = (int16_t)new_offset;
         pushReconstructionSample(&effect->recon_offset, new_offset);
     }
 }
@@ -624,8 +623,13 @@ float EffectsCalculator::evaluateReconstructionFilter(ReconFilterState* state, f
     uint32_t now_us = micros();
     float last_known_time = state->spline_x[3]; // The most recent point
 
+    // If no samples were pushed (e.g. SerialFFB or simple test mode), use fallback
+    if (!state->isSplineReady) {
+        return fallbackValue;
+    }
+
     // 50ms timeout (if the game is paused, etc.)
-    if (!state->isSplineReady || (now_us > last_known_time + 50000)) {
+    if (now_us > last_known_time + 50000) {
         return state->spline_y[3]; // Maintain the last value
     }
 

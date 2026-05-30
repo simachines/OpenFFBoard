@@ -26,7 +26,8 @@
 #include "EffectsCalculator.h"
 
 #ifdef USE_DSP_FUNCTIONS
-#include "arm_math.h"
+#include "dsp/controller_functions.h"
+#include "dsp/fast_math_functions.h"
 #endif
 
 #define INTERNAL_AXIS_DAMPER_SCALER 0.7
@@ -60,7 +61,6 @@ struct AxisFlashAddresses
 	uint16_t config = ADR_AXIS1_CONFIG;
 	uint16_t maxSpeed = ADR_AXIS1_MAX_SPEED;
 	uint16_t maxAccel = ADR_AXIS1_MAX_ACCEL;
-	uint16_t maxSlewRateDrv = ADR_AXIS1_MAX_SLEWRATE_DRV;
 
 	uint16_t endstop = ADR_AXIS1_ENDSTOP;
 	uint16_t power = ADR_AXIS1_POWER;
@@ -71,12 +71,6 @@ struct AxisFlashAddresses
 
 	uint16_t speedAccelFilter = ADR_AXIS1_SPEEDACCEL_FILTER;
 	uint16_t postprocess1 = ADR_AXIS1_POSTPROCESS1;
-	// NOTE: The following addresses must be defined in constants.h
-	uint16_t equalizer1 = ADR_AXIS1_EQ1;
-	uint16_t equalizer2 = ADR_AXIS1_EQ2;
-	uint16_t equalizer3 = ADR_AXIS1_EQ3;
-	uint16_t handsOffConfig = ADR_AXIS1_HANDSOFF_CONF;
-	uint16_t handsOffAccel = ADR_AXIS1_HANDSOFF_ACCEL;
 };
 
 /**
@@ -119,15 +113,10 @@ struct GearRatio_t{
 
 enum class Axis_commands : uint32_t{
 	power=0x00,degrees=0x01,esgain,zeroenc,invert,idlespring,axisdamper,enctype,drvtype,
-	pos,curtorque,curpos,curspd,curaccel,
-	fxratio,reductionScaler,
+	pos,fxratio,curtorque,curpos,curspd,curaccel,reductionScaler,
 	filterSpeed, filterAccel, filterProfileId,cpr,axisfriction,axisinertia,
-	maxspeed,slewrate,
-	calibrate_maxSlewRateDrv,
-	maxSlewRateDrv,
-	expo,exposcale,
-	equalizer,eqb1,eqb2,eqb3,eqb4,eqb5,eqb6,
-	handsoff, handsoff_speed, handsoff_accel
+	maxspeed,maxtorquerate,
+	expo,exposcale
 };
 
 /**
@@ -349,7 +338,7 @@ public:
 	 * @brief Calculates the FFB torque exponential torque, from the input torque and apply expo and scaler
 	 * @return The calculated exponential torque.
 	 */
-	int64_t calculateFFBTorque();
+	int32_t calculateFFBTorque();
 
 	/**
 	 * @brief Starts a force fade-in.
@@ -364,7 +353,7 @@ public:
 	 * @brief Sets the FFB effect torque.
 	 * @param torque The new FFB effect torque from the EffectsCalculator.
 	 */
-	void setFfbEffectTorque(int64_t torque);
+	void setFfbEffectTorque(int32_t torque);
 
 	/**
 	 * @brief Updates the total torque.
@@ -394,12 +383,6 @@ private:
 
 	// Private methods
 	/**
-	 * @brief Sets the gain for a specific equalizer band.
-	 * @param band The equalizer band index (0-4).
-	 * @param gain The gain in 0.1 dB steps (-120 to 120).
-	 */
-	void setEqGain(uint8_t band, int8_t gain);
-	/**
 	 * @brief Sets the degrees of rotation for the axis.
 	 * @param degrees The new range of rotation.
 	 */
@@ -425,18 +408,13 @@ private:
 	 */
 	void setExpo(int val);
 
-	float calculateExpoTorque(float torque);
+	int32_t calculateExpoTorque(int32_t torque);
 	/**
 	 * @brief Applies the speed limiter PI controller to the torque.
 	 * @param torque A reference to the torque value to be modified.
 	 * @return torque update to apply to reduced de speed.
 	 */
-	int64_t applySpeedLimiterTorque(int64_t& torque);
-	/**
-	 * @brief Applies the torque slew rate limiter to the torque.
-	 * @param torque A reference to the torque value to be modified.
-	 */
-	void applyTorqueSlewRateLimiter(int64_t& torque);
+	int32_t applySpeedLimiterTorque(int32_t& torque);
 	/**
 	 * @brief Decodes the axis configuration from a 16-bit integer stored in flash.
 	 * @param val The 16-bit encoded configuration value.
@@ -449,10 +427,6 @@ private:
 	 */
 	static uint16_t encodeConfToInt(AxisConfig conf);
 
-	/**
-	 * @brief Checks if the user has let go of the wheel and updates the torque accordingly.
-	 */
-	void updateHandsOffState();
 
 
 	// Member variables
@@ -476,8 +450,7 @@ private:
 	uint16_t previousDegreesOfRotation = degreesOfRotation; //!< Previous degrees of rotation (for smooth transitions).
 	uint16_t nextDegreesOfRotation = degreesOfRotation; //!< Target degrees of rotation.
 
-	// Limiters
-	uint16_t maxSlewRate_Driver = MAX_SLEW_RATE;		//!< Maximum slew rate as measured by the driver (in units/ms).
+	// Axis parameters
 	uint16_t maxSpeedDegS  = 0;		//!< Maximum speed in degrees per second. 0 to disable.
 	uint32_t maxTorqueRateMS = 0;		//!< Maximum torque rate of change per millisecond. 0 to disable.
 
@@ -495,7 +468,7 @@ private:
 	float previousFrameSpeed = 0;			//!< Instantaneous speed from the last cycle, used for acceleration calculation.
 
 	// Torque components
-	int64_t ffbEffectTorque = 0;		//!< Torque from HID FFB effects.
+	int32_t ffbEffectTorque = 0;		//!< Torque from HID FFB effects.
 	int32_t mechanicalEffectTorque = 0;	//!< Torque from mechanical effects (damper, friction, inertia).
 
 	// Power and scaling
@@ -515,9 +488,6 @@ private:
 	float idleSpringScale = 0;        //!< Scaler for the idle spring force.
 	bool motorWasNotReady = true;     //!< Flag to detect motor readiness transition.
 
-	// Slew rate calibration tracking: true when Axis requested a calibration and
-	// is waiting for the driver to finish measuring the max slew rate.
-	bool awaitingSlewCalibration = false;
 
 	// Filters
 	// TODO tune these and check if it is really stable and beneficial to the FFB. index 4 placeholder
@@ -542,27 +512,11 @@ private:
 	Biquad frictionFilter = Biquad(BiquadType::lowpass, filterFrictionCst.freq/filter_f, filterFrictionCst.q / 100.0, 0.0);
 	Biquad inertiaFilter = Biquad(BiquadType::lowpass, filterInertiaCst.freq/filter_f, filterInertiaCst.q / 100.0, 0.0);
 
-	// Equalizer
-	static const uint8_t num_eq_bands = 6;
-	const std::array<uint16_t, num_eq_bands> eq_frequencies = {10, 15, 25, 40, 60, 100};
-	std::array<Biquad, num_eq_bands> eqFilters;
-	std::array<int8_t, num_eq_bands> eqGains = {0,0,0,0,0}; // Gains from -120 to 120, represents gain in dB * 10
-	bool equalizerEnabled = false; //!< Enable/disable the equalizer.
-
 	// Post-processing
 	GearRatio_t gearRatio;	//!< Gear ratio between encoder and axis.
 	int expoValue = 0;		//!< Raw integer value for the expo curve. Formula: v = val*2 => v<0 ? 1/-v : v
 	float expo = 1;			//!< Calculated exponent for the torque curve.
 	float expoScaler = 50;	//!< Scaler for the expo calculation : 0.28 to 3.54
-
-	// Hands-off detection
-	bool handsOffCheckEnabled = false;
-	float handsOffAccelThreshold = 0.1;
-	uint16_t handsOffSpeedThreshold = 720; // deg/s
-	bool handsOff = false;
-	float accel_buffer[16] = {0};
-	uint8_t accel_buffer_idx = 0;
-	uint32_t handsOffTimer = 0;
 };
 
 #endif /* SRC_AXIS_H_ */

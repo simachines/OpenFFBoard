@@ -13,7 +13,15 @@
 #include <math.h>
 
 #ifdef USE_DSP_FUNCTIONS
-#include "arm_math.h"
+#include "arm_math_types.h"
+#include "dsp/fast_math_functions.h"
+#define MATH_PI PI
+#define MATH_SIN(x) arm_sin_f32(x)
+#define MATH_COS(x) arm_cos_f32(x)
+#else
+#define MATH_PI M_PI
+#define MATH_SIN(x) sinf(x)
+#define MATH_COS(x) cosf(x)
 #endif
 
 HidFFB::HidFFB(std::shared_ptr<EffectsCalculator> ec,uint8_t axisCount) : effects_calc(ec), effects(ec->effects),axisCount(axisCount)
@@ -239,7 +247,7 @@ void HidFFB::set_constant_effect(FFB_SetConstantForce_Data_t* data){
 	cfUpdateEvent();
 	FFB_Effect& effect_p = effects[data->effectBlockIndex-1];
 
-	//effect_p.magnitude = data->magnitude;
+	effect_p.magnitude = data->magnitude;
 	effects_calc->updateEffectReconstruction(&effect_p, (float)data->magnitude, 0.0f, false);
 //	if(effect_p.state == 0){
 //		effect_p.state = 1; // Force start effect
@@ -320,21 +328,15 @@ void HidFFB::set_effect(FFB_SetEffect_t* effect){
 
 
 	if(!overridesCondition){
-#ifdef USE_DSP_FUNCTIONS
-		float phaseX = PI*2.0f * (effect->directionX/36000.0f);
+		float phaseX = MATH_PI*2.0f * (effect->directionX/36000.0f);
 
-		effect_p->axisMagnitudes[0] = directionEnable ? arm_sin_f32(phaseX) : (effect->enableAxis & X_AXIS_ENABLE ? (effect->directionX - 18000.0f) / 18000.0f : 0); // Angular vector if dirEnable used otherwise linear or 0 if axis enabled
-		effect_p->axisMagnitudes[1] = directionEnable ? -arm_cos_f32(phaseX) : (effect->enableAxis & Y_AXIS_ENABLE ? -(effect->directionY - 18000.0f) / 18000.0f : 0);
-#else
-		float phaseX = M_PI*2.0f * (effect->directionX/36000.0);
-		effect_p->axisMagnitudes[0] = directionEnable ? sin(phaseX) : (effect->enableAxis & X_AXIS_ENABLE ? (effect->directionX - 18000.0f) / 18000.0f : 0); // Angular vector if dirEnable used otherwise linear or 0 if axis enabled
-		effect_p->axisMagnitudes[1] = directionEnable ? -cos(phaseX) : (effect->enableAxis & Y_AXIS_ENABLE ? -(effect->directionY - 18000.0f) / 18000.0f : 0);
-#endif
+		effect_p->axisMagnitudes[0] = directionEnable ? MATH_SIN(phaseX) : (effect->enableAxis & X_AXIS_ENABLE ? (effect->directionX - 18000.0f) / 18000.0f : 0); // Angular vector if dirEnable used otherwise linear or 0 if axis enabled
+		effect_p->axisMagnitudes[1] = directionEnable ? -MATH_COS(phaseX) : (effect->enableAxis & Y_AXIS_ENABLE ? -(effect->directionY - 18000.0f) / 18000.0f : 0);
 	}
 
 #if MAX_AXIS == 3
-	float phaseY = M_PI*2.0 * (effect->directionY/36000.0);
-	effect_p->axisMagnitudes[3] = directionEnable ? sin(phaseY) : (effect->enableAxis & Z_AXIS_ENABLE ? (effect->directionZ - 18000.0f) / 18000.0f : 0);
+	float phaseY = MATH_PI*2.0f * (effect->directionY/36000.0f);
+	effect_p->axisMagnitudes[3] = directionEnable ? MATH_SIN(phaseY) : (effect->enableAxis & Z_AXIS_ENABLE ? (effect->directionZ - 18000.0f) / 18000.0f : 0);
 #endif
 	if(effect->duration == 0){ // Fix for games assuming 0 is infinite
 		effect_p->duration = FFB_EFFECT_DURATION_INFINITE;
@@ -466,10 +468,9 @@ void HidFFB::set_periodic(FFB_SetPeriodic_Data_t* report){
 	effect->period = clip<uint32_t,uint32_t>(report->period,1,0x7fff); // Period is never 0
 	effect->phase = report->phase;
 
+	effect->magnitude = report->magnitude;
+	effect->offset = report->offset;
 	effects_calc->updateEffectReconstruction(effect, (float)report->magnitude, (float)report->offset, true);
-	//effect->magnitude = report->magnitude;
-	//effect->offset = report->offset;
-	//effect->counter = 0;
 }
 
 
