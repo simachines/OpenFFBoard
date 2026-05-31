@@ -78,7 +78,7 @@ private:
 	CAN_Config_t conf1;
 	CAN_Config_t conf2;
 	bool gvretMode = false;
-	const std::vector<char> keepalivemsg = {0xF1,0x09, 0xDE,0xAD};
+	const std::vector<uint8_t> keepalivemsg = {0xF1,0x09, 0xDE,0xAD};
 };
 #endif /* CANBRIDGE_H_ */
 #endif

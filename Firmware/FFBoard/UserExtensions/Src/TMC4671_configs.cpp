@@ -43,13 +43,13 @@ const TMC4671HardwareTypeConf conf1_2 = {
 			.temp_limit = 90,
 			.temperatureEnabled = true,
 		},
-		.currentScaler = 2.5 / (0x7fff * 60.0 * 0.0015), // w. 60x 1.5mOhm sensor
+		.currentScaler = 2.5 / (0x7fff * 50.0 * 0.0015), // w. 60x 1.5mOhm sensor
 		.brakeLimLow = 50700,
 		.brakeLimHigh = 50900,
 		.vmScaler = (2.5 / 0x7fff) * ((1.5+71.5)/1.5),
 		.vSenseMult = VOLTAGE_MULT_DEFAULT,
 		.clockfreq = 25e6,
-		.bbm = 20,
+		.bbm = 40,
 };
 const TMC4671HardwareTypeConf conf1_2_2 = {
 		.name = "v1.2.2 LEM 10 (80mV/A)",

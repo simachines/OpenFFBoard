@@ -1,0 +1,144 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Firmware: Build F407VG",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/Firmware/build.ps1", "-Target", "F407VG"],
+      "options": {
+        "cwd": "${workspaceFolder}/Firmware"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "Firmware: Clean F407VG",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/Firmware/clean.ps1", "-Target", "F407VG"],
+      "options": {
+        "cwd": "${workspaceFolder}/Firmware"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Firmware: Flash F407VG",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/Firmware/upload.ps1", "-Target", "F407VG"],
+      "options": {
+        "cwd": "${workspaceFolder}/Firmware"
+      },
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "Firmware: Build F407VG_DISCO",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/Firmware/build.ps1", "-Target", "F407VG_DISCO"],
+      "options": {
+        "cwd": "${workspaceFolder}/Firmware"
+      },
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "Firmware: Clean F407VG_DISCO",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/Firmware/clean.ps1", "-Target", "F407VG_DISCO"],
+      "options": {
+        "cwd": "${workspaceFolder}/Firmware"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Firmware: Flash F407VG_DISCO",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/Firmware/upload.ps1", "-Target", "F407VG_DISCO"],
+      "options": {
+        "cwd": "${workspaceFolder}/Firmware"
+      },
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "Firmware: Build F411RE",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/Firmware/build.ps1", "-Target", "F411RE"],
+      "options": {
+        "cwd": "${workspaceFolder}/Firmware"
+      },
+      "group": "build",
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "Firmware: Clean F411RE",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/Firmware/clean.ps1", "-Target", "F411RE"],
+      "options": {
+        "cwd": "${workspaceFolder}/Firmware"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Firmware: Flash F411RE",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/Firmware/upload.ps1", "-Target", "F411RE"],
+      "options": {
+        "cwd": "${workspaceFolder}/Firmware"
+      },
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "Firmware: Build All Targets",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/Firmware/make_windows.ps1"],
+      "options": {
+        "cwd": "${workspaceFolder}/Firmware"
+      },
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "Configurator: Build",
+      "type": "shell",
+      "command": "cmd",
+      "args": ["/c", "${workspaceFolder}\\Configurator\\build\\build.bat"],
+      "options": {
+        "cwd": "${workspaceFolder}/Configurator"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Configurator: Run",
+      "type": "shell",
+      "command": "${workspaceFolder}/Configurator/.venv/Scripts/python.exe",
+      "args": ["main.py"],
+      "options": {
+        "cwd": "${workspaceFolder}/Configurator"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Configurator: Install Requirements",
+      "type": "shell",
+      "command": "cmd",
+      "args": ["/c", "${workspaceFolder}\\Configurator\\setup_venv_win.bat"],
+      "options": {
+        "cwd": "${workspaceFolder}/Configurator"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

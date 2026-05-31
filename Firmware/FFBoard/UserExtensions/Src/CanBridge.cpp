@@ -103,10 +103,18 @@ void CanBridge::update(){
 			if(rxHeader.extId){
 				id |= 0x80000000;
 			}
-			std::vector<char> reply = {
-					0xF1,0,(char)(time & 0xff), (char)((time >> 8) & 0xff), (char)((time >> 16) & 0xff), (char)((time >> 24) & 0xff),
-					(char)(id & 0xff), (char)((id >> 8) & 0xff), (char)((id >> 16) & 0xff), (char)((id >> 24) & 0xff),
-					(char)((rxHeader.length & 0xf) | (1 >> 4))
+			std::vector<uint8_t> reply = {
+					0xF1,
+					0,
+					static_cast<uint8_t>(time & 0xff),
+					static_cast<uint8_t>((time >> 8) & 0xff),
+					static_cast<uint8_t>((time >> 16) & 0xff),
+					static_cast<uint8_t>((time >> 24) & 0xff),
+					static_cast<uint8_t>(id & 0xff),
+					static_cast<uint8_t>((id >> 8) & 0xff),
+					static_cast<uint8_t>((id >> 16) & 0xff),
+					static_cast<uint8_t>((id >> 24) & 0xff),
+					static_cast<uint8_t>((rxHeader.length & 0xf) | (1 >> 4))
 			};
 
 			for(uint8_t i = 0; i< rxHeader.length; i++){
@@ -161,7 +169,7 @@ void CanBridge::cdcRcv(char* Buf, uint32_t *Len){
 		}
 	}
 
-	std::vector<char> reply;
+	std::vector<uint8_t> reply;
 	while(pos < *Len){
 
 		uint8_t datalength = *Len;
@@ -198,7 +206,14 @@ void CanBridge::cdcRcv(char* Buf, uint32_t *Len){
 			case(1):
 			{	// sync. Microseconds since start up LSB to MSB
 				uint32_t time = HAL_GetTick()*1000;//HAL_CAN_GetTxTimestamp(CanHandle, txMailbox); // or use systick and scale.
-				std::vector<char> t = {0xF1,cmd,(char)(time & 0xff), (char)((time >> 8) & 0xff), (char)((time >> 16) & 0xff), (char)((time >> 24) & 0xff)};
+				std::vector<uint8_t> t = {
+					0xF1,
+					cmd,
+					static_cast<uint8_t>(time & 0xff),
+					static_cast<uint8_t>((time >> 8) & 0xff),
+					static_cast<uint8_t>((time >> 16) & 0xff),
+					static_cast<uint8_t>((time >> 24) & 0xff)
+				};
 				reply.insert(reply.end(),t.begin(),t.end());
 
 				break;
@@ -229,10 +244,10 @@ void CanBridge::cdcRcv(char* Buf, uint32_t *Len){
 			}
 			case(6): // get can config
 			{
-				std::vector<char> t =
+				std::vector<uint8_t> t =
 					{	0xF1,cmd,
-							(char)(conf1.enabled | conf1.listenOnly << 4),(char)(conf1.speed & 0xff), (char)((conf1.speed >> 8) & 0xff),(char)((conf1.speed >> 16) & 0xff),(char)((conf1.speed >> 24) & 0xff),
-							(char)(conf2.enabled | conf2.listenOnly << 4),(char)(conf2.speed & 0xff), (char)((conf2.speed >> 8) & 0xff),(char)((conf2.speed >> 16) & 0xff),(char)((conf2.speed >> 24) & 0xff),
+							static_cast<uint8_t>(conf1.enabled | conf1.listenOnly << 4),static_cast<uint8_t>(conf1.speed & 0xff), static_cast<uint8_t>((conf1.speed >> 8) & 0xff),static_cast<uint8_t>((conf1.speed >> 16) & 0xff),static_cast<uint8_t>((conf1.speed >> 24) & 0xff),
+							static_cast<uint8_t>(conf2.enabled | conf2.listenOnly << 4),static_cast<uint8_t>(conf2.speed & 0xff), static_cast<uint8_t>((conf2.speed >> 8) & 0xff),static_cast<uint8_t>((conf2.speed >> 16) & 0xff),static_cast<uint8_t>((conf2.speed >> 24) & 0xff),
 					};
 				reply.insert(reply.end(),t.begin(),t.end());
 				break;
@@ -241,7 +256,7 @@ void CanBridge::cdcRcv(char* Buf, uint32_t *Len){
 
 			case(7): // get device info
 			{
-				std::vector<char> t = {0xF1,cmd,1,1,1,0,0,0};
+				std::vector<uint8_t> t = {0xF1,cmd,1,1,1,0,0,0};
 				reply.insert(reply.end(),t.begin(),t.end());
 				break;
 			}
@@ -265,7 +280,7 @@ void CanBridge::cdcRcv(char* Buf, uint32_t *Len){
 
 			case(12): // Num buses
 			{
-				std::vector<char> t = {0xF1,cmd,numBuses};
+				std::vector<uint8_t> t = {0xF1,cmd,numBuses};
 				reply.insert(reply.end(),t.begin(),t.end());
 			}
 			break;

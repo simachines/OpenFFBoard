@@ -13,6 +13,8 @@ DEBUG = 0
 # optimization
 OPT = -O2 # -mno-unaligned-access
 OPTCPP = -Os
+# debug symbols/options (used when DEBUG=1)
+DBGFLAGS = -g -ggdb
 
 
 #######################################
@@ -180,19 +182,15 @@ C_SOURCES := $(filter-out %_f16.c %_f64.c %_mve.c, $(C_SOURCES))
 endif
 
 # compile gcc flags
-ASFLAGS = $(MCU) $(AS_DEFS) $(AS_INCLUDES) $(OPT) -Wall -fdata-sections -ffunction-sections
+ASFLAGS = $(MCU) $(AS_DEFS) $(AS_INCLUDES) $(OPT) -Wall -fdata-sections -ffunction-sections $(DBGFLAGS)
 
-CFLAGS = $(MCU) $(C_DEFS) $(C_INCLUDES) $(OPT) -Wall -fdata-sections -ffunction-sections -std=gnu11
-
-ifeq ($(DEBUG), 1)
-CFLAGS += -g -gdwarf-2
-endif
+CFLAGS = $(MCU) $(C_DEFS) $(C_INCLUDES) $(OPT) -Wall -fdata-sections -ffunction-sections -std=gnu11 $(DBGFLAGS)
 
 
 # Generate dependency information
 CFLAGS += -MMD -MP -MF"$(@:%.o=%.d)"
 
-CXXFLAGS = $(MCU) $(C_DEFS) $(C_INCLUDES) $(OPTCPP) -Wall -fdata-sections -ffunction-sections -fno-exceptions -fno-use-cxa-atexit -std=gnu++20 -fstack-usage -Wno-volatile
+CXXFLAGS = $(MCU) $(C_DEFS) $(C_INCLUDES) $(OPTCPP) -Wall -fdata-sections -ffunction-sections -fno-exceptions -fno-use-cxa-atexit -std=gnu++20 -fstack-usage -Wno-volatile $(DBGFLAGS)
 
 #######################################
 # LDFLAGS

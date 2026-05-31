@@ -1,7 +1,7 @@
 [submodule "Configurator"]
 	path = Configurator
-	url = https://github.com/Ultrawipf/OpenFFBoard-configurator.git
-	branch = .
+	url = https://github.com/manoukianv/OpenFFBoard-configurator.git
+	branch = feat/add_cogging
 [submodule "Hardware"]
 	path = Hardware
 	url = https://github.com/Ultrawipf/OpenFFBoard-hardware.git
