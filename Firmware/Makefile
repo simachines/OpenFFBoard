@@ -13,7 +13,6 @@ DEBUG = 0
 # optimization
 OPT = -O2 # -mno-unaligned-access
 OPTCPP = -Os
-# debug symbols/options (used when DEBUG=1)
 DBGFLAGS = -g -ggdb
 
 

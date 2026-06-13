@@ -87,6 +87,52 @@ struct CoggingCalibData {
 	uint16_t counts[1024];
 };
 
+enum class TMC4671CoggingDebugPhase : uint32_t {
+	Idle = 0,
+	SysId,
+	Validation,
+	Acquisition,
+	ScaleTune,
+	ReturnToCenter,
+	Completed,
+	Aborted,
+	TuneSweepP,
+	TuneSweepI,
+};
+
+struct TMC4671CoggingDebugVars {
+	uint32_t phase = static_cast<uint32_t>(TMC4671CoggingDebugPhase::Idle);
+	uint32_t loopPeriodUs = 0;
+	uint32_t decimationRatio = 0;
+	uint32_t pidExecCount = 0;
+	uint32_t currentQuarter = 0;
+	float pidExecRateHz = 0.0f;
+	float targetRpm = 0.0f;
+	float targetPosTurns = 0.0f;
+	float actualPosTurns = 0.0f;
+	float positionErrorTurns = 0.0f;
+	float positionErrorDeg = 0.0f;
+	float quarterMaxErrDeg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	float maxErrDeg = 0.0f;
+	float iqPid = 0.0f;
+	float iqFriction = 0.0f;
+	float iqInertia = 0.0f;
+	float iqCompensation = 0.0f;
+	float iqCmd = 0.0f;
+	float Appliediq = 0.0f;
+	float currentVelTurns = 0.0f;
+	float currentAccelRad = 0.0f;
+	float currentKp = 0.0f;
+	float currentKi = 0.0f;
+	float currentKd = 0.0f;
+	float identifiedJ = 0.0f;
+	float identifiedB = 0.0f;
+	float dynamicFriction = 0.0f;
+	int32_t actualIq = 0;
+};
+
+extern volatile TMC4671CoggingDebugVars g_tmc4671_cogging_debug;
+
 enum class TMC_ControlState : uint32_t {uninitialized,waitPower,Shutdown,Running,EncoderInit,EncoderFinished,HardError,OverTemp,IndexSearch,FullCalibration,ExternalEncoderInit,Pidautotune
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
 	,CoggingCalibration
@@ -422,7 +468,7 @@ class TMC4671 :
 		svpwm,fullCalibration,calibrated,abnindexenabled,findIndex,getState,encpol,combineEncoder,invertForce,vmTmc,
 		extphie,torqueFilter_mode,torqueFilter_f,torqueFilter_q,pidautotune,fluxbrake,pwmfreq,
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
-		cogging,calibrateCogging, coggingTable, coggingScale
+		cogging,calibrateCogging, coggingTable, coggingScale, coggingSpeedP, coggingSpeedI, coggingPhaseLead, coggingHarmonics
 #endif
 	};
 
@@ -738,12 +784,16 @@ private:
 	bool cogging_enabled = false;
 	float cogging_scale = 0.5f;
 	int32_t last_anticogging_torque = 0;
+	float cogging_phase_lead = 0.0f;	// Phase advance gain (dimensionless, typical 0.0-1.0)
+	float last_cogging_pos = 0.0f;		// Previous position for velocity computation
 	void saveCoggingTable();
 	void clearCoggingTable();
 
 	std::unique_ptr<CoggingCalibData> coggingData = nullptr;
 	uint32_t calibStartTime = 0;
 	MotionMode prevCalibMode = MotionMode::stop;
+	float coggingSpeedP = 0.0f;
+	float coggingSpeedI = 0.0f;
 	void handleStateCoggingCalibration();
 #endif
 

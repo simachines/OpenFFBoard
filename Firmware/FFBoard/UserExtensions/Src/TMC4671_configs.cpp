@@ -33,7 +33,7 @@ const TMC4671HardwareTypeConf conf1_0 = {
 		.bbm = 20,
 };
 const TMC4671HardwareTypeConf conf1_2 = {
-		.name = "v1.2 AD8417 (1.5mOhm)",
+		.name = "v1.2 INA241A3 (1.5mOhm)",
 		.hwVersion = (uint8_t)TMC_HW_Ver::v1_2,
 		.adcOffset = 1000,
 		.thermistorSettings = {
@@ -48,7 +48,7 @@ const TMC4671HardwareTypeConf conf1_2 = {
 		.brakeLimHigh = 50900,
 		.vmScaler = (2.5 / 0x7fff) * ((1.5+71.5)/1.5),
 		.vSenseMult = VOLTAGE_MULT_DEFAULT,
-		.clockfreq = 25e6,
+		.clockfreq = 70e6,
 		.bbm = 40,
 };
 const TMC4671HardwareTypeConf conf1_2_2 = {

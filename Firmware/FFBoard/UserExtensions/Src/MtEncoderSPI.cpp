@@ -298,7 +298,7 @@ void MtEncoderSPI::setSpiSpeed(uint8_t preset){
 	if(preset == spiSpeedPreset){
 		return; // Ignore if no change
 	}
-	spiSpeedPreset = clip<uint8_t,uint8_t>(preset,0,spispeeds.size());
+	spiSpeedPreset = clip<uint8_t,uint8_t>(preset,0,spispeeds.size()-1);
 	this->spiConfig.peripheral.BaudRatePrescaler = spiPort.getClosestPrescaler(spispeeds[spiSpeedPreset]).first;
 	initSPI();
 }

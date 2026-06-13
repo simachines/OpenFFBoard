@@ -140,5 +140,5 @@ extern CAN_HandleTypeDef hcan1;
 #define COGGING_TABLE_SIZE                (COGGING_HARMONICS_COUNT * 12) 
 #define MAX_COGGING_TABLES                3
 #define COGGING_TABLE_FLASH_SECTOR        FLASH_SECTOR_4
-
+#define COGGING_DFT_USE_IQ_CMD
 #endif /* INC_TARGET_CONSTANTS_H_ */

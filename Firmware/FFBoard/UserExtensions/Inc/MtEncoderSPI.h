@@ -24,7 +24,7 @@ class MtEncoderSPI: public Encoder, public SPIDevice, public PersistentStorage, 
 	enum class MtEncoderSPI_mode : uint8_t{
 		mt6825,mt6835
 	};
-	const std::array<float,3> spispeeds = {10e6,5e6,2.5e6}; // Target speeds. Must double each entry
+	const std::array<float,4> spispeeds = {16e6,10e6,5e6,2.5e6}; // Target speeds
 public:
 	MtEncoderSPI();
 	virtual ~MtEncoderSPI();
