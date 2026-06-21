@@ -7,13 +7,13 @@
  *	/!\ Generated from the file memory_map.csv 
    / ! \ DO NOT EDIT THIS DIRECTLY !!!	
  */			
-		
+
 #ifndef EEPROM_ADDRESSES_H_
 #define EEPROM_ADDRESSES_H_
 
 #include "main.h"
 // Change this to the amount of currently registered variables
-#define NB_OF_VAR 189
+#define NB_OF_VAR 378
 extern const uint16_t VirtAddVarTab[NB_OF_VAR];
 
 // Amount of variables in exportable list
@@ -28,7 +28,7 @@ Anything below 0x00ff is reserved for system variables.
 Use ranges that are clear to distinguish between configurations. Address ranges can have gaps.		
 Label the names clearly.		
 Example: 0x0100 - 0x01ff for one class and 0x0200-0x02ff for another class would be reasonable even if they each need only 3 variables		
-		
+
 		
 Important: Add your variable to the VirtAddVarTab[NB_OF_VAR] array in eeprom_addresses.c!		
 		
@@ -121,6 +121,9 @@ uint16_t EE_ReadVariable(uint16_t VirtAddress, uint16_t* Data) will return 1 if 
 #define ADR_TMC1_TRQ_FILT 0x32C
 #define ADR_TMC1_COGGING_CAL 0x32D
 #define ADR_TMC1_COGGING_SCALE 0x32E
+#define ADR_TMC1_COGGING_DYN_OFS 0x32F
+// TMC1 Scale Curve: 14 uint16 values (*1000), addresses 0x330-0x33D
+#define ADR_TMC1_COGGING_SCALE_CURVE_BASE 0x330
 // AXIS2
 #define ADR_AXIS2_CONFIG 0x341 // 0-2 ENC, 3-5 DRV
 #define ADR_AXIS2_POWER 0x342
@@ -149,6 +152,9 @@ uint16_t EE_ReadVariable(uint16_t VirtAddress, uint16_t* Data) will return 1 if 
 #define ADR_TMC2_TRQ_FILT 0x36C
 #define ADR_TMC2_COGGING_CAL 0x36D
 #define ADR_TMC2_COGGING_SCALE 0x36E
+#define ADR_TMC2_COGGING_DYN_OFS 0x36F
+// TMC2 Scale Curve: 14 uint16 values (*1000), addresses 0x370-0x37D
+#define ADR_TMC2_COGGING_SCALE_CURVE_BASE 0x370
 // AXIS3
 #define ADR_AXIS3_CONFIG 0x381 // 0-2 ENC, 3-5 DRV
 #define ADR_AXIS3_POWER 0x382
@@ -177,6 +183,9 @@ uint16_t EE_ReadVariable(uint16_t VirtAddress, uint16_t* Data) will return 1 if 
 #define ADR_TMC3_TRQ_FILT 0x3AC
 #define ADR_TMC3_COGGING_CAL 0x3AD
 #define ADR_TMC3_COGGING_SCALE 0x3AE
+#define ADR_TMC3_COGGING_DYN_OFS 0x3AF
+// TMC3 Scale Curve: 14 uint16 values (*1000), addresses 0x3B0-0x3BD
+#define ADR_TMC3_COGGING_SCALE_CURVE_BASE 0x3B0
 // RMD CAN Motor
 #define ADR_RMD1_DATA1 0x3C0 //0-4 CAN ID
 #define ADR_RMD1_TORQUE 0x3C1 //Maximum current
@@ -235,4 +244,14 @@ uint16_t EE_ReadVariable(uint16_t VirtAddress, uint16_t* Data) will return 1 if 
 #define ADR_ADS111X_MAX_2 0x515
 #define ADR_ADS111X_MIN_3 0x516
 #define ADR_ADS111X_MAX_3 0x517
+// TMC Extended Curves (24-point scale curve + 24-point phase-advance curve per TMC).
+// Relocated to a contiguous block (free space after the SSI encoder section).
+// Each curve occupies 24 consecutive uint16 slots. Old 14-point bases above are
+// kept registered in VirtAddVarTab for legacy page-transfer compatibility only.
+#define ADR_TMC1_SCALE_CURVE_BASE     0x420 // 24 pts: 0x420-0x437
+#define ADR_TMC1_PHASEADV_CURVE_BASE  0x438 // 24 pts: 0x438-0x44F
+#define ADR_TMC2_SCALE_CURVE_BASE     0x450 // 24 pts: 0x450-0x467
+#define ADR_TMC2_PHASEADV_CURVE_BASE  0x468 // 24 pts: 0x468-0x47F
+#define ADR_TMC3_SCALE_CURVE_BASE     0x480 // 24 pts: 0x480-0x497
+#define ADR_TMC3_PHASEADV_CURVE_BASE  0x498 // 24 pts: 0x498-0x4AF
 #endif /* EEPROM_ADDRESSES_H_ */

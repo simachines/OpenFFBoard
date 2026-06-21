@@ -101,21 +101,21 @@ void TMC4671::setAddress(uint8_t address){
 	if (address == 1){
 		this->flashAddrs = TMC4671FlashAddrs({ADR_TMC1_MOTCONF, ADR_TMC1_CPR, ADR_TMC1_ENCA, ADR_TMC1_OFFSETFLUX, ADR_TMC1_TORQUE_P, ADR_TMC1_TORQUE_I, ADR_TMC1_FLUX_P, ADR_TMC1_FLUX_I,ADR_TMC1_ADC_I0_OFS,ADR_TMC1_ADC_I1_OFS,ADR_TMC1_ENC_OFFSET,ADR_TMC1_PHIE_OFS,ADR_TMC1_TRQ_FILT
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
-			,ADR_TMC1_COGGING_CAL
+			,ADR_TMC1_COGGING_CAL, ADR_TMC1_COGGING_SCALE, ADR_TMC1_COGGING_DYN_OFS, ADR_TMC1_SCALE_CURVE_BASE, ADR_TMC1_PHASEADV_CURVE_BASE
 #endif
 			});
 	}else if (address == 2)
 	{
 		this->flashAddrs = TMC4671FlashAddrs({ADR_TMC2_MOTCONF, ADR_TMC2_CPR, ADR_TMC2_ENCA, ADR_TMC2_OFFSETFLUX, ADR_TMC2_TORQUE_P, ADR_TMC2_TORQUE_I, ADR_TMC2_FLUX_P, ADR_TMC2_FLUX_I,ADR_TMC2_ADC_I0_OFS,ADR_TMC2_ADC_I1_OFS,ADR_TMC2_ENC_OFFSET,ADR_TMC2_PHIE_OFS,ADR_TMC2_TRQ_FILT
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
-	,ADR_TMC2_COGGING_CAL
+	,ADR_TMC2_COGGING_CAL, ADR_TMC2_COGGING_SCALE, ADR_TMC2_COGGING_DYN_OFS, ADR_TMC2_SCALE_CURVE_BASE, ADR_TMC2_PHASEADV_CURVE_BASE
 #endif
 		});
 	}else if (address == 3)
 	{
 		this->flashAddrs = TMC4671FlashAddrs({ADR_TMC3_MOTCONF, ADR_TMC3_CPR, ADR_TMC3_ENCA, ADR_TMC3_OFFSETFLUX, ADR_TMC3_TORQUE_P, ADR_TMC3_TORQUE_I, ADR_TMC3_FLUX_P, ADR_TMC3_FLUX_I,ADR_TMC3_ADC_I0_OFS,ADR_TMC3_ADC_I1_OFS,ADR_TMC3_ENC_OFFSET,ADR_TMC3_PHIE_OFS,ADR_TMC3_TRQ_FILT
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS			
-	,ADR_TMC3_COGGING_CAL
+	,ADR_TMC3_COGGING_CAL, ADR_TMC3_COGGING_SCALE, ADR_TMC3_COGGING_DYN_OFS, ADR_TMC3_SCALE_CURVE_BASE, ADR_TMC3_PHASEADV_CURVE_BASE
 #endif
 		});
 	}
@@ -153,6 +153,22 @@ void TMC4671::saveFlash(){
 	
 	int16_t scale_int = clip<float>(this->cogging_scale * 10000.0f, -32767, 32767);
 	Flash_Write(flashAddrs.coggingScale, (uint16_t)scale_int);
+
+	// Save speed-dependent scale curve (24 points, *1000)
+	if (scale_curve_valid) {
+		for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
+			int16_t curve_val = (int16_t)clip<float>(scale_curve_values[i] * 1000.0f, 0, 32767);
+			Flash_Write(flashAddrs.scaleCurveBase + i, (uint16_t)curve_val);
+		}
+	}
+
+	// Save velocity-based phase-advance curve (24 points, degrees * 100)
+	if (phase_adv_curve_valid) {
+		for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
+			int16_t curve_val = (int16_t)clip<float>(phase_advance_curve_values[i] * 100.0f, -32767, 32767);
+			Flash_Write(flashAddrs.phaseAdvCurveBase + i, (uint16_t)curve_val);
+		}
+	}
 #endif
 }
 
@@ -167,8 +183,7 @@ void TMC4671::saveAdcParams(){
 
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
 void TMC4671::saveCoggingTable(){
-	Flash_WriteCoggingTable(this->drv_address - 1, (void*)this->cogging_harmonics);
-}
+		Flash_WriteCoggingTable(this->drv_address - 1, (void*)this->cogging_harmonics);}
 
 void TMC4671::clearCoggingTable(){
 	memset(cogging_harmonics, 0, sizeof(cogging_harmonics));
@@ -246,6 +261,41 @@ void TMC4671::restoreFlash(){
 	}
 
 	Flash_ReadCoggingTable(this->drv_address - 1, (int16_t*)this->cogging_harmonics);
+
+	// Largest single harmonic amplitude as tanh reference.
+	// Using sum-of-all or RMS overestimates, keeping tanh in linear zone.
+	// Restore speed-dependent scale curve (24 points, *1000)
+	scale_curve_valid = false;
+	scale_curve_count = SCALE_CURVE_POINTS;
+	uint16_t curve_flash = 0;
+	bool any_valid = false;
+	for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
+		if (Flash_Read(flashAddrs.scaleCurveBase + i, &curve_flash)) {
+			scale_curve_values[i] = (float)(int16_t)curve_flash / 1000.0f;
+			any_valid = true;
+		} else {
+			scale_curve_values[i] = 0.0f;
+		}
+	}
+	// Validate: 3 RPM scale should be near 1.0. Reject corrupt curves from old code.
+	if (any_valid && scale_curve_values[0] >= 1.0f)
+		scale_curve_valid = true;
+
+	// Restore velocity-based phase-advance curve (24 points, degrees * 100)
+	phase_adv_curve_valid = false;
+	uint16_t padv_flash = 0;
+	bool padv_any_valid = false;
+	for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
+		if (Flash_Read(flashAddrs.phaseAdvCurveBase + i, &padv_flash)) {
+			phase_advance_curve_values[i] = (float)(int16_t)padv_flash / 100.0f;
+			padv_any_valid = true;
+		} else {
+			phase_advance_curve_values[i] = 0.0f;
+		}
+	}
+	// Consider valid as soon as any point has ever been written to flash.
+	if (padv_any_valid)
+		phase_adv_curve_valid = true;
 #endif
 }
 
@@ -1629,30 +1679,53 @@ void TMC4671::turn(int16_t power){
 	if (cogging_enabled && !this->isCalibrationInProgress()) {
 		float pos_f = this->getFilteredPosition();
 
-		// Phase advance: predict rotor position at time current reaches windings.
-		// Uses position delta between successive turn() calls as velocity estimate.
-		// cogging_phase_lead absorbs control loop rate and system delay (PWM + current loop).
-		// Typical values: 0.0 (off) to 1.0 (one full control cycle ahead).
-		float pos_advanced = pos_f;
-		if (this->cogging_phase_lead > 0.0f) {
-			float pos_delta = pos_f - this->last_cogging_pos;
-			// Handle wrap-around at mechanical turn boundary
-			if (pos_delta > 0.5f)  pos_delta -= 1.0f;
-			if (pos_delta < -0.5f) pos_delta += 1.0f;
-			pos_advanced = pos_f + pos_delta * this->cogging_phase_lead;
+		// Measure RPM from position delta (runs in turn() at firmware speed)
+		uint32_t now = micros();
+		float signed_rpm = 0.0f;
+		if (last_vel_tick > 0) {
+			float dt_sec = (float)(now - last_vel_tick) / 1000000.0f;
+			float delta = pos_f - prev_filtered_pos;
+			if (delta > 0.5f) delta -= 1.0f;
+			if (delta < -0.5f) delta += 1.0f;
+			signed_rpm = (delta / dt_sec) * 60.0f;
+			measured_rpm = fabsf(signed_rpm);
+			measured_rpm_signed = signed_rpm;
 		}
-		this->last_cogging_pos = pos_f;
+		prev_filtered_pos = pos_f;
+		last_vel_tick = now;
+
+		// Velocity-based phase advance: shift the lookup position forward in the
+		// direction of motion to compensate for high-speed lag of the cogging pattern.
+		if (phase_adv_curve_valid) {
+			float adv_deg = interpolatePhaseAdvance(measured_rpm);
+			float dir = (signed_rpm >= 0.0f) ? 1.0f : -1.0f;
+			pos_f += dir * adv_deg / 360.0f;
+			// Wrap back into [0,1)
+			pos_f = pos_f - floorf(pos_f);
+		}
 
 		// Fourier series compensation: Sum(A_k * sin(k * theta + phi_k))
 		float compensation = 0;
-		float angle_rad = pos_advanced * 2.0f * PI;
+		float angle_rad = pos_f * 2.0f * PI;
 		
 		for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
 			if (cogging_harmonics[i].amplitude > 0.0f) {
 				compensation += cogging_harmonics[i].amplitude * arm_sin_f32(angle_rad * cogging_harmonics[i].order + cogging_harmonics[i].phase);
 			}
 		}
-		this->last_anticogging_torque = (int32_t)(this->cogging_scale * compensation);
+		// Speed-dependent scale: interpolate from calibrated curve if available
+		float dyn_scale = this->cogging_scale;
+
+		if (scale_curve_valid) {
+			// Use EMA-filtered RPM measured in acttrq handler (polled every 50ms)
+			float rpm = measured_rpm;
+			// Small deadband for encoder noise at standstill
+			if (rpm < 0.3f) rpm = 0.0f;
+			dyn_scale = interpolateScale(rpm);
+		}
+
+		this->last_anticogging_torque = (int32_t)(dyn_scale * compensation);
+		this->last_cogging_scale = dyn_scale;
 
 		totalPower += this->last_anticogging_torque;
 		
@@ -2740,13 +2813,25 @@ void TMC4671::registerCommands(){
 	registerCommand("coggingScale", TMC4671_commands::coggingScale, "Cogging compensation scale (0-100)",CMDFLAG_GET | CMDFLAG_SET);
 	registerCommand("coggingSpeedP", TMC4671_commands::coggingSpeedP, "Manual speed loop P gain for cogging",CMDFLAG_GET | CMDFLAG_SET);
 	registerCommand("coggingSpeedI", TMC4671_commands::coggingSpeedI, "Manual speed loop I gain for cogging",CMDFLAG_GET | CMDFLAG_SET);
-	registerCommand("coggingPhaseLead", TMC4671_commands::coggingPhaseLead, "Phase lead gain for anti-cogging (0-10000=1.0)",CMDFLAG_GET | CMDFLAG_SET);
-	registerCommand("coggingHarmonics", TMC4671_commands::coggingHarmonics, "Get full harmonic table (order:amp:phase)",CMDFLAG_GET);
+	registerCommand("coggingHarmonics", TMC4671_commands::coggingHarmonics, "Get full harmonic table",CMDFLAG_GET);
+	registerCommand("coggingCwCcw", TMC4671_commands::coggingCwCcw, "Get CW and CCW raw harmonics",CMDFLAG_GET);
+	registerCommand("coggingSave", TMC4671_commands::coggingSave, "Save cogging table to flash",CMDFLAG_GET);
+	registerCommand("coggingShape", TMC4671_commands::coggingShape, "Waveshaping factor (*100)",CMDFLAG_GET | CMDFLAG_SET);
+	registerCommand("coggingSpeedD", TMC4671_commands::coggingSpeedD, "Speed D gain for cogging",CMDFLAG_GET | CMDFLAG_SET);
+	registerCommand("scaleCurve", TMC4671_commands::scaleCurve, "Get/Set scale curve values",CMDFLAG_GET | CMDFLAG_SETADR);
+	registerCommand("phaseAdvCurve", TMC4671_commands::phaseAdvCurve, "Get/Set phase advance curve (degrees per RPM)",CMDFLAG_GET | CMDFLAG_SETADR);
 #endif
 }
 
 
 CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply>& replies){
+#ifdef COGGING_TABLE_FLASH_START_ADDRESS
+	// During cogging calibration, block all poll commands to avoid SPI contention
+	// and serial log flooding. Only calibration progress broadcasts are allowed through.
+	if (state == TMC_ControlState::CoggingCalibration && static_cast<TMC4671_commands>(cmd.cmdId) != TMC4671_commands::calibrateCogging) {
+		return CommandStatus::NO_REPLY;
+	}
+#endif
 	CommandStatus status = CommandStatus::OK;
 	switch(static_cast<TMC4671_commands>(cmd.cmdId)){
 	case TMC4671_commands::combineEncoder:
@@ -2850,8 +2935,10 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			std::string replyStr = std::to_string(current.second) + ":" + std::to_string(current.first);
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
 			replyStr += ":" + std::to_string(this->last_anticogging_torque);
-			// Append normalized mechanical position (0.0-1.0) as fixed-point * 10000
+			// Append scale then position
+			replyStr += ":" + std::to_string((int16_t)(this->last_cogging_scale * 100.0f));
 			replyStr += ":" + std::to_string((int32_t)(this->getFilteredPosition() * 10000.0f));
+			replyStr += ":" + std::to_string((int16_t)(this->measured_rpm));
 #endif
 			replies.emplace_back(CommandReply(replyStr, current.second, current.first));
 		}
@@ -3137,11 +3224,57 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 		handleGetSet(cmd, replies, this->coggingSpeedI);
 		break;
 
-	case TMC4671_commands::coggingPhaseLead:
+	case TMC4671_commands::coggingSave:
 		if (cmd.type == CMDtype::get) {
-			replies.emplace_back((int16_t)(this->cogging_phase_lead * 10000.0f));
+			saveCoggingTable();
+			replies.emplace_back(1);
+		}
+		break;
+
+	case TMC4671_commands::coggingSpeedD:
+		if (cmd.type == CMDtype::get) {
+			replies.emplace_back((int16_t)(this->coggingSpeedD));
 		} else if (cmd.type == CMDtype::set) {
-			this->cogging_phase_lead = (float)(int16_t)cmd.val / 10000.0f;
+			this->coggingSpeedD = clip<float>((float)(int16_t)cmd.val, 0.0f, 100000.0f);
+		}
+		break;
+
+	case TMC4671_commands::scaleCurve:
+		if (cmd.type == CMDtype::get) {
+			std::string s;
+			for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
+				if (i > 0) s += ",";
+				s += std::to_string((int16_t)(scale_curve_rpm_defaults[i])) + ":";
+				s += std::to_string((int16_t)(scale_curve_values[i] * 1000.0f));
+			}
+			replies.emplace_back(s);
+		} else if (cmd.type == CMDtype::setat) {
+			uint8_t idx = (uint8_t)cmd.adr;
+			if (idx < SCALE_CURVE_POINTS) {
+				scale_curve_values[idx] = (float)(int16_t)cmd.val / 1000.0f;
+				scale_curve_count = SCALE_CURVE_POINTS;
+				scale_curve_valid = true;
+			}
+		}
+		break;
+
+	case TMC4671_commands::phaseAdvCurve:
+		if (cmd.type == CMDtype::get) {
+			// Format identical to scaleCurve: "rpm:deg100,rpm:deg100,..."
+			// Phase advance stored as degrees * 100 for 0.01 deg resolution.
+			std::string s;
+			for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
+				if (i > 0) s += ",";
+				s += std::to_string((int16_t)(scale_curve_rpm_defaults[i])) + ":";
+				s += std::to_string((int16_t)(phase_advance_curve_values[i] * 100.0f));
+			}
+			replies.emplace_back(s);
+		} else if (cmd.type == CMDtype::setat) {
+			uint8_t idx = (uint8_t)cmd.adr;
+			if (idx < SCALE_CURVE_POINTS) {
+				phase_advance_curve_values[idx] = (float)(int16_t)cmd.val / 100.0f;
+				phase_adv_curve_valid = true;
+			}
 		}
 		break;
 
@@ -3164,6 +3297,47 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 				s = "0:0:0"; // Empty table
 			}
 			CommandHandler::broadcastCommandReply(CommandReply(s,0), (uint32_t)TMC4671_commands::coggingHarmonics, CMDtype::get);
+			return CommandStatus::NO_REPLY;
+		}
+		break;
+
+	case TMC4671_commands::coggingCwCcw:
+		if(cmd.type == CMDtype::get){
+			// Return CW and CCW separate harmonic tables
+			// Format: "CW:order:amp:phase,...|CCW:order:amp:phase,..."
+			std::string s;
+			s.reserve(512);
+
+			if (cwccw_data_valid) {
+				s += "CW:";
+				bool first = true;
+				for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
+					if (cw_store[i].amplitude > 0.0f) {
+						if (!first) s += ",";
+						first = false;
+						s += std::to_string(cw_store[i].order) + ":";
+						s += std::to_string((int16_t)cw_store[i].amplitude) + ":";
+						s += std::to_string((int16_t)(cw_store[i].phase * 1000.0f));
+					}
+				}
+				if (first) s += "0:0:0";
+
+				s += "|CCW:";
+				first = true;
+				for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
+					if (ccw_store[i].amplitude > 0.0f) {
+						if (!first) s += ",";
+						first = false;
+						s += std::to_string(ccw_store[i].order) + ":";
+						s += std::to_string((int16_t)ccw_store[i].amplitude) + ":";
+						s += std::to_string((int16_t)(ccw_store[i].phase * 1000.0f));
+					}
+				}
+				if (first) s += "0:0:0";
+			} else {
+				s = "CW:0:0:0|CCW:0:0:0";
+			}
+			CommandHandler::broadcastCommandReply(CommandReply(s,0), (uint32_t)TMC4671_commands::coggingCwCcw, CMDtype::get);
 			return CommandStatus::NO_REPLY;
 		}
 		break;
@@ -3443,8 +3617,8 @@ void TMC4671::applySafeTorque(float torque_cmd) {
 
 // Helper: Calculate wrapped error between 0 and 1 turn
 float TMC4671::getWrappedError(float target, float actual) {
-	target = target - floorf(target); 
-	actual = actual - floorf(actual); 
+	target = target - (float)((int32_t)target); 
+    actual = actual - (float)((int32_t)actual); 
 	float err = target - actual;
 	if (err > 0.5f) err -= 1.0f;
 	if (err < -0.5f) err += 1.0f;
@@ -3454,6 +3628,34 @@ float TMC4671::getWrappedError(float target, float actual) {
 float TMC4671::getAbsolutePosition() {
 	Encoder* activeEnc = usingExternalEncoder() ? drvEncoder.get() : static_cast<Encoder*>(this);
 	return activeEnc->getPos_f();
+}
+
+float TMC4671::interpolateScale(float rpm) {
+	if (!scale_curve_valid || scale_curve_count < 2) return this->cogging_scale;
+	const float* rpm_pts = scale_curve_rpm_defaults;
+	// 0–3 RPM: flat plateau at the 3 RPM calibrated value (typically 1.0)
+	if (rpm <= rpm_pts[0]) return scale_curve_values[0];
+	for (uint8_t i = 0; i < scale_curve_count - 1; i++) {
+		if (rpm >= rpm_pts[i] && rpm <= rpm_pts[i+1]) {
+			float t = (rpm - rpm_pts[i]) / (rpm_pts[i+1] - rpm_pts[i]);
+			return scale_curve_values[i] + t * (scale_curve_values[i+1] - scale_curve_values[i]);
+		}
+	}
+	return scale_curve_values[scale_curve_count - 1];
+}
+
+float TMC4671::interpolatePhaseAdvance(float rpm) {
+	if (!phase_adv_curve_valid) return 0.0f;
+	const float* rpm_pts = scale_curve_rpm_defaults;
+	// 0–3 RPM: no phase advance (low speed plateau)
+	if (rpm <= rpm_pts[0]) return phase_advance_curve_values[0];
+	for (uint8_t i = 0; i < SCALE_CURVE_POINTS - 1; i++) {
+		if (rpm >= rpm_pts[i] && rpm <= rpm_pts[i+1]) {
+			float t = (rpm - rpm_pts[i]) / (rpm_pts[i+1] - rpm_pts[i]);
+			return phase_advance_curve_values[i] + t * (phase_advance_curve_values[i+1] - phase_advance_curve_values[i]);
+		}
+	}
+	return phase_advance_curve_values[SCALE_CURVE_POINTS - 1];
 }
 
 float TMC4671::getFilteredPosition() {
@@ -3469,6 +3671,103 @@ float TMC4671::getFilteredPosition() {
 	
 	return (float)remainder / (float)cpr;
 }
+
+#ifdef COGGING_TABLE_FLASH_START_ADDRESS
+/**
+ * Rebuilds cogging_harmonics from stored CW/CCW data with position offsets.
+ * Called when configurator changes CW/CCW position offsets.
+ * Position offset shifts the waveform horizontally: phase -= order * offset_turns * 2π.
+ * Magnitude scaling is NOT applied (vertical offset is configurator-only visualization).
+ * CW and CCW store arrays are independently sorted; we match by harmonic order.
+ */
+void TMC4671::recomputeCoggingFromCwCcw() {
+	if (!cwccw_data_valid) return;
+
+	float cw_pos_rad = 0.0f;
+	float ccw_pos_rad = 0.0f;
+
+	struct Sel { float mag; uint16_t order; float phase; };
+	Sel best[COGGING_HARMONICS_COUNT];
+	memset(best, 0, sizeof(best));
+
+	bool seen[COGGING_CALIB_DFT_HARMONICS] = {false};
+
+	for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
+		uint16_t order;
+		float cw_mag = 0.0f, ccw_mag = 0.0f;
+		float cw_ph = 0.0f, ccw_ph = 0.0f;
+
+		if (cw_store[i].amplitude > 0.0f) {
+			order = cw_store[i].order;
+			if (seen[order]) continue;
+			seen[order] = true;
+			cw_mag = cw_store[i].amplitude;
+			// Position offset: phase adjustment is k * Δθ (shift right by Δθ = subtract k*Δθ from phase)
+			cw_ph = cw_store[i].phase - (float)order * cw_pos_rad;
+
+			for (uint8_t j = 0; j < COGGING_HARMONICS_COUNT; j++) {
+				if (ccw_store[j].order == order && ccw_store[j].amplitude > 0.0f) {
+					ccw_mag = ccw_store[j].amplitude;
+					ccw_ph = ccw_store[j].phase - (float)order * ccw_pos_rad;
+					break;
+				}
+			}
+		} else {
+			continue;
+		}
+
+		float avg_mag = (cw_mag + ccw_mag) / 2.0f;
+
+		float phase_diff = cw_ph - ccw_ph;
+		if (phase_diff > PI) ccw_ph += 2.0f * PI;
+		if (phase_diff < -PI) ccw_ph -= 2.0f * PI;
+		float avg_phase = (cw_ph + ccw_ph) / 2.0f;
+
+		for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+			if (avg_mag > best[n].mag) {
+				for (int s = COGGING_HARMONICS_COUNT - 1; s > n; s--) best[s] = best[s-1];
+				best[n].mag = avg_mag;
+				best[n].order = order;
+				best[n].phase = avg_phase;
+				break;
+			}
+		}
+	}
+
+	// Process CCW-only orders
+	for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
+		if (ccw_store[i].amplitude <= 0.0f) continue;
+		uint16_t order = ccw_store[i].order;
+		if (seen[order]) continue;
+		seen[order] = true;
+
+		float avg_mag = ccw_store[i].amplitude;
+		float avg_phase = ccw_store[i].phase - (float)order * ccw_pos_rad;
+
+		for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+			if (avg_mag > best[n].mag) {
+				for (int s = COGGING_HARMONICS_COUNT - 1; s > n; s--) best[s] = best[s-1];
+				best[n].mag = avg_mag;
+				best[n].order = order;
+				best[n].phase = avg_phase;
+				break;
+			}
+		}
+	}
+
+	memset(cogging_harmonics, 0, sizeof(cogging_harmonics));
+	for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+		if (best[n].mag <= 0.0f) continue;
+		cogging_harmonics[n].order = best[n].order;
+		cogging_harmonics[n].amplitude = best[n].mag;
+		cogging_harmonics[n].phase = best[n].phase;
+	}
+
+	// NOTE: saveCoggingTable() is NOT called here.
+	// Flash writes during motor operation can cause SPI faults / crashes.
+	// The configurator sends coggingSave separately after all offset commands.
+}
+#endif
 
 /**
  * Calculates a detent torque compensation map (anti-cogging) for the motor.
@@ -3517,46 +3816,19 @@ void TMC4671::handleStateCoggingCalibration() {
 	float max_test_torque = bangInitPower > 0 ? (float)bangInitPower * 0.8f : 2000.0f; 
 	volatile TMC4671CoggingDebugVars& dbg = g_tmc4671_cogging_debug;
 
-	auto clearDebugErrorPeaks = [&]() {
-		dbg.currentQuarter = 0;
-		dbg.maxErrDeg = 0.0f;
-		for (uint8_t quarter = 0; quarter < 4; quarter++) {
-			dbg.quarterMaxErrDeg[quarter] = 0.0f;
-		}
-	};
 
 	auto resetDebugWatch = [&]() {
-		dbg.phase = static_cast<uint32_t>(TMC4671CoggingDebugPhase::Idle);
-		dbg.loopPeriodUs = 0;
-		dbg.decimationRatio = 0;
 		dbg.pidExecCount = 0;
-		dbg.pidExecRateHz = 0.0f;
-		dbg.targetRpm = 0.0f;
-		dbg.targetPosTurns = 0.0f;
-		dbg.actualPosTurns = 0.0f;
-		dbg.positionErrorTurns = 0.0f;
+		dbg.pidExecRate = 0;
 		dbg.positionErrorDeg = 0.0f;
-		dbg.iqPid = 0.0f;
-		dbg.iqFriction = 0.0f;
-		dbg.iqInertia = 0.0f;
 		dbg.iqCompensation = 0.0f;
 		dbg.iqCmd = 0.0f;
 		dbg.Appliediq = 0.0f;
-		dbg.currentVelTurns = 0.0f;
-		dbg.currentAccelRad = 0.0f;
-		dbg.currentKp = 0.0f;
-		dbg.currentKi = 0.0f;
-		dbg.currentKd = 0.0f;
-		dbg.identifiedJ = 0.0f;
-		dbg.identifiedB = 0.0f;
-		dbg.dynamicFriction = 0.0f;
 		dbg.actualIq = 0;
-		clearDebugErrorPeaks();
+		dbg.lastCaptureDebugUs = 0;
 	};
 
 	auto captureDebug = [&](TMC4671CoggingDebugPhase phase,
-			uint32_t loop_period_us,
-			uint32_t decimation_ratio,
 			float target_rpm,
 			float target_pos_turns,
 			float actual_pos_turns,
@@ -3572,53 +3844,26 @@ void TMC4671::handleStateCoggingCalibration() {
 			float identified_j,
 			float identified_b,
 			float dynamic_friction) {
-		dbg.phase = static_cast<uint32_t>(phase);
-		dbg.loopPeriodUs = loop_period_us;
-		dbg.decimationRatio = decimation_ratio;
-		dbg.pidExecCount++;
-		dbg.pidExecRateHz = (loop_period_us > 0 && decimation_ratio > 0) ? (1000000.0f / ((float)loop_period_us * (float)decimation_ratio)) : 0.0f;
-		dbg.targetRpm = target_rpm;
-		dbg.targetPosTurns = target_pos_turns;
-		dbg.actualPosTurns = actual_pos_turns;
-		dbg.positionErrorTurns = error_turns;
+		// Real Hz from micros() delta — unaffected by decimation or loop jitter
+		uint32_t now_us = micros();
+		if (now_us != 0) {
+			uint32_t delta_us = now_us - dbg.lastCaptureDebugUs;
+			if (delta_us > 0) {
+				dbg.pidExecRate = delta_us;
+			}
+		}
+		dbg.lastCaptureDebugUs = now_us;
+		
 		dbg.positionErrorDeg = error_turns * 360.0f;
-		dbg.iqPid = iq_pid;
-		dbg.iqFriction = iq_friction;
-		dbg.iqInertia = iq_inertia;
+		//dbg.iqPid = iq_pid;
+		//dbg.iqFriction = iq_friction;
+		//dbg.iqInertia = iq_inertia;
 		dbg.iqCompensation = iq_compensation;
 		dbg.iqCmd = iq_cmd;
 		dbg.Appliediq = iq_applied;
-		dbg.currentVelTurns = current_vel_turns;
-		dbg.currentAccelRad = current_accel_rad;
-
-
-
-
-
-
-				dbg.currentKp = pid_soft.Kp;
-		dbg.currentKi = pid_soft.Ki;
-		dbg.currentKd = pid_soft.Kd;
-		dbg.identifiedJ = identified_j;
-		dbg.identifiedB = identified_b;
-		dbg.dynamicFriction = dynamic_friction;
-		float wrapped_pos = actual_pos_turns - floorf(actual_pos_turns);
-		if (wrapped_pos < 0.0f) {
-			wrapped_pos += 1.0f;
-		}
-		uint32_t quarter = (uint32_t)(wrapped_pos * 4.0f);
-		if (quarter > 3) {
-			quarter = 3;
-		}
-		dbg.currentQuarter = quarter;
-
-		float abs_err_deg = fabsf(error_turns) * 360.0f;
-		if (abs_err_deg > dbg.quarterMaxErrDeg[quarter]) {
-			dbg.quarterMaxErrDeg[quarter] = abs_err_deg;
-		}
-		if (abs_err_deg > dbg.maxErrDeg) {
-			dbg.maxErrDeg = abs_err_deg;
-		}
+		//dbg.currentVelTurns = current_vel_turns;
+		//dbg.currentAccelRad = current_accel_rad;
+		//dbg.dynamicFriction = dynamic_friction;
 	};
 
 	resetDebugWatch();
@@ -3721,11 +3966,10 @@ void TMC4671::handleStateCoggingCalibration() {
 				uint32_t timeout_ms,
 				QuarterErrorStats& stats) {
 			resetQuarterErrorStats(stats);
-			clearDebugErrorPeaks();
 
 			pid_soft.Kp = clip<float,float>(kp, 50.0f, 250000.0f);
 			pid_soft.Ki = clip<float,float>(ki, 0.0f, 100000.0f);
-			pid_soft.Kd = 0.0f;
+			pid_soft.Kd = coggingSpeedD;
 			arm_pid_init_f32(&pid_soft, 1);
 
 			float target_pos_turns = getAbsolutePosition();
@@ -3748,11 +3992,11 @@ void TMC4671::handleStateCoggingCalibration() {
 					float iq_ff = dynamic_friction * 1.0f;
 					float iq_cmd = clip<float,float>(iq_pid + iq_ff, -max_test_torque, max_test_torque);
 
-					captureDebug(phase, act_period, enc_decimation_ratio, calib_rpm, target_pos_turns, actual_pos_turns, err, iq_pid, iq_ff, 0.0f, 0.0f, iq_cmd, iq_cmd, 0.0f, 0.0f, J, B, dynamic_friction);
+					captureDebug(phase, calib_rpm, target_pos_turns, actual_pos_turns, err, iq_pid, iq_ff, 0.0f, 0.0f, iq_cmd, iq_cmd, 0.0f, 0.0f, J, B, dynamic_friction);
 					applySafeTorque(iq_cmd);
 
 					if (HAL_GetTick() - eval_start >= warmup_ms) {
-						float wrapped_pos = actual_pos_turns - floorf(actual_pos_turns);
+						float wrapped_pos = actual_pos_turns - (float)((int32_t)actual_pos_turns);
 						if (wrapped_pos < 0.0f) {
 							wrapped_pos += 1.0f;
 						}
@@ -4002,11 +4246,11 @@ void TMC4671::handleStateCoggingCalibration() {
 
 			pid_soft.Kp = best_sweep_kp;
 			pid_soft.Ki = best_sweep_ki;
-			pid_soft.Kd = 0.0f;
+			pid_soft.Kd = coggingSpeedD;
 			} else {
 				pid_soft.Kp = coggingSpeedP;
 				pid_soft.Ki = coggingSpeedI;
-				pid_soft.Kd = 0.0f;
+				pid_soft.Kd = coggingSpeedD;
 				broadcastCalibLog(0, "Manual PID Override -> Kp:%.0f Ki:%.0f", pid_soft.Kp, pid_soft.Ki);
 			}
 			arm_pid_init_f32(&pid_soft, 1);
@@ -4024,21 +4268,22 @@ void TMC4671::handleStateCoggingCalibration() {
 			Harmonic prev_harmonics[COGGING_HARMONICS_COUNT]; // backup of best table
 
 			for (uint8_t dft_iter = 0; dft_iter < MAX_DFT_ITERATIONS && !emergency && hasPower(); dft_iter++) {
-				// Clear DFT accumulators for this iteration
-				memset(iq_acc_cos, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
-				memset(iq_acc_sin, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
-#ifdef COGGING_CALIB_ENABLE_ID_DIAG
-				memset(id_acc_cos, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
-				memset(id_acc_sin, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
-#endif
 				total_samples = 0;
 				float iter_max_err_deg = 0.0f;
 
 				broadcastCalibLog(0, "DFT iteration %u/%u...", dft_iter + 1, MAX_DFT_ITERATIONS);
+
+				// Separate storage for CW and CCW harmonics — extracted per direction
+				// so they can be averaged after both sweeps complete
+				struct TempHarmonic { float mag; float phase; };
+				TempHarmonic cw_harms[COGGING_CALIB_DFT_HARMONICS];
+				TempHarmonic ccw_harms[COGGING_CALIB_DFT_HARMONICS];
+				memset(cw_harms, 0, sizeof(cw_harms));
+				memset(ccw_harms, 0, sizeof(ccw_harms));
+
 				int8_t dirs[2] = {1, -1};
 				
 				for (int8_t p : dirs) {
-					clearDebugErrorPeaks();
 					
 					float target_rpm = (p == 1) ? calib_rpm : -calib_rpm;
 					float integrated_distance = 0.0f;
@@ -4047,6 +4292,15 @@ void TMC4671::handleStateCoggingCalibration() {
 					float ema_err = 0.0f;  // lowpass-filtered error for glitch-robust peak tracking
 
 					arm_pid_init_f32(&pid_soft, 1);
+
+					// Clear accumulators per direction so CW and CCW DFTs don't mix
+					memset(iq_acc_cos, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
+					memset(iq_acc_sin, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
+#ifdef COGGING_CALIB_ENABLE_ID_DIAG
+					memset(id_acc_cos, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
+					memset(id_acc_sin, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
+#endif
+					uint32_t dir_samples = 0;
 
 					uint32_t waitStart = HAL_GetTick();
 					while(HAL_GetTick() - waitStart < 1000 && !emergency && hasPower()) { 
@@ -4068,6 +4322,10 @@ void TMC4671::handleStateCoggingCalibration() {
 						float prev_vel_turns = target_rpm / 60.0f; 
 						
 						uint32_t enc_decimation_counter = 0;
+						// DFT decimation: keep DFT accumulation ≤ ~4 kHz to prevent
+						// 32-bit float overflow
+						uint32_t dft_decimation_ratio = 4;
+						uint32_t dft_decimation_counter = 0;
 						float iq_cmd = 0.0f;
 						float iq_inertia = 0.0f;
 						float iq_pid = 0.0f;
@@ -4124,21 +4382,22 @@ void TMC4671::handleStateCoggingCalibration() {
 								}
 								float iq_applied = iq_cmd + (this->cogging_scale * cog_comp);
 								iq_applied = clip<float,float>(iq_applied, -max_test_torque, max_test_torque);
-#ifdef COGGING_CALIB_DISABLE_I_SENSE
-								// Current SPI read skipped to reduce bus load at high loop rates
-								actual_iq_raw = (int32_t)iq_cmd; // Use commanded torque as proxy
-								dbg.actualIq = actual_iq_raw;
-#else
+#ifndef COGGING_DFT_USE_IQ_CMD
 								actual_iq_raw = getActualTorque();
 								dbg.actualIq = actual_iq_raw;
 #endif
-								captureDebug(TMC4671CoggingDebugPhase::Acquisition, period_us, enc_decimation_ratio, target_rpm, target_pos_f, actual_pos_f, error, iq_pid, iq_ff, iq_inertia, this->cogging_scale * cog_comp, iq_cmd, iq_applied, current_vel_turns, current_accel_rad, J, B, dynamic_friction);
+								captureDebug(TMC4671CoggingDebugPhase::Acquisition, target_rpm, target_pos_f, actual_pos_f, error, iq_pid, iq_ff, iq_inertia, this->cogging_scale * cog_comp, iq_cmd, iq_applied, current_vel_turns, current_accel_rad, J, B, dynamic_friction);
 								applySafeTorque(iq_applied);
 							}
 							
 							enc_decimation_counter++;
+							dft_decimation_counter++;
 							
 							if (integrated_distance < 1.0f && (HAL_GetTick() - calibStartTime > COGGING_WARMUP_MS)) {
+								integrated_distance += fabs(step);
+								// Only run heavy DFT math every Nth loop to prevent
+								// CPU starvation and float accumulator overflow at high rates
+								if (dft_decimation_counter % dft_decimation_ratio == 0) {
 								// DFT signal source — toggle with #define COGGING_DFT_USE_IQ_CMD
 								// actual_iq_raw = total applied torque (includes cogging FF on later passes)
 								// iq_cmd        = PID + friction only (residual cogging, for phasor-add)
@@ -4165,11 +4424,11 @@ void TMC4671::handleStateCoggingCalibration() {
 									float next_s = cur_c * s1 + cur_s * c1;
 									cur_c = next_c; cur_s = next_s;
 								}
-								total_samples++;
-								integrated_distance += fabs(step);
+								dir_samples++;
 							}
+						}
 
-							refreshWatchdog();
+						refreshWatchdog();
 #ifdef TIM_CALIBRATION
 							if (this->calibTimer != nullptr) {
 								this->WaitForNotification();
@@ -4186,105 +4445,188 @@ void TMC4671::handleStateCoggingCalibration() {
 					if (max_err_seen * 360.0f > iter_max_err_deg) {
 						iter_max_err_deg = max_err_seen * 360.0f;
 					}
-				}
 
-				// --- HARMONICS EXTRACTION FOR THIS ITERATION ---
-				if (total_samples > 0) {
-					float norm = 2.0f / (float)total_samples;
-					struct TempHarmonic { float32_t mag; uint16_t k; float32_t phase; };
-					TempHarmonic* candidates = (TempHarmonic*)pvPortMalloc(COGGING_CALIB_DFT_HARMONICS * sizeof(TempHarmonic));
-					
-					if (candidates) {
+					// Extract per-direction harmonics immediately after this sweep
+					if (dir_samples > 0) {
+						float norm = 2.0f / (float)dir_samples;
 						for (int k = 1; k < COGGING_CALIB_DFT_HARMONICS; k++) {
 							float re = iq_acc_cos[k] * norm;
 							float im = iq_acc_sin[k] * norm;
-							candidates[k].mag = sqrtf(re*re + im*im);
-							candidates[k].phase = atan2f(re, im);
-							candidates[k].k = k;
-						}
-
-						if (dft_iter == 0 && candidates[1].mag > 5000.0f) {
-							broadcastCalibLog(0, "Warning: High motor eccentricity detected");
-						}
-
-#ifdef COGGING_CALIB_ENABLE_ID_DIAG
-						if (dft_iter == 0) {
-							float h3_id = sqrtf(powf(id_acc_cos[3]*norm,2) + powf(id_acc_sin[3]*norm,2));
-							float h6_id = sqrtf(powf(id_acc_cos[6]*norm,2) + powf(id_acc_sin[6]*norm,2));
-							if (h3_id > 500.0f || h6_id > 500.0f) {
-								broadcastCalibLog(0, "Warning: Potential electrical phase imbalance");
+							if (p == 1) { // CW
+								cw_harms[k].mag = sqrtf(re*re + im*im);
+								cw_harms[k].phase = atan2f(re, im);
+							} else { // CCW
+								ccw_harms[k].mag = sqrtf(re*re + im*im);
+								ccw_harms[k].phase = atan2f(re, im);
 							}
 						}
-#endif
+						total_samples += dir_samples;
+					}
+				}
 
-						// Iterative DFT: on first pass, set harmonics directly.
-						// On subsequent passes, phasor-add residuals to existing table.
-						if (dft_iter == 0) {
-							memset(cogging_harmonics, 0, sizeof(cogging_harmonics));
-						}
-						// Build candidate list for this iteration
-						struct Sel { float mag; uint16_t order; float phase; };
-						Sel best[COGGING_HARMONICS_COUNT];
-						memset(best, 0, sizeof(best));
-						for (int k = 5; k < COGGING_CALIB_DFT_HARMONICS; k++) {
-							float m = candidates[k].mag;
-							// Insertion sort: keep top COGGING_HARMONICS_COUNT by magnitude
-							for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
-								if (m > best[n].mag) {
-									// Shift down
-									for (int s = COGGING_HARMONICS_COUNT - 1; s > n; s--) {
-										best[s] = best[s-1];
-									}
-									best[n].mag = m;
-									best[n].order = candidates[k].k;
-									best[n].phase = candidates[k].phase;
-									break;
-								}
-							}
-						}
-						// Phasor-add candidates to cogging_harmonics
+				// --- CW+CCW HARMONICS COMBINATION (Piccoli phase alignment) ---
+				// Average magnitudes and phases from CW and CCW sweeps.
+				// Magnitude averaging cancels AC-neutral friction bias.
+				// Phase averaging with unwrapping cancels PID tracking lag delta.
+				if (total_samples > 0) {
+					// On first pass, clear the table
+					if (dft_iter == 0) {
+						memset(cogging_harmonics, 0, sizeof(cogging_harmonics));
+					}
+
+					// Diagnostics on first iteration
+					if (dft_iter == 0 && cw_harms[1].mag > 5000.0f) {
+						broadcastCalibLog(0, "Warning: High motor eccentricity detected");
+					}
+
+					// Build combined candidate list from averaged CW+CCW magnitudes
+					struct Sel { float mag; uint16_t order; float phase; };
+					Sel best[COGGING_HARMONICS_COUNT];
+					memset(best, 0, sizeof(best));
+
+					for (int k = 5; k < COGGING_CALIB_DFT_HARMONICS; k++) {
+						// Average magnitude (friction is AC-neutral, doesn't affect magnitude)
+						float avg_mag = (cw_harms[k].mag + ccw_harms[k].mag) / 2.0f;
+
+						// Phase unwrapping: avoid averaging +179° and -179° to 0°
+						float cw_phase = cw_harms[k].phase;
+						float ccw_phase = ccw_harms[k].phase;
+						float phase_diff = cw_phase - ccw_phase;
+						if (phase_diff > PI) ccw_phase += 2.0f * PI;
+						if (phase_diff < -PI) ccw_phase -= 2.0f * PI;
+
+						// Average phase (cancels tracking lag delta between CW and CCW)
+						float avg_phase = (cw_phase + ccw_phase) / 2.0f;
+
+						// Insertion sort: keep top COGGING_HARMONICS_COUNT by magnitude
 						for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
-							if (best[n].mag <= 0.0f) continue;
-							uint16_t order = best[n].order;
+							if (avg_mag > best[n].mag) {
+								for (int s = COGGING_HARMONICS_COUNT - 1; s > n; s--) {
+									best[s] = best[s-1];
+								}
+								best[n].mag = avg_mag;
+								best[n].order = k;
+								best[n].phase = avg_phase;
+								break;
+							}
+						}
+					}
+
+					// Assign to cogging_harmonics
+					for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+						if (best[n].mag <= 0.0f) continue;
+						uint16_t order = best[n].order;
+						int slot = -1;
+						for (int j = 0; j < COGGING_HARMONICS_COUNT; j++) {
+							if (cogging_harmonics[j].order == order && cogging_harmonics[j].amplitude > 0.0f) {
+								slot = j; break;
+							}
+						}
+						if (slot < 0) {
+							for (int j = 0; j < COGGING_HARMONICS_COUNT; j++) {
+								if (cogging_harmonics[j].amplitude <= 0.0f) { slot = j; break; }
+							}
+						}
+						if (slot >= 0) {
+#ifdef COGGING_DFT_USE_IQ_CMD
+							float ex_re = cogging_harmonics[slot].amplitude * cosf(cogging_harmonics[slot].phase);
+							float ex_im = cogging_harmonics[slot].amplitude * sinf(cogging_harmonics[slot].phase);
 							float new_re = best[n].mag * cosf(best[n].phase);
 							float new_im = best[n].mag * sinf(best[n].phase);
-							// Find matching existing harmonic or first empty slot
-							int slot = -1;
-							for (int j = 0; j < COGGING_HARMONICS_COUNT; j++) {
-								if (cogging_harmonics[j].order == order && cogging_harmonics[j].amplitude > 0.0f) {
-									slot = j; break;
-								}
-							}
-							if (slot < 0) {
-								for (int j = 0; j < COGGING_HARMONICS_COUNT; j++) {
-									if (cogging_harmonics[j].amplitude <= 0.0f) { slot = j; break; }
-								}
-							}
-							if (slot >= 0) {
-								// Harmonic assignment strategy tied to DFT signal source:
-								// iq_cmd → phasor-add (measures residual, sum improves table)
-								// actual_iq_raw → direct set (measures total, summing would double)
-#ifdef COGGING_DFT_USE_IQ_CMD
-								float ex_re = cogging_harmonics[slot].amplitude * cosf(cogging_harmonics[slot].phase);
-								float ex_im = cogging_harmonics[slot].amplitude * sinf(cogging_harmonics[slot].phase);
-								float sum_re = ex_re + new_re;
-								float sum_im = ex_im + new_im;
-								cogging_harmonics[slot].order = order;
-								cogging_harmonics[slot].amplitude = sqrtf(sum_re*sum_re + sum_im*sum_im);
-								cogging_harmonics[slot].phase = atan2f(sum_im, sum_re);
+							float sum_re = ex_re + new_re;
+							float sum_im = ex_im + new_im;
+							cogging_harmonics[slot].order = order;
+							cogging_harmonics[slot].amplitude = sqrtf(sum_re*sum_re + sum_im*sum_im);
+							cogging_harmonics[slot].phase = atan2f(sum_im, sum_re);
 #else
-								cogging_harmonics[slot].order = order;
-								cogging_harmonics[slot].amplitude = best[n].mag;
-								cogging_harmonics[slot].phase = best[n].phase;
+							cogging_harmonics[slot].order = order;
+							cogging_harmonics[slot].amplitude = best[n].mag;
+							cogging_harmonics[slot].phase = best[n].phase;
 #endif
-							}
 						}
-
-						vPortFree(candidates);
 					}
 				}
 
 				broadcastCalibLog(0, "DFT iter %u max err: %.2f deg", dft_iter + 1, iter_max_err_deg);
+
+				// --- Store and broadcast CW/CCW raw harmonics for configurator offset tuning ---
+				{
+					struct { float mag; uint16_t order; float phase; } top[COGGING_HARMONICS_COUNT];
+
+					// Extract top CW harmonics
+					memset(top, 0, sizeof(top));
+					for (int k = 1; k < COGGING_CALIB_DFT_HARMONICS; k++) {
+						if (cw_harms[k].mag <= 0.0f) continue;
+						for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+							if (cw_harms[k].mag > top[n].mag) {
+								for (int s = COGGING_HARMONICS_COUNT - 1; s > n; s--) top[s] = top[s-1];
+								top[n].mag = cw_harms[k].mag;
+								top[n].order = (uint16_t)k;
+								top[n].phase = cw_harms[k].phase;
+								break;
+							}
+						}
+					}
+					for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+						cw_store[n].order = top[n].order;
+						cw_store[n].amplitude = top[n].mag;
+						cw_store[n].phase = top[n].phase;
+					}
+
+					// Broadcast CW data in chunks
+					{
+						std::string cwStr = "CWD:";
+						for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+							if (cw_store[n].amplitude <= 0.0f) continue;
+							char chunk[48];
+							snprintf(chunk, sizeof(chunk), "%u:%.0f:%.0f,", cw_store[n].order, cw_store[n].amplitude, cw_store[n].phase * 1000.0f);
+							if (cwStr.length() + strlen(chunk) > 100) {
+								broadcastCalibLog(0, "%s", cwStr.c_str());
+								cwStr = "CWD:";
+							}
+							cwStr += chunk;
+						}
+						if (cwStr.length() > 4) broadcastCalibLog(0, "%s", cwStr.c_str());
+					}
+
+					// Extract top CCW harmonics
+					memset(top, 0, sizeof(top));
+					for (int k = 1; k < COGGING_CALIB_DFT_HARMONICS; k++) {
+						if (ccw_harms[k].mag <= 0.0f) continue;
+						for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+							if (ccw_harms[k].mag > top[n].mag) {
+								for (int s = COGGING_HARMONICS_COUNT - 1; s > n; s--) top[s] = top[s-1];
+								top[n].mag = ccw_harms[k].mag;
+								top[n].order = (uint16_t)k;
+								top[n].phase = ccw_harms[k].phase;
+								break;
+							}
+						}
+					}
+					for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+						ccw_store[n].order = top[n].order;
+						ccw_store[n].amplitude = top[n].mag;
+						ccw_store[n].phase = top[n].phase;
+					}
+
+					// Broadcast CCW data in chunks
+					{
+						std::string ccwStr = "CCWD:";
+						for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+							if (ccw_store[n].amplitude <= 0.0f) continue;
+							char chunk[48];
+							snprintf(chunk, sizeof(chunk), "%u:%.0f:%.0f,", ccw_store[n].order, ccw_store[n].amplitude, ccw_store[n].phase * 1000.0f);
+							if (ccwStr.length() + strlen(chunk) > 100) {
+								broadcastCalibLog(0, "%s", ccwStr.c_str());
+								ccwStr = "CCWD:";
+							}
+							ccwStr += chunk;
+						}
+						if (ccwStr.length() > 5) broadcastCalibLog(0, "%s", ccwStr.c_str());
+					}
+
+					cwccw_data_valid = true;
+				}
 
 				// Degradation check DISABLED: all iterations always run.
 				// To re-enable, uncomment the block below.
@@ -4324,6 +4666,140 @@ void TMC4671::handleStateCoggingCalibration() {
 					this->cogging_enabled = true;
 				}
 
+#ifdef COGGING_SCALE_SWEEP
+				// --- 3.6 SPEED-DEPENDENT SCALE CURVE SWEEP ---
+				// Gradient descent: 3rpm=1.0, then ±0.1 refine, then ±0.01 fine.
+				// Predict next magnitude from 2+ previous points for faster convergence.
+				{
+					this->cogging_enabled = true;
+					setMotionMode(MotionMode::torque, true);
+
+					const float rpm_list[14] = {3,4,5,7,10,15,20,30,40,50,60,70,80,100};
+					scale_curve_count = 14;
+					broadcastCalibLog(0, "Speed-dependent scale sweep (gradient descent)...");
+
+					uint32_t period_us = getActualCalibPeriod(TIM_TMC_ARR);
+					float dt_sec = (float)period_us / 1000000.0f;
+					uint32_t warmup_ms = 1500;
+
+					// Averaged max position error measurement (3 passes) to reject noise
+					auto measureError = [&](float testRpm, float scale) -> float {
+						float err_sum = 0.0f;
+						uint8_t valid_passes = 0;
+						for (uint8_t pass = 0; pass < 3 && !emergency && hasPower(); pass++) {
+							arm_pid_init_f32(&pid_soft, 1);
+							float target_pos_f = getFilteredPosition();
+							float max_err = 0.0f;
+							uint32_t sweeptime_ms = (uint32_t)(240000.0f / testRpm); // ~4 revolutions
+							sweeptime_ms = clip<uint32_t>(sweeptime_ms, 4000, 20000);
+							uint32_t next_tick = micros();
+							uint32_t endWarmup = HAL_GetTick() + warmup_ms;
+							uint32_t endMeasure = endWarmup + sweeptime_ms;
+
+							startCalibTimers(TIM_TMC_ARR);
+							while (HAL_GetTick() < endMeasure && !emergency && hasPower()) {
+								next_tick += period_us;
+								refreshWatchdog();
+								target_pos_f += (testRpm / 60.0f) * dt_sec;
+								target_pos_f = target_pos_f - floorf(target_pos_f);
+								float actual_pos_f = getFilteredPosition();
+								float err = getWrappedError(target_pos_f, actual_pos_f);
+								float iq_pid = arm_pid_f32(&pid_soft, err);
+								float cog = 0.0f;
+								float ar = actual_pos_f * 2.0f * PI;
+								for (uint8_t h = 0; h < COGGING_HARMONICS_COUNT; h++) {
+									if (cogging_harmonics[h].amplitude > 0.0f)
+										cog += cogging_harmonics[h].amplitude * arm_sin_f32(ar * cogging_harmonics[h].order + cogging_harmonics[h].phase);
+								}
+								float total = iq_pid + scale * cog;
+								total = clip<float,float>(total, -max_test_torque, max_test_torque);
+								applySafeTorque(total);
+								if (HAL_GetTick() >= endWarmup) {
+									float aerr = fabsf(err) * 360.0f; // position error in degrees
+									if (aerr > max_err) max_err = aerr;
+								}
+								while ((micros() - next_tick) & 0x80000000) {}
+							}
+							stopCalibTimers();
+							applySafeTorque(0);
+							Delay(250);
+							if (max_err < 99999.0f) {
+								err_sum += max_err;
+								valid_passes++;
+							}
+						}
+						return (valid_passes > 0) ? (err_sum / (float)valid_passes) : 999999.0f;
+					};
+
+					for (uint8_t pt = 0; pt < 14 && !emergency && hasPower(); pt++) {
+						float testRpm = rpm_list[pt];
+
+						// 3 RPM: force 1.0, no search
+						if (pt == 0) {
+							scale_curve_values[0] = 1.0f;
+							this->cogging_scale = 1.0f;
+							broadcastCalibLog(0, "RPM 3 -> scale 1.00 (fixed)");
+							continue;
+						}
+
+						// Predict: linear extrapolation, clamped to not go lower
+						float last_best = scale_curve_values[pt-1];
+						float seed = last_best;
+						if (pt >= 2) {
+							float x1 = rpm_list[pt-2], x2 = rpm_list[pt-1];
+							float y1 = scale_curve_values[pt-2], y2 = scale_curve_values[pt-1];
+							float slope = (y2 - y1) / (x2 - x1);
+							seed = y2 + slope * (testRpm - x2);
+						}
+						// Never go below last best (scale should only increase)
+						if (seed < last_best) seed = last_best;
+						seed = clip<float>(seed, 0.1f, 3.0f);
+
+						this->cogging_scale = seed;
+						float best_scale = seed;
+						float best_err = measureError(testRpm, best_scale);
+						broadcastCalibLog(0, "Sweep RPM %.0f seed=%.2f err=%.2f\xC2\xB0", testRpm, seed, best_err);
+
+						// Helper: walk both uphill and downhill, stepping until no more improvement
+						auto refine = [&](float testRpm, const char* label, float step) {
+							// Walk uphill while improving
+							while (!emergency && hasPower()) {
+								float trial = best_scale + step;
+								if (trial > 3.0f) break;
+								float r = measureError(testRpm, trial);
+								broadcastCalibLog(0, "  %s+ %.2f err=%.2f\xC2\xB0", label, trial, r);
+								if (r < best_err) { best_err = r; best_scale = trial; }
+								else break;
+							}
+							// Walk downhill while improving
+							while (!emergency && hasPower()) {
+								float trial = best_scale - step;
+								if (trial < last_best) break;
+								float r = measureError(testRpm, trial);
+								broadcastCalibLog(0, "  %s- %.2f err=%.2f\xC2\xB0", label, trial, r);
+								if (r < best_err) { best_err = r; best_scale = trial; }
+								else break;
+							}
+						};
+
+						// Coarse: ±0.25
+						refine(testRpm, "coarse", 0.25f);
+						// Fine: ±0.1
+						refine(testRpm, "fine", 0.10f);
+						// Finer: ±0.05 (RPM ≤ 20 only)
+						if (testRpm <= 20.0f)
+							refine(testRpm, "finer", 0.05f);
+
+						scale_curve_values[pt] = best_scale;
+						this->cogging_scale = best_scale;
+						broadcastCalibLog(0, "Final RPM %.0f -> scale %.2f (err %.2f\xC2\xB0)", testRpm, best_scale, best_err);
+						refreshWatchdog();
+					}
+					scale_curve_valid = true;
+					this->cogging_scale = 1.0f;
+					broadcastCalibLog(0, "Scale curve sweep complete (%u points)", scale_curve_count);
+				}
+#endif
 				// --- 4. RETURN TO CENTER (Unwinding multi-turn) ---
 				
 				calib_rpm = 20.0f; // Return speed (RPM). Increase if unwinding is too slow.
@@ -4338,16 +4814,14 @@ void TMC4671::handleStateCoggingCalibration() {
 				// USE THE FULL TUNED GAINS
 				arm_pid_init_f32(&pid_soft, 1);
 
-				// removed initial torque warmup delay to prevent transients
-				
 				float target_pos_f = actual_pos_f;
 				uint32_t period_us = getActualCalibPeriod(TIM_TMC_ARR); 
-				target_rpm = (actual_pos_f > 0.0f) ? -calib_rpm : calib_rpm;
+				const float full_ret_rpm = (actual_pos_f > 0.0f) ? -calib_rpm : calib_rpm;
+				target_rpm = full_ret_rpm;
 				// Dynamic timeout based on the distance to cover
 				float distance_turns = fabs(actual_pos_f);
 				// (distance_turns * 60 sec/min * 1000 ms/sec) / calib_rpm
 				uint32_t dynamic_timeout_ms = (uint32_t)((distance_turns * 60000.0f) / calib_rpm) + 5000;
-				clearDebugErrorPeaks();
 				
 				uint32_t return_start = HAL_GetTick();
 				uint32_t next_tick = micros();
@@ -4355,8 +4829,11 @@ void TMC4671::handleStateCoggingCalibration() {
 				while (fabs(actual_pos_f) > 0.005f && !emergency && hasPower()) {
 					next_tick += period_us;
 					
-					// Absolute ramp generation towards 0.0
-					target_pos_f += (target_rpm / 60.0f) * ((float)period_us / 1000000.0f);
+					// Ramp velocity from 0 to full to prevent torque slam
+					float ret_elapsed_ms = (float)(HAL_GetTick() - return_start);
+					float ret_ramp = (ret_elapsed_ms < (float)COGGING_WARMUP_MS) ? (ret_elapsed_ms / (float)COGGING_WARMUP_MS) : 1.0f;
+					float active_rpm = full_ret_rpm * ret_ramp;
+					target_pos_f += (active_rpm / 60.0f) * ((float)period_us / 1000000.0f);
 
 					// Clamp at zero
 					if (target_rpm < 0 && target_pos_f < 0.0f) target_pos_f = 0.0f;
@@ -4388,7 +4865,7 @@ void TMC4671::handleStateCoggingCalibration() {
 					
 					// Use full test torque limit (standard for all phases)
 					iq_applied = clip<float,float>(iq_applied, -max_test_torque, max_test_torque);
-					captureDebug(TMC4671CoggingDebugPhase::ReturnToCenter, period_us, 1, target_rpm, target_pos_f, actual_pos_f, error, iq_pid, iq_ff, 0.0f, cog_comp, iq_cmd, iq_applied, 0.0f, 0.0f, J, B, dynamic_friction);
+					captureDebug(TMC4671CoggingDebugPhase::ReturnToCenter, target_rpm, target_pos_f, actual_pos_f, error, iq_pid, iq_ff, 0.0f, cog_comp, iq_cmd, iq_applied, 0.0f, 0.0f, J, B, dynamic_friction);
 					applySafeTorque(iq_applied);
 					
 					refreshWatchdog();

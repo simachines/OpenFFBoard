@@ -41,8 +41,10 @@
 // --- Constants for anti-cogging calibration ---
 #define COGGING_CALIB_LUT_RESOLUTION    2880 	// Resolution for legacy protocol communication
 #define COGGING_CALIB_TIME_PER_REV_S    20 	 	// Time in seconds to complete one revolution (8s = 7.5 RPM)
-#define COGGING_CALIB_DFT_HARMONICS      128     // Number of harmonics to analyze during calibration
-#define COGGING_CALIB_ENABLE_ID_DIAG            // Enable Point 1 diagnostic (Id axis analysis)
+#define COGGING_CALIB_DFT_HARMONICS     128     // Number of harmonics to analyze during calibration
+//#define COGGING_CALIB_ENABLE_ID_DIAG            // Enable Point 1 diagnostic (Id axis analysis)
+#define COGGING_DFT_USE_IQ_CMD                  //comment out to use adc iq
+//#define COGGING_SCALE_SWEEP
 #endif
 
 extern SPI_HandleTypeDef HSPIDRV;
@@ -102,15 +104,10 @@ enum class TMC4671CoggingDebugPhase : uint32_t {
 
 struct TMC4671CoggingDebugVars {
 	uint32_t phase = static_cast<uint32_t>(TMC4671CoggingDebugPhase::Idle);
-	uint32_t loopPeriodUs = 0;
-	uint32_t decimationRatio = 0;
 	uint32_t pidExecCount = 0;
 	uint32_t currentQuarter = 0;
-	float pidExecRateHz = 0.0f;
-	float targetRpm = 0.0f;
-	float targetPosTurns = 0.0f;
-	float actualPosTurns = 0.0f;
-	float positionErrorTurns = 0.0f;
+	uint32_t pidExecRate = 0;
+	uint32_t lastCaptureDebugUs = 0;
 	float positionErrorDeg = 0.0f;
 	float quarterMaxErrDeg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 	float maxErrDeg = 0.0f;
@@ -122,13 +119,13 @@ struct TMC4671CoggingDebugVars {
 	float Appliediq = 0.0f;
 	float currentVelTurns = 0.0f;
 	float currentAccelRad = 0.0f;
-	float currentKp = 0.0f;
-	float currentKi = 0.0f;
-	float currentKd = 0.0f;
-	float identifiedJ = 0.0f;
-	float identifiedB = 0.0f;
 	float dynamicFriction = 0.0f;
 	int32_t actualIq = 0;
+	// Sweep debug
+	float sweepRpm = 0.0f;
+	float sweepScaleSeed = 0.0f;
+	float sweepScaleBest = 0.0f;
+	float sweepP2P = 0.0f;
 };
 
 extern volatile TMC4671CoggingDebugVars g_tmc4671_cogging_debug;
@@ -154,7 +151,7 @@ enum class VelSelection : uint8_t {PhiE=0, PhiE_ext=1, PhiE_openloop=2, PhiE_abn
 enum class EncoderType_TMC : uint8_t {NONE=0,abn=1,sincos=2,uvw=3,hall=4,ext=5}; // max 7
 
 //// Hardware versions for identifying different types. 31 versions valid
-enum class TMC_HW_Ver : uint8_t {NONE=0,v1_0,v1_2,v1_2_2,v1_2_2_LEM20,v1_2_2_100mv,v1_3_66mv};
+enum class TMC_HW_Ver : uint8_t {NONE=0,v1_0,v1_2,v1_2_1,v1_2_2,v1_2_2_LEM20,v1_2_2_100mv,v1_3_66mv};
 
 struct TMC4671MotConf{
 	MotorType motor_type = MotorType::NONE; //saved
@@ -347,6 +344,9 @@ struct TMC4671FlashAddrs{
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
 	uint16_t coggingEnable = ADR_TMC1_COGGING_CAL;
 	uint16_t coggingScale = ADR_TMC1_COGGING_SCALE;
+	uint16_t coggingDynOffset = ADR_TMC1_COGGING_DYN_OFS;
+	uint16_t scaleCurveBase = ADR_TMC1_SCALE_CURVE_BASE;
+	uint16_t phaseAdvCurveBase = ADR_TMC1_PHASEADV_CURVE_BASE;
 #endif
 };
 
@@ -468,7 +468,8 @@ class TMC4671 :
 		svpwm,fullCalibration,calibrated,abnindexenabled,findIndex,getState,encpol,combineEncoder,invertForce,vmTmc,
 		extphie,torqueFilter_mode,torqueFilter_f,torqueFilter_q,pidautotune,fluxbrake,pwmfreq,
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
-		cogging,calibrateCogging, coggingTable, coggingScale, coggingSpeedP, coggingSpeedI, coggingPhaseLead, coggingHarmonics
+		cogging,calibrateCogging, coggingTable, coggingScale, coggingSpeedP, coggingSpeedI, coggingHarmonics,
+coggingCwCcw, coggingSave, coggingShape, coggingSpeedD, scaleCurve, phaseAdvCurve
 #endif
 	};
 
@@ -784,16 +785,55 @@ private:
 	bool cogging_enabled = false;
 	float cogging_scale = 0.5f;
 	int32_t last_anticogging_torque = 0;
-	float cogging_phase_lead = 0.0f;	// Phase advance gain (dimensionless, typical 0.0-1.0)
-	float last_cogging_pos = 0.0f;		// Previous position for velocity computation
+
+	// CW/CCW raw DFT harmonics stored for configurator-side offset tuning
+	// Only the top COGGING_HARMONICS_COUNT entries (by magnitude) are preserved per direction.
+	Harmonic cw_store[COGGING_HARMONICS_COUNT];
+	Harmonic ccw_store[COGGING_HARMONICS_COUNT];
+	bool cwccw_data_valid = false;
+
+	// Offset controls for configurator-side CW/CCW tuning
+	float last_cogging_scale = 0.0f;  // current active anti-cogging scale (1.0 = nominal)
+	float prev_filtered_pos = 0.0f;   // previous position for RPM calculation
+	float measured_rpm = 0.0f;        // EMA-filtered velocity in RPM
+	uint32_t last_vel_tick = 0;       // timestamp for velocity measurement
+	// Note: magnitude scale removed — vertical offset is configurator-only visualization
+
+	void recomputeCoggingFromCwCcw(); // rebuilds cogging_harmonics from cw_store/ccw_store + offsets
+
 	void saveCoggingTable();
 	void clearCoggingTable();
+
+	static constexpr uint8_t SCALE_CURVE_POINTS = 24;
+	// RPM breakpoints shared by the scale curve and the phase-advance curve (up to 256 RPM)
+	static constexpr float scale_curve_rpm_defaults[24] = {3,5,7,10,12,15,20,25,30,35,40,50,60,70,80,90,100,120,140,160,180,200,225,256};
+	float scale_curve_values[24] = {};  // optimal cogging_scale at each RPM
+	uint8_t scale_curve_count = 0;      // number of calibrated points
+	bool scale_curve_valid = false;     // curve has been calibrated
+	float interpolateScale(float rpm);  // linear interpolation for runtime
+
+	// Velocity-based phase advance: degrees of electrical/lookup position advance per RPM.
+	// Same structure as the scale curve. Applied at runtime to shift the cogging lookup position.
+	float phase_advance_curve_values[24] = {};  // degrees at each RPM breakpoint
+	bool phase_adv_curve_valid = false;         // curve has been loaded/set
+	float interpolatePhaseAdvance(float rpm);   // linear interpolation (returns degrees)
+
+	// Data for scale sweep
+	float scale_optimize_test_rpm = 0.0f;
+	float scale_optimize_best_scale = 0.0f;
+	float scale_optimize_best_err = 999999.0f;
+	struct ScaleCurveResult { float rpm; float scale; };
+	ScaleCurveResult scale_curve_results[24];
+
+	// Signed velocity (rev/sec * 60) measured in turn(); used for phase-advance direction.
+	float measured_rpm_signed = 0.0f;
 
 	std::unique_ptr<CoggingCalibData> coggingData = nullptr;
 	uint32_t calibStartTime = 0;
 	MotionMode prevCalibMode = MotionMode::stop;
 	float coggingSpeedP = 0.0f;
 	float coggingSpeedI = 0.0f;
+	float coggingSpeedD = 0.0f;
 	void handleStateCoggingCalibration();
 #endif
 

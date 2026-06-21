@@ -33,7 +33,7 @@ const TMC4671HardwareTypeConf conf1_0 = {
 		.bbm = 20,
 };
 const TMC4671HardwareTypeConf conf1_2 = {
-		.name = "v1.2 INA241A3 (1.5mOhm)",
+		.name = "v1.2 AD8417 (1.5mOhm)",
 		.hwVersion = (uint8_t)TMC_HW_Ver::v1_2,
 		.adcOffset = 1000,
 		.thermistorSettings = {
@@ -43,7 +43,26 @@ const TMC4671HardwareTypeConf conf1_2 = {
 			.temp_limit = 90,
 			.temperatureEnabled = true,
 		},
-		.currentScaler = 2.5 / (0x7fff * 50.0 * 0.0015), // w. 60x 1.5mOhm sensor
+		.currentScaler = 2.5 / (0x7fff * 60.0 * 0.0015), // w. 60x 1.5mOhm sensor
+		.brakeLimLow = 50700,
+		.brakeLimHigh = 50900,
+		.vmScaler = (2.5 / 0x7fff) * ((1.5+71.5)/1.5),
+		.vSenseMult = VOLTAGE_MULT_DEFAULT,
+		.clockfreq = 70e6,
+		.bbm = 20,
+};
+const TMC4671HardwareTypeConf conf1_2_1 = {
+		.name = "v1.2.1 INA241A3 (1.5mOhm)",
+		.hwVersion = (uint8_t)TMC_HW_Ver::v1_2_1,
+		.adcOffset = 1000,
+		.thermistorSettings = {
+			.thermistor_R2 = 1500,
+			.thermistor_R = 22000,
+			.thermistor_Beta = 4300,
+			.temp_limit = 90,
+			.temperatureEnabled = true,
+		},
+		.currentScaler = 2.5 / (0x7fff * 50.0 * 0.0015), // w. 50x 1.5mOhm sensor
 		.brakeLimLow = 50700,
 		.brakeLimHigh = 50900,
 		.vmScaler = (2.5 / 0x7fff) * ((1.5+71.5)/1.5),
@@ -104,7 +123,7 @@ const TMC4671HardwareTypeConf conf1_3 = {
 			.allowFluxDissipationDeactivation = 1
 		}
 };
-const auto tmc4671_hw_configs_array = std::to_array<const TMC4671HardwareTypeConf>({conf1_3,conf1_2_2,conf1_2,conf1_0});
+const auto tmc4671_hw_configs_array = std::to_array<const TMC4671HardwareTypeConf>({conf1_3,conf1_2_2,conf1_2_1,conf1_2,conf1_0});
 std::span<const TMC4671HardwareTypeConf> TMC4671::tmc4671_hw_configs = tmc4671_hw_configs_array;
 #endif
 

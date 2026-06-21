@@ -72,7 +72,7 @@
 #define TIM_CALIBRATION htim9
 #define TIM_TMC htim6 // Timer running at half clock speed
 #define TIM_TMC_BCLK SystemCoreClock / 2
-#define TIM_TMC_ARR 240 // 4khz
+#define TIM_TMC_ARR 140
 #define TIM_FFB htim13
 
 extern UART_HandleTypeDef huart1;
@@ -142,9 +142,6 @@ extern CAN_HandleTypeDef hcan1;
 #define COGGING_TABLE_SIZE                (COGGING_HARMONICS_COUNT * 12) 
 #define MAX_COGGING_TABLES                3
 #define COGGING_TABLE_FLASH_SECTOR        FLASH_SECTOR_4
-// DFT tuning: define for iq_cmd + phasor-add; undefine for actual_iq_raw + direct set
-#define COGGING_DFT_USE_IQ_CMD
-#define COGGING_CALIB_DISABLE_I_SENSE    // Skip getActualTorque() SPI read (use with COGGING_DFT_USE_IQ_CMD)
 
 // System
 // BKPSRAM positions

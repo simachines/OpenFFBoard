@@ -125,6 +125,12 @@ CXX = $(PREFIX)g++
 AS = $(PREFIX)gcc -x assembler-with-cpp
 CP = $(PREFIX)objcopy
 SZ = $(PREFIX)size
+
+# Use ccache if available to dramatically speed up recompilation
+ifneq ($(shell which ccache 2>/dev/null),)
+CC := ccache $(CC)
+CXX := ccache $(CXX)
+endif
 endif
 HEX = $(CP) -O ihex
 BIN = $(CP) -O binary -S
@@ -190,6 +196,9 @@ CFLAGS = $(MCU) $(C_DEFS) $(C_INCLUDES) $(OPT) -Wall -fdata-sections -ffunction-
 CFLAGS += -MMD -MP -MF"$(@:%.o=%.d)"
 
 CXXFLAGS = $(MCU) $(C_DEFS) $(C_INCLUDES) $(OPTCPP) -Wall -fdata-sections -ffunction-sections -fno-exceptions -fno-use-cxa-atexit -std=gnu++20 -fstack-usage -Wno-volatile $(DBGFLAGS)
+
+# Generate dependency information
+CXXFLAGS += -MMD -MP -MF"$(@:%.o=%.d)"
 
 #######################################
 # LDFLAGS
