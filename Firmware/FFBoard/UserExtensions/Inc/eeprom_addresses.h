@@ -13,7 +13,7 @@
 
 #include "main.h"
 // Change this to the amount of currently registered variables
-#define NB_OF_VAR 378
+#define NB_OF_VAR 387
 extern const uint16_t VirtAddVarTab[NB_OF_VAR];
 
 // Amount of variables in exportable list
@@ -254,4 +254,20 @@ uint16_t EE_ReadVariable(uint16_t VirtAddress, uint16_t* Data) will return 1 if 
 #define ADR_TMC2_PHASEADV_CURVE_BASE  0x468 // 24 pts: 0x468-0x47F
 #define ADR_TMC3_SCALE_CURVE_BASE     0x480 // 24 pts: 0x480-0x497
 #define ADR_TMC3_PHASEADV_CURVE_BASE  0x498 // 24 pts: 0x498-0x4AF
+
+// Cogging waveshaping ("3rd harmonic" tab) per TMC.
+// Lets the user subtract/add a harmonic of the DOMINANT cogging order to reshape
+// the compensation profile (thin peaks / steep slopes) to match the physical
+// stator-tooth geometry better than the raw Fourier sum.
+// 3 uint16 slots per TMC: shaping (*1000, signed), phase trim (millirad, signed),
+// mult (integer 1..31).
+#define ADR_TMC1_H3_AMP    0x4B0
+#define ADR_TMC1_H3_PHASE  0x4B1
+#define ADR_TMC1_H3_ORDER  0x4B2
+#define ADR_TMC2_H3_AMP    0x4B3
+#define ADR_TMC2_H3_PHASE  0x4B4
+#define ADR_TMC2_H3_ORDER  0x4B5
+#define ADR_TMC3_H3_AMP    0x4B6
+#define ADR_TMC3_H3_PHASE  0x4B7
+#define ADR_TMC3_H3_ORDER  0x4B8
 #endif /* EEPROM_ADDRESSES_H_ */

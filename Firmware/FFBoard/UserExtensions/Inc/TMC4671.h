@@ -347,6 +347,15 @@ struct TMC4671FlashAddrs{
 	uint16_t coggingDynOffset = ADR_TMC1_COGGING_DYN_OFS;
 	uint16_t scaleCurveBase = ADR_TMC1_SCALE_CURVE_BASE;
 	uint16_t phaseAdvCurveBase = ADR_TMC1_PHASEADV_CURVE_BASE;
+	// Cogging waveshaping ("3rd harmonic" tab) — must stay last: aggregate-init order.
+	// EEPROM slots still named H3_AMP/PHASE/ORDER but now hold:
+	//   h3Shaping    : signed fraction of the dominant harmonic's amplitude to
+	//                  subtract from the compensation (e.g. +0.15 = thin peaks).
+	//   h3PhaseTrim  : extra phase offset (rad) on top of the auto m*phase lock.
+	//   h3Mult       : harmonic multiplier of the dominant order (default 3).
+	uint16_t h3Shaping = ADR_TMC1_H3_AMP;
+	uint16_t h3PhaseTrim = ADR_TMC1_H3_PHASE;
+	uint16_t h3Mult = ADR_TMC1_H3_ORDER;
 #endif
 };
 
@@ -469,7 +478,7 @@ class TMC4671 :
 		extphie,torqueFilter_mode,torqueFilter_f,torqueFilter_q,pidautotune,fluxbrake,pwmfreq,
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
 		cogging,calibrateCogging, coggingTable, coggingScale, coggingSpeedP, coggingSpeedI, coggingHarmonics,
-coggingCwCcw, coggingSave, coggingShape, coggingSpeedD, scaleCurve, phaseAdvCurve
+coggingCwCcw, coggingSave, coggingShape, coggingSpeedD, scaleCurve, phaseAdvCurve, coggingH3
 #endif
 	};
 
@@ -806,7 +815,7 @@ private:
 
 	static constexpr uint8_t SCALE_CURVE_POINTS = 24;
 	// RPM breakpoints shared by the scale curve and the phase-advance curve (up to 256 RPM)
-	static constexpr float scale_curve_rpm_defaults[24] = {3,5,7,10,12,15,20,25,30,35,40,50,60,70,80,90,100,120,140,160,180,200,225,256};
+	static constexpr float scale_curve_rpm_defaults[24] = {0,5,7,10,12,15,20,25,30,35,40,50,60,70,80,90,100,120,140,160,180,200,225,256};
 	float scale_curve_values[24] = {};  // optimal cogging_scale at each RPM
 	uint8_t scale_curve_count = 0;      // number of calibrated points
 	bool scale_curve_valid = false;     // curve has been calibrated
@@ -817,6 +826,19 @@ private:
 	float phase_advance_curve_values[24] = {};  // degrees at each RPM breakpoint
 	bool phase_adv_curve_valid = false;         // curve has been loaded/set
 	float interpolatePhaseAdvance(float rpm);   // linear interpolation (returns degrees)
+
+	// Cogging waveshaping ("3rd harmonic" tab).
+	// The DFT compensation reconstructs the cogging wave as a sum of sines, which can
+	// sit slightly off the physical stator-tooth profile and feel asymmetric
+	// ("troughs resistive, peaks too light"). This lets the user reshape the
+	// compensation by subtracting/adding a harmonic of the DOMINANT cogging harmonic:
+	//   shaped = compensation - h3_shaping * dom_amp * sin(mult*(dom_order*theta + dom_phase) + h3_phase_trim)
+	// With mult=3 and h3_shaping>0 this thins the peaks / steepens the slopes so the
+	// compensation better matches the real tooth geometry. dom_* are derived at
+	// runtime from the largest entry in cogging_harmonics[].
+	float h3_shaping = 0.0f;       // signed fraction of dominant amplitude (e.g. +0.15)
+	float h3_phase_trim = 0.0f;    // extra phase offset (rad)
+	uint16_t h3_mult = 3;          // harmonic multiplier of dominant order (1..31)
 
 	// Data for scale sweep
 	float scale_optimize_test_rpm = 0.0f;
@@ -834,6 +856,7 @@ private:
 	float coggingSpeedP = 0.0f;
 	float coggingSpeedI = 0.0f;
 	float coggingSpeedD = 0.0f;
+	float coggingShape = 1.0f;  // waveshaping factor (1.0 = linear)
 	void handleStateCoggingCalibration();
 #endif
 

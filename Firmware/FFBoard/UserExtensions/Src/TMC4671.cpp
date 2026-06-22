@@ -101,21 +101,21 @@ void TMC4671::setAddress(uint8_t address){
 	if (address == 1){
 		this->flashAddrs = TMC4671FlashAddrs({ADR_TMC1_MOTCONF, ADR_TMC1_CPR, ADR_TMC1_ENCA, ADR_TMC1_OFFSETFLUX, ADR_TMC1_TORQUE_P, ADR_TMC1_TORQUE_I, ADR_TMC1_FLUX_P, ADR_TMC1_FLUX_I,ADR_TMC1_ADC_I0_OFS,ADR_TMC1_ADC_I1_OFS,ADR_TMC1_ENC_OFFSET,ADR_TMC1_PHIE_OFS,ADR_TMC1_TRQ_FILT
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
-			,ADR_TMC1_COGGING_CAL, ADR_TMC1_COGGING_SCALE, ADR_TMC1_COGGING_DYN_OFS, ADR_TMC1_SCALE_CURVE_BASE, ADR_TMC1_PHASEADV_CURVE_BASE
+			,ADR_TMC1_COGGING_CAL, ADR_TMC1_COGGING_SCALE, ADR_TMC1_COGGING_DYN_OFS, ADR_TMC1_SCALE_CURVE_BASE, ADR_TMC1_PHASEADV_CURVE_BASE, ADR_TMC1_H3_AMP, ADR_TMC1_H3_PHASE, ADR_TMC1_H3_ORDER
 #endif
 			});
 	}else if (address == 2)
 	{
 		this->flashAddrs = TMC4671FlashAddrs({ADR_TMC2_MOTCONF, ADR_TMC2_CPR, ADR_TMC2_ENCA, ADR_TMC2_OFFSETFLUX, ADR_TMC2_TORQUE_P, ADR_TMC2_TORQUE_I, ADR_TMC2_FLUX_P, ADR_TMC2_FLUX_I,ADR_TMC2_ADC_I0_OFS,ADR_TMC2_ADC_I1_OFS,ADR_TMC2_ENC_OFFSET,ADR_TMC2_PHIE_OFS,ADR_TMC2_TRQ_FILT
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
-	,ADR_TMC2_COGGING_CAL, ADR_TMC2_COGGING_SCALE, ADR_TMC2_COGGING_DYN_OFS, ADR_TMC2_SCALE_CURVE_BASE, ADR_TMC2_PHASEADV_CURVE_BASE
+	,ADR_TMC2_COGGING_CAL, ADR_TMC2_COGGING_SCALE, ADR_TMC2_COGGING_DYN_OFS, ADR_TMC2_SCALE_CURVE_BASE, ADR_TMC2_PHASEADV_CURVE_BASE, ADR_TMC2_H3_AMP, ADR_TMC2_H3_PHASE, ADR_TMC2_H3_ORDER
 #endif
 		});
 	}else if (address == 3)
 	{
 		this->flashAddrs = TMC4671FlashAddrs({ADR_TMC3_MOTCONF, ADR_TMC3_CPR, ADR_TMC3_ENCA, ADR_TMC3_OFFSETFLUX, ADR_TMC3_TORQUE_P, ADR_TMC3_TORQUE_I, ADR_TMC3_FLUX_P, ADR_TMC3_FLUX_I,ADR_TMC3_ADC_I0_OFS,ADR_TMC3_ADC_I1_OFS,ADR_TMC3_ENC_OFFSET,ADR_TMC3_PHIE_OFS,ADR_TMC3_TRQ_FILT
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS			
-	,ADR_TMC3_COGGING_CAL, ADR_TMC3_COGGING_SCALE, ADR_TMC3_COGGING_DYN_OFS, ADR_TMC3_SCALE_CURVE_BASE, ADR_TMC3_PHASEADV_CURVE_BASE
+	,ADR_TMC3_COGGING_CAL, ADR_TMC3_COGGING_SCALE, ADR_TMC3_COGGING_DYN_OFS, ADR_TMC3_SCALE_CURVE_BASE, ADR_TMC3_PHASEADV_CURVE_BASE, ADR_TMC3_H3_AMP, ADR_TMC3_H3_PHASE, ADR_TMC3_H3_ORDER
 #endif
 		});
 	}
@@ -169,6 +169,11 @@ void TMC4671::saveFlash(){
 			Flash_Write(flashAddrs.phaseAdvCurveBase + i, (uint16_t)curve_val);
 		}
 	}
+
+	// Save cogging waveshaping ("3rd harmonic" tab): shaping *1000, phase trim millirad, mult.
+	Flash_Write(flashAddrs.h3Shaping, (uint16_t)(int16_t)clip<float>(this->h3_shaping * 1000.0f, -32767, 32767));
+	Flash_Write(flashAddrs.h3PhaseTrim, (uint16_t)(int16_t)clip<float>(this->h3_phase_trim * 1000.0f, -32767, 32767));
+	Flash_Write(flashAddrs.h3Mult, this->h3_mult);
 #endif
 }
 
@@ -296,6 +301,17 @@ void TMC4671::restoreFlash(){
 	// Consider valid as soon as any point has ever been written to flash.
 	if (padv_any_valid)
 		phase_adv_curve_valid = true;
+
+	// Restore cogging waveshaping ("3rd harmonic" tab)
+	uint16_t h3_flash = 0;
+	if (Flash_Read(flashAddrs.h3Shaping, &h3_flash))
+		this->h3_shaping = (float)(int16_t)h3_flash / 1000.0f;
+	if (Flash_Read(flashAddrs.h3PhaseTrim, &h3_flash))
+		this->h3_phase_trim = (float)(int16_t)h3_flash / 1000.0f;
+	if (Flash_Read(flashAddrs.h3Mult, &h3_flash)) {
+		uint16_t m = h3_flash;
+		if (m >= 1 && m <= 31) this->h3_mult = m;
+	}
 #endif
 }
 
@@ -1707,11 +1723,28 @@ void TMC4671::turn(int16_t power){
 		// Fourier series compensation: Sum(A_k * sin(k * theta + phi_k))
 		float compensation = 0;
 		float angle_rad = pos_f * 2.0f * PI;
-		
+
+		// Track the dominant harmonic (largest amplitude) for waveshaping.
+		float dom_amp = 0.0f, dom_order = 1.0f, dom_phase = 0.0f;
 		for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
 			if (cogging_harmonics[i].amplitude > 0.0f) {
 				compensation += cogging_harmonics[i].amplitude * arm_sin_f32(angle_rad * cogging_harmonics[i].order + cogging_harmonics[i].phase);
+				if (cogging_harmonics[i].amplitude > dom_amp) {
+					dom_amp = cogging_harmonics[i].amplitude;
+					dom_order = (float)cogging_harmonics[i].order;
+					dom_phase = cogging_harmonics[i].phase;
+				}
 			}
+		}
+
+		// Cogging waveshaping: subtract/add a harmonic of the DOMINANT cogging
+		// order to reshape the peak/trough profile ("thin peaks / steep slopes"),
+		// since the raw Fourier sum can sit slightly off the physical tooth geometry.
+		//   shaped = compensation - h3_shaping * dom_amp * sin(mult*(dom_order*theta + dom_phase) + phase_trim)
+		// mult=3 and h3_shaping>0 thins the peaks; h3_shaping<0 flattens them.
+		if (h3_shaping != 0.0f && dom_amp > 0.0f) {
+			float shaped_arg = this->h3_mult * (dom_order * angle_rad + dom_phase) + this->h3_phase_trim;
+			compensation -= this->h3_shaping * dom_amp * arm_sin_f32(shaped_arg);
 		}
 		// Speed-dependent scale: interpolate from calibrated curve if available
 		float dyn_scale = this->cogging_scale;
@@ -2820,6 +2853,7 @@ void TMC4671::registerCommands(){
 	registerCommand("coggingSpeedD", TMC4671_commands::coggingSpeedD, "Speed D gain for cogging",CMDFLAG_GET | CMDFLAG_SET);
 	registerCommand("scaleCurve", TMC4671_commands::scaleCurve, "Get/Set scale curve values",CMDFLAG_GET | CMDFLAG_SETADR);
 	registerCommand("phaseAdvCurve", TMC4671_commands::phaseAdvCurve, "Get/Set phase advance curve (degrees per RPM)",CMDFLAG_GET | CMDFLAG_SETADR);
+	registerCommand("coggingH3", TMC4671_commands::coggingH3, "Cogging waveshaping: get 'shaping:phaseTrim:mult' or set adr 0=shaping(*1000) 1=phaseTrim(mdeg) 2=mult",CMDFLAG_GET | CMDFLAG_SETADR);
 #endif
 }
 
@@ -3231,6 +3265,14 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 		}
 		break;
 
+	case TMC4671_commands::coggingShape:
+		if (cmd.type == CMDtype::get) {
+			replies.emplace_back((int16_t)(this->coggingShape * 100.0f));
+		} else if (cmd.type == CMDtype::set) {
+			this->coggingShape = clip<float>((float)(int16_t)cmd.val / 100.0f, 0.0f, 10.0f);
+		}
+		break;
+
 	case TMC4671_commands::coggingSpeedD:
 		if (cmd.type == CMDtype::get) {
 			replies.emplace_back((int16_t)(this->coggingSpeedD));
@@ -3245,7 +3287,12 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
 				if (i > 0) s += ",";
 				s += std::to_string((int16_t)(scale_curve_rpm_defaults[i])) + ":";
-				s += std::to_string((int16_t)(scale_curve_values[i] * 1000.0f));
+				// Return effective default (1.0) when curve not calibrated yet
+				if (scale_curve_valid) {
+					s += std::to_string((int16_t)(scale_curve_values[i] * 1000.0f));
+				} else {
+					s += "1000";
+				}
 			}
 			replies.emplace_back(s);
 		} else if (cmd.type == CMDtype::setat) {
@@ -3266,7 +3313,12 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
 				if (i > 0) s += ",";
 				s += std::to_string((int16_t)(scale_curve_rpm_defaults[i])) + ":";
-				s += std::to_string((int16_t)(phase_advance_curve_values[i] * 100.0f));
+				// Return 0 when curve not calibrated yet
+				if (phase_adv_curve_valid) {
+					s += std::to_string((int16_t)(phase_advance_curve_values[i] * 100.0f));
+				} else {
+					s += "0";
+				}
 			}
 			replies.emplace_back(s);
 		} else if (cmd.type == CMDtype::setat) {
@@ -3274,6 +3326,28 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			if (idx < SCALE_CURVE_POINTS) {
 				phase_advance_curve_values[idx] = (float)(int16_t)cmd.val / 100.0f;
 				phase_adv_curve_valid = true;
+			}
+		}
+		break;
+
+	case TMC4671_commands::coggingH3:
+		// Cogging waveshaping. adr/index 0 = shaping (*1000, signed),
+		// 1 = phase trim (millirad, signed), 2 = mult (1..31).
+		if (cmd.type == CMDtype::get) {
+			std::string s;
+			s += std::to_string((int16_t)(this->h3_shaping * 1000.0f)) + ":";
+			s += std::to_string((int16_t)(this->h3_phase_trim * 1000.0f)) + ":";
+			s += std::to_string((uint16_t)this->h3_mult);
+			replies.emplace_back(s);
+		} else if (cmd.type == CMDtype::setat) {
+			uint8_t idx = (uint8_t)cmd.adr;
+			if (idx == 0) {
+				this->h3_shaping = (float)(int16_t)cmd.val / 1000.0f;
+			} else if (idx == 1) {
+				this->h3_phase_trim = (float)(int16_t)cmd.val / 1000.0f;
+			} else if (idx == 2) {
+				uint16_t m = (uint16_t)cmd.val;
+				if (m >= 1 && m <= 31) this->h3_mult = m;
 			}
 		}
 		break;
@@ -3877,9 +3951,13 @@ void TMC4671::handleStateCoggingCalibration() {
 	
 	allowStateChange = false;
 	
-	// Reset cogging table to prevent old harmonics from applying during calibration
+	// Reset cogging table and scale/phase curves for fresh calibration
 	clearCoggingTable();
-
+	scale_curve_valid = false;
+	phase_adv_curve_valid = false;
+	memset(scale_curve_values, 0, sizeof(scale_curve_values));
+	memset(phase_advance_curve_values, 0, sizeof(phase_advance_curve_values));
+	
 	// Set temporary robust PIDs for velocity control during calibration
 	calibPids.velocityP = 1000;
 	calibPids.velocityI = 100;
@@ -4262,7 +4340,7 @@ void TMC4671::handleStateCoggingCalibration() {
 			clearCoggingTable();
 			this->cogging_scale = 1.0f;
 
-			const uint8_t MAX_DFT_ITERATIONS = 2;
+			const uint8_t MAX_DFT_ITERATIONS = 3;
 
 			float prev_iter_err = 999.0f; // track best error for degradation detection
 			Harmonic prev_harmonics[COGGING_HARMONICS_COUNT]; // backup of best table
