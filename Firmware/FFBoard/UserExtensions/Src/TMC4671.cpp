@@ -101,21 +101,21 @@ void TMC4671::setAddress(uint8_t address){
 	if (address == 1){
 		this->flashAddrs = TMC4671FlashAddrs({ADR_TMC1_MOTCONF, ADR_TMC1_CPR, ADR_TMC1_ENCA, ADR_TMC1_OFFSETFLUX, ADR_TMC1_TORQUE_P, ADR_TMC1_TORQUE_I, ADR_TMC1_FLUX_P, ADR_TMC1_FLUX_I,ADR_TMC1_ADC_I0_OFS,ADR_TMC1_ADC_I1_OFS,ADR_TMC1_ENC_OFFSET,ADR_TMC1_PHIE_OFS,ADR_TMC1_TRQ_FILT
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
-			,ADR_TMC1_COGGING_CAL, ADR_TMC1_COGGING_SCALE, ADR_TMC1_COGGING_DYN_OFS, ADR_TMC1_SCALE_CURVE_BASE, ADR_TMC1_PHASEADV_CURVE_BASE, ADR_TMC1_H3_AMP, ADR_TMC1_H3_PHASE, ADR_TMC1_H3_ORDER
+			,ADR_TMC1_COGGING_CAL, ADR_TMC1_COGGING_SCALE, ADR_TMC1_COGGING_DYN_OFS, ADR_TMC1_SCALE_CURVE_BASE, ADR_TMC1_PHASEADV_CURVE_BASE, ADR_TMC1_H3_AMP, ADR_TMC1_H3_PHASE, ADR_TMC1_H3_ORDER, ADR_TMC1_COGGING_BLEND_RPM2, ADR_TMC1_COGGING_RPM2_VALID, ADR_TMC1_COGGING_BLEND_RPM3, ADR_TMC1_COGGING_RPM3_VALID
 #endif
 			});
 	}else if (address == 2)
 	{
 		this->flashAddrs = TMC4671FlashAddrs({ADR_TMC2_MOTCONF, ADR_TMC2_CPR, ADR_TMC2_ENCA, ADR_TMC2_OFFSETFLUX, ADR_TMC2_TORQUE_P, ADR_TMC2_TORQUE_I, ADR_TMC2_FLUX_P, ADR_TMC2_FLUX_I,ADR_TMC2_ADC_I0_OFS,ADR_TMC2_ADC_I1_OFS,ADR_TMC2_ENC_OFFSET,ADR_TMC2_PHIE_OFS,ADR_TMC2_TRQ_FILT
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
-	,ADR_TMC2_COGGING_CAL, ADR_TMC2_COGGING_SCALE, ADR_TMC2_COGGING_DYN_OFS, ADR_TMC2_SCALE_CURVE_BASE, ADR_TMC2_PHASEADV_CURVE_BASE, ADR_TMC2_H3_AMP, ADR_TMC2_H3_PHASE, ADR_TMC2_H3_ORDER
+	,ADR_TMC2_COGGING_CAL, ADR_TMC2_COGGING_SCALE, ADR_TMC2_COGGING_DYN_OFS, ADR_TMC2_SCALE_CURVE_BASE, ADR_TMC2_PHASEADV_CURVE_BASE, ADR_TMC2_H3_AMP, ADR_TMC2_H3_PHASE, ADR_TMC2_H3_ORDER, ADR_TMC2_COGGING_BLEND_RPM2, ADR_TMC2_COGGING_RPM2_VALID, ADR_TMC2_COGGING_BLEND_RPM3, ADR_TMC2_COGGING_RPM3_VALID
 #endif
 		});
 	}else if (address == 3)
 	{
 		this->flashAddrs = TMC4671FlashAddrs({ADR_TMC3_MOTCONF, ADR_TMC3_CPR, ADR_TMC3_ENCA, ADR_TMC3_OFFSETFLUX, ADR_TMC3_TORQUE_P, ADR_TMC3_TORQUE_I, ADR_TMC3_FLUX_P, ADR_TMC3_FLUX_I,ADR_TMC3_ADC_I0_OFS,ADR_TMC3_ADC_I1_OFS,ADR_TMC3_ENC_OFFSET,ADR_TMC3_PHIE_OFS,ADR_TMC3_TRQ_FILT
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS			
-	,ADR_TMC3_COGGING_CAL, ADR_TMC3_COGGING_SCALE, ADR_TMC3_COGGING_DYN_OFS, ADR_TMC3_SCALE_CURVE_BASE, ADR_TMC3_PHASEADV_CURVE_BASE, ADR_TMC3_H3_AMP, ADR_TMC3_H3_PHASE, ADR_TMC3_H3_ORDER
+	,ADR_TMC3_COGGING_CAL, ADR_TMC3_COGGING_SCALE, ADR_TMC3_COGGING_DYN_OFS, ADR_TMC3_SCALE_CURVE_BASE, ADR_TMC3_PHASEADV_CURVE_BASE, ADR_TMC3_H3_AMP, ADR_TMC3_H3_PHASE, ADR_TMC3_H3_ORDER, ADR_TMC3_COGGING_BLEND_RPM2, ADR_TMC3_COGGING_RPM2_VALID, ADR_TMC3_COGGING_BLEND_RPM3, ADR_TMC3_COGGING_RPM3_VALID
 #endif
 		});
 	}
@@ -174,6 +174,12 @@ void TMC4671::saveFlash(){
 	Flash_Write(flashAddrs.h3Shaping, (uint16_t)(int16_t)clip<float>(this->h3_shaping * 1000.0f, -32767, 32767));
 	Flash_Write(flashAddrs.h3PhaseTrim, (uint16_t)(int16_t)clip<float>(this->h3_phase_trim * 1000.0f, -32767, 32767));
 	Flash_Write(flashAddrs.h3Mult, this->h3_mult);
+
+	// Multi-RPM blend anchors (RPM*10) and per-map validity flags.
+	Flash_Write(flashAddrs.coggingBlendrpm2, (uint16_t)clip<float>(this->blend_rpm2 * 10.0f, 0.0f, 65535.0f));
+	Flash_Write(flashAddrs.coggingrpm2Valid, this->rpm2_table_valid ? 1 : 0);
+	Flash_Write(flashAddrs.coggingBlendrpm3, (uint16_t)clip<float>(this->blend_rpm3 * 10.0f, 0.0f, 65535.0f));
+	Flash_Write(flashAddrs.coggingrpm3Valid, this->rpm3_table_valid ? 1 : 0);
 #endif
 }
 
@@ -189,6 +195,16 @@ void TMC4671::saveAdcParams(){
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
 void TMC4671::saveCoggingTable(){
 		Flash_WriteCoggingTable(this->drv_address - 1, (void*)this->cogging_harmonics);}
+
+// RPM#2 and RPM#3 maps live in the second and third per-driver flash banks:
+//   low  : index (drv_address-1) + 0*COGGING_DRIVER_COUNT   (slots 0..2)
+//   rpm2 : index (drv_address-1) + 1*COGGING_DRIVER_COUNT   (slots 3..5)
+//   rpm3 : index (drv_address-1) + 2*COGGING_DRIVER_COUNT   (slots 6..8)
+void TMC4671::saveCoggingTableRpm2(){
+		Flash_WriteCoggingTable((this->drv_address - 1) + 1*COGGING_DRIVER_COUNT, (void*)this->cogging_harmonics_rpm2);}
+
+void TMC4671::saveCoggingTableRpm3(){
+		Flash_WriteCoggingTable((this->drv_address - 1) + 2*COGGING_DRIVER_COUNT, (void*)this->cogging_harmonics_rpm3);}
 
 void TMC4671::clearCoggingTable(){
 	memset(cogging_harmonics, 0, sizeof(cogging_harmonics));
@@ -266,6 +282,29 @@ void TMC4671::restoreFlash(){
 	}
 
 	Flash_ReadCoggingTable(this->drv_address - 1, (int16_t*)this->cogging_harmonics);
+
+	// Restore the RPM#2/RPM#3 maps, their validity flags and blend anchors so the
+	// multi-RPM gain scheduling survives a reboot.
+	Flash_ReadCoggingTable((this->drv_address - 1) + 1*COGGING_DRIVER_COUNT, (int16_t*)this->cogging_harmonics_rpm2);
+	Flash_ReadCoggingTable((this->drv_address - 1) + 2*COGGING_DRIVER_COUNT, (int16_t*)this->cogging_harmonics_rpm3);
+	uint16_t rpm2_valid_flash = 0;
+	if (Flash_Read(flashAddrs.coggingrpm2Valid, &rpm2_valid_flash)) {
+		this->rpm2_table_valid = (rpm2_valid_flash != 0);
+	} else { this->rpm2_table_valid = false; }
+	uint16_t rpm3_valid_flash = 0;
+	if (Flash_Read(flashAddrs.coggingrpm3Valid, &rpm3_valid_flash)) {
+		this->rpm3_table_valid = (rpm3_valid_flash != 0);
+	} else { this->rpm3_table_valid = false; }
+	uint16_t blend2_flash = 0;
+	if (Flash_Read(flashAddrs.coggingBlendrpm2, &blend2_flash)) {
+		this->blend_rpm2 = (float)(uint16_t)blend2_flash / 10.0f;
+		if (this->blend_rpm2 < 1.0f) this->blend_rpm2 = 30.0f;
+	} else { this->blend_rpm2 = 30.0f; }
+	uint16_t blend3_flash = 0;
+	if (Flash_Read(flashAddrs.coggingBlendrpm3, &blend3_flash)) {
+		this->blend_rpm3 = (float)(uint16_t)blend3_flash / 10.0f;
+		if (this->blend_rpm3 < 1.0f) this->blend_rpm3 = 100.0f;
+	} else { this->blend_rpm3 = 100.0f; }
 
 	// Largest single harmonic amplitude as tanh reference.
 	// Using sum-of-all or RMS overestimates, keeping tanh in linear zone.
@@ -1720,19 +1759,26 @@ void TMC4671::turn(int16_t power){
 			pos_f = pos_f - floorf(pos_f);
 		}
 
-		// Fourier series compensation: Sum(A_k * sin(k * theta + phi_k))
+		// Fourier series compensation with per-RPM harmonic blending.
+		// Three tables were calibrated at different RPMs; blend between them
+		// based on measured_rpm: below blend_rpm1 uses only cogging_harmonics,
+		// between blend_rpm1..blend_rpm2 uses blend of cogging_harmonics + cogging_harmonics_rpm2,
+		// above blend_rpm2 uses blend of cogging_harmonics_rpm2 + cogging_harmonics_rpm3.
+		Harmonic blended[COGGING_HARMONICS_COUNT];
+		this->blendHarmonicTables(measured_rpm, blended);
+
 		float compensation = 0;
 		float angle_rad = pos_f * 2.0f * PI;
 
 		// Track the dominant harmonic (largest amplitude) for waveshaping.
 		float dom_amp = 0.0f, dom_order = 1.0f, dom_phase = 0.0f;
 		for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
-			if (cogging_harmonics[i].amplitude > 0.0f) {
-				compensation += cogging_harmonics[i].amplitude * arm_sin_f32(angle_rad * cogging_harmonics[i].order + cogging_harmonics[i].phase);
-				if (cogging_harmonics[i].amplitude > dom_amp) {
-					dom_amp = cogging_harmonics[i].amplitude;
-					dom_order = (float)cogging_harmonics[i].order;
-					dom_phase = cogging_harmonics[i].phase;
+			if (blended[i].amplitude > 0.0f) {
+				compensation += blended[i].amplitude * arm_sin_f32(angle_rad * blended[i].order + blended[i].phase);
+				if (blended[i].amplitude > dom_amp) {
+					dom_amp = blended[i].amplitude;
+					dom_order = (float)blended[i].order;
+					dom_phase = blended[i].phase;
 				}
 			}
 		}
@@ -2854,6 +2900,13 @@ void TMC4671::registerCommands(){
 	registerCommand("scaleCurve", TMC4671_commands::scaleCurve, "Get/Set scale curve values",CMDFLAG_GET | CMDFLAG_SETADR);
 	registerCommand("phaseAdvCurve", TMC4671_commands::phaseAdvCurve, "Get/Set phase advance curve (degrees per RPM)",CMDFLAG_GET | CMDFLAG_SETADR);
 	registerCommand("coggingH3", TMC4671_commands::coggingH3, "Cogging waveshaping: get 'shaping:phaseTrim:mult' or set adr 0=shaping(*1000) 1=phaseTrim(mdeg) 2=mult",CMDFLAG_GET | CMDFLAG_SETADR);
+	registerCommand("coggingCalibCount", TMC4671_commands::coggingCalibCount, "Get number of calibration profiles",CMDFLAG_GET);
+	registerCommand("coggingCalibRPM", TMC4671_commands::coggingCalibRPM, "Get/Set RPM target per calibration profile (adr=idx, val=RPM*10)",CMDFLAG_GETADR | CMDFLAG_SETADR);
+	registerCommand("coggingCalibIters", TMC4671_commands::coggingCalibIters, "Get/Set iterations per calibration profile (adr=idx)",CMDFLAG_GETADR | CMDFLAG_SETADR);
+	registerCommand("coggingCalibPidP", TMC4671_commands::coggingCalibPidP, "Get/Set manual P gain per calibration profile (adr=idx, val=PID*1000)",CMDFLAG_GETADR | CMDFLAG_SETADR);
+	registerCommand("coggingCalibPidI", TMC4671_commands::coggingCalibPidI, "Get/Set manual I gain per calibration profile (adr=idx, val=PID*1000)",CMDFLAG_GETADR | CMDFLAG_SETADR);
+	registerCommand("coggingCalibPidD", TMC4671_commands::coggingCalibPidD, "Get/Set manual D gain per calibration profile (adr=idx, val=PID*1000)",CMDFLAG_GETADR | CMDFLAG_SETADR);
+	registerCommand("coggingCalibAutoPid", TMC4671_commands::coggingCalibAutoPid, "Get/Set auto PID tune flag (1=auto, 0=manual)",CMDFLAG_GET | CMDFLAG_SET);
 #endif
 }
 
@@ -3354,17 +3407,22 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 
 	case TMC4671_commands::coggingHarmonics:
 		if(cmd.type == CMDtype::get){
+			// Select table by adr: 0=cogging_harmonics, 1=rpm2, 2=rpm3
+			Harmonic* tbl = cogging_harmonics;
+			if (cmd.adr == 1 && rpm2_table_valid) tbl = cogging_harmonics_rpm2;
+			if (cmd.adr == 2 && rpm3_table_valid) tbl = cogging_harmonics_rpm3;
+
 			// Send full harmonic table: "order:amplitude:phase,..." (up to 20 harmonics)
 			std::string s;
 			s.reserve(512);
 			bool first = true;
 			for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
-				if (cogging_harmonics[i].amplitude > 0.0f || cogging_harmonics[i].order > 0) {
+				if (tbl[i].amplitude > 0.0f || tbl[i].order > 0) {
 					if (!first) s += ",";
 					first = false;
-					s += std::to_string(cogging_harmonics[i].order) + ":";
-					s += std::to_string((int16_t)cogging_harmonics[i].amplitude) + ":";
-					s += std::to_string((int16_t)(cogging_harmonics[i].phase * 1000.0f));
+					s += std::to_string(tbl[i].order) + ":";
+					s += std::to_string((int16_t)tbl[i].amplitude) + ":";
+					s += std::to_string((int16_t)(tbl[i].phase * 1000.0f));
 				}
 			}
 			if (first) {
@@ -3413,6 +3471,87 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			}
 			CommandHandler::broadcastCommandReply(CommandReply(s,0), (uint32_t)TMC4671_commands::coggingCwCcw, CMDtype::get);
 			return CommandStatus::NO_REPLY;
+		}
+		break;
+		break;
+
+	case TMC4671_commands::coggingCalibCount:
+		if(cmd.type == CMDtype::get){
+			replies.emplace_back((uint32_t)this->cogging_calib_count);
+		}
+		break;
+
+	case TMC4671_commands::coggingCalibRPM:
+		if(cmd.type == CMDtype::getat){
+			uint8_t idx = (uint8_t)cmd.adr;
+			if(idx < COGGING_MAX_CALIB_PROFILES)
+				replies.emplace_back((int16_t)(this->cogging_calib_rpm[idx] * 10.0f));
+		} else if(cmd.type == CMDtype::setat){
+			uint8_t idx = (uint8_t)cmd.adr;
+			if(idx < COGGING_MAX_CALIB_PROFILES)
+				this->cogging_calib_rpm[idx] = (float)(int16_t)cmd.val / 10.0f;
+		}
+		break;
+
+	case TMC4671_commands::coggingCalibIters:
+		if(cmd.type == CMDtype::getat){
+			uint8_t idx = (uint8_t)cmd.adr;
+			if(idx < COGGING_MAX_CALIB_PROFILES)
+				replies.emplace_back((uint32_t)this->cogging_calib_iters[idx]);
+		} else if(cmd.type == CMDtype::setat){
+			uint8_t idx = (uint8_t)cmd.adr;
+			if(idx < COGGING_MAX_CALIB_PROFILES)
+				this->cogging_calib_iters[idx] = (uint16_t)cmd.val;
+		}
+		break;
+
+	case TMC4671_commands::coggingCalibPidP:
+		if(cmd.type == CMDtype::getat){
+			uint8_t idx = (uint8_t)cmd.adr;
+			if(idx < COGGING_MAX_CALIB_PROFILES)
+				replies.emplace_back((uint32_t)this->cogging_calib_pidP[idx]);
+		} else if(cmd.type == CMDtype::setat){
+			uint8_t idx = (uint8_t)cmd.adr;
+			if(idx < COGGING_MAX_CALIB_PROFILES){
+				this->cogging_calib_pidP[idx] = cmd.val;
+				if(idx == 0) this->coggingSpeedP = (float)cmd.val;
+			}
+		}
+		break;
+
+	case TMC4671_commands::coggingCalibPidI:
+		if(cmd.type == CMDtype::getat){
+			uint8_t idx = (uint8_t)cmd.adr;
+			if(idx < COGGING_MAX_CALIB_PROFILES)
+				replies.emplace_back((uint32_t)this->cogging_calib_pidI[idx]);
+		} else if(cmd.type == CMDtype::setat){
+			uint8_t idx = (uint8_t)cmd.adr;
+			if(idx < COGGING_MAX_CALIB_PROFILES){
+				this->cogging_calib_pidI[idx] = cmd.val;
+				if(idx == 0) this->coggingSpeedI = (float)cmd.val;
+			}
+		}
+		break;
+
+	case TMC4671_commands::coggingCalibPidD:
+		if(cmd.type == CMDtype::getat){
+			uint8_t idx = (uint8_t)cmd.adr;
+			if(idx < COGGING_MAX_CALIB_PROFILES)
+				replies.emplace_back((uint32_t)this->cogging_calib_pidD[idx]);
+		} else if(cmd.type == CMDtype::setat){
+			uint8_t idx = (uint8_t)cmd.adr;
+			if(idx < COGGING_MAX_CALIB_PROFILES){
+				this->cogging_calib_pidD[idx] = cmd.val;
+				if(idx == 0) this->coggingSpeedD = (float)cmd.val;
+			}
+		}
+		break;
+
+	case TMC4671_commands::coggingCalibAutoPid:
+		if(cmd.type == CMDtype::get){
+			replies.emplace_back(this->cogging_calib_autoPid ? 1 : 0);
+		} else if(cmd.type == CMDtype::set){
+			this->cogging_calib_autoPid = (cmd.val != 0);
 		}
 		break;
 #endif
@@ -3847,6 +3986,80 @@ void TMC4671::recomputeCoggingFromCwCcw() {
  * Calculates a detent torque compensation map (anti-cogging) for the motor.
  * This function is now ATOMIC: it blocks the TMC thread to perform high-frequency sampling.
  */
+
+/**
+ * Blends per-RPM harmonic tables based on current measured RPM.
+ * Below blend_rpm1: 100% cogging_harmonics
+ * blend_rpm1..blend_rpm2: linear blend between cogging_harmonics and cogging_harmonics_rpm2
+ * Above blend_rpm2: linear blend between cogging_harmonics_rpm2 and cogging_harmonics_rpm3
+ * Unavailable tables are treated as all-zero.
+ */
+void TMC4671::blendHarmonicTables(float rpm, Harmonic* out_table) {
+	memset(out_table, 0, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
+
+	float w_lo = 1.0f, w_hi = 0.0f;
+	const Harmonic* tab_a = this->cogging_harmonics;
+	const Harmonic* tab_b = this->cogging_harmonics_rpm2;
+
+	if (rpm < this->blend_rpm1 || !this->rpm2_table_valid) {
+		// Low RPM only (or no mid table available)
+		w_lo = 1.0f; w_hi = 0.0f;
+		tab_b = this->cogging_harmonics; // unused, set to avoid nullptr issues
+	} else if (rpm < this->blend_rpm2 && this->rpm2_table_valid) {
+		// Blend between low and mid
+		float t = (rpm - this->blend_rpm1) / (this->blend_rpm2 - this->blend_rpm1);
+		w_lo = 1.0f - t;
+		w_hi = t;
+	} else if (rpm < this->blend_rpm3 && this->rpm3_table_valid) {
+		// Blend between mid and high
+		tab_a = this->cogging_harmonics_rpm2;
+		tab_b = this->cogging_harmonics_rpm3;
+		float t = (rpm - this->blend_rpm2) / (this->blend_rpm3 - this->blend_rpm2);
+		w_lo = 1.0f - t;
+		w_hi = t;
+	} else {
+		// Above all thresholds: use highest available
+		if (this->rpm3_table_valid) {
+			memcpy(out_table, this->cogging_harmonics_rpm3, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
+		} else if (this->rpm2_table_valid) {
+			memcpy(out_table, this->cogging_harmonics_rpm2, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
+		} else {
+			memcpy(out_table, this->cogging_harmonics, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
+		}
+		return;
+	}
+
+	// Linear blend: for each harmonic order, interpolate amplitude and phase.
+	// Phase needs unwrapping.
+	// Build lookup by order for tab_a and tab_b.
+	for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
+		uint16_t order = tab_a[i].order;
+		if (order == 0 && tab_a[i].amplitude <= 0.0f) continue;
+
+		float amp_a = tab_a[i].amplitude;
+		float ph_a = tab_a[i].phase;
+
+		// Find matching order in tab_b
+		float amp_b = 0.0f, ph_b = 0.0f;
+		for (uint8_t j = 0; j < COGGING_HARMONICS_COUNT; j++) {
+			if (tab_b[j].order == order && tab_b[j].amplitude > 0.0f) {
+				amp_b = tab_b[j].amplitude;
+				ph_b = tab_b[j].phase;
+				break;
+			}
+		}
+
+		// Phase unwrap
+		float diff = ph_b - ph_a;
+		if (diff > PI) ph_b -= 2.0f * PI;
+		if (diff < -PI) ph_b += 2.0f * PI;
+
+		out_table[i].order = order;
+		out_table[i].amplitude = amp_a * w_lo + amp_b * w_hi;
+		out_table[i].phase = ph_a * w_lo + ph_b * w_hi;
+	}
+}
+
 void TMC4671::handleStateCoggingCalibration() {
 
 	auto broadcastCalibLog = [this](int val, const char* format, ...) {
@@ -3875,8 +4088,9 @@ void TMC4671::handleStateCoggingCalibration() {
 	TMC4671PIDConf prevPids = curPids;
 	TMC4671PIDConf calibPids = curPids;
 	
-	// --- TUNABLE CALIBRATION CONSTANTS ---
-	const uint32_t REVOLUTION_TIME_MS = COGGING_CALIB_TIME_PER_REV_S * 1500;
+	// REVOLUTION_TIME_MS is now computed dynamically in the RPM profile loop
+	// below, based on the active calib_rpm, so each sweep is exactly 1 revolution.
+	// const uint32_t REVOLUTION_TIME_MS removed — see dynamic calc below.
 	const uint32_t BREAKOUT_STEP_MS = 50;
 	const uint32_t SYSID_J_PULSE_MS = 150;
 	const uint32_t SYSID_B_DURATION_MS = 2000;
@@ -3994,6 +4208,7 @@ void TMC4671::handleStateCoggingCalibration() {
 	// 2. CALIBRATION PROCESS AND ANALYSIS
 	{
 		uint32_t total_samples = 0;
+		bool any_profile_succeeded = false;
 		float starting_torque = bangInitPower > 0 ? (float)bangInitPower * 0.15f : 300.0f; 
 		float tuning_torque = starting_torque;
 		float dynamic_friction = 0.0f;
@@ -4296,7 +4511,8 @@ void TMC4671::handleStateCoggingCalibration() {
 
 			float imc_kp = pid_soft.Kp;
 			float imc_ki = pid_soft.Ki;
-			uint32_t gain_sweep_timeout_ms = GAIN_SWEEP_WARMUP_MS + ((REVOLUTION_TIME_MS * 2U) / 3U) + 500U;
+			// Use the initial calib_rpm (3 RPM = 20000 ms) for the IMC validation sweep.
+			uint32_t gain_sweep_timeout_ms = GAIN_SWEEP_WARMUP_MS + ((20000U * 2U) / 3U) + 500U;
 			if (gain_sweep_timeout_ms < VAL_TOTAL_DURATION_MS) {
 				gain_sweep_timeout_ms = VAL_TOTAL_DURATION_MS;
 			}
@@ -4335,12 +4551,81 @@ void TMC4671::handleStateCoggingCalibration() {
 			Delay(250);
 
 // --- STEP 3/4: DFT ACQUISITION AT CONSTANT SPEED ---
-			// Iterative DFT: first pass measures full cogging (table cleared),
-			// subsequent passes measure residual with FF active and phasor-add.
-			clearCoggingTable();
-			this->cogging_scale = 1.0f;
+			// Multi-RPM profile loop: calibrate at each configured RPM speed.
+			// Each profile uses its own iteration count from cogging_calib_iters[].
+			// Each profile writes DIRECTLY into its own target table (active_tbl),
+			// so the routine is identical across profiles — only the target location
+			// increments (location 1 = cogging_harmonics, 2 = _rpm2, 3 = _rpm3).
 
-			const uint8_t MAX_DFT_ITERATIONS = 3;
+			// Clear stale higher-table validity flags + tables from a previous
+			// calibration. If this run uses fewer profiles (or a higher profile
+			// aborts) we must not leave a stale-true flag pointing at empty/garbage
+			// data, or blendHarmonicTables() would return an empty table at speed.
+			this->rpm2_table_valid = false;
+			this->rpm3_table_valid = false;
+			memset(this->cogging_harmonics_rpm2, 0, sizeof(this->cogging_harmonics_rpm2));
+			memset(this->cogging_harmonics_rpm3, 0, sizeof(this->cogging_harmonics_rpm3));
+
+			// Track whether ANY profile produced a usable table. The finalize block
+			// uses this instead of total_samples (which only reflects the LAST
+			// iteration of the LAST profile, and can be 0 if that profile aborted
+			// even though earlier profiles — e.g. rpm1 — succeeded).
+			for (uint8_t rpm_profile = 0;
+				 rpm_profile < this->cogging_calib_count && !emergency && hasPower();
+				 rpm_profile++) {
+
+				// Set calibration RPM from current profile
+				calib_rpm = this->cogging_calib_rpm[rpm_profile];
+				if (calib_rpm <= 0.0f) calib_rpm = 60.0f / (float)COGGING_CALIB_TIME_PER_REV_S;
+
+				const uint8_t MAX_DFT_ITERATIONS = this->cogging_calib_iters[rpm_profile];
+				if (MAX_DFT_ITERATIONS < 1) continue;
+
+				// Recompute acquisition duration so each CW and CCW sweep
+				// is exactly 1 revolution, regardless of the RPM target.
+				const uint32_t rev_ms = (uint32_t)((60.0f / calib_rpm) * 1500.0f);
+				const uint32_t REVOLUTION_TIME_MS = rev_ms + COGGING_WARMUP_MS;
+
+				broadcastCalibLog(0, "RPM profile %u/%u: target %.1f RPM, %u iterations (%.1f s/rev)",
+					rpm_profile + 1, this->cogging_calib_count, calib_rpm, MAX_DFT_ITERATIONS,
+					(float)REVOLUTION_TIME_MS / 1000.0f);
+
+			// Load per-profile PID into the speed PID globals so the calibration
+			// loop uses this profile's gains instead of always reusing profile 0.
+			// Falls back to profile 0 for unconfigured profiles (all-zero PID).
+			{
+				uint32_t pidP = this->cogging_calib_pidP[rpm_profile];
+				uint32_t pidI = this->cogging_calib_pidI[rpm_profile];
+				uint32_t pidD = this->cogging_calib_pidD[rpm_profile];
+				if (rpm_profile > 0 && pidP == 0 && pidI == 0 && pidD == 0) {
+					pidP = this->cogging_calib_pidP[0];
+					pidI = this->cogging_calib_pidI[0];
+					pidD = this->cogging_calib_pidD[0];
+				}
+				this->coggingSpeedP = (float)pidP;
+				this->coggingSpeedI = (float)pidI;
+				this->coggingSpeedD = (float)pidD;
+			}
+
+			// Re-initialize pid_soft with this profile's gains.
+			// The STEP 2 IMC calc only ran once; each RPM profile
+			// must reset the CMSIS PID state for DFT velocity control.
+			pid_soft.Kp = this->coggingSpeedP;
+			pid_soft.Ki = this->coggingSpeedI;
+			pid_soft.Kd = this->coggingSpeedD;
+			arm_pid_init_f32(&pid_soft, 1);
+
+			// Per-profile target table: the calibration routine is IDENTICAL for
+			// every RPM profile — only the target location increments. Profile 0
+			// writes cogging_harmonics (location 1), profile 1 cogging_harmonics_rpm2
+			// (location 2), profile 2 cogging_harmonics_rpm3 (location 3). Each
+			// table is cleared, measured fresh, and phasor-refined independently, so
+			// every RPM speed gets its own self-contained cogging map.
+			Harmonic* active_tbl = this->cogging_harmonics;
+			if (rpm_profile == 1) active_tbl = this->cogging_harmonics_rpm2;
+			else if (rpm_profile >= 2) active_tbl = this->cogging_harmonics_rpm3;
+			memset(active_tbl, 0, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
+			this->cogging_scale = 1.0f;
 
 			float prev_iter_err = 999.0f; // track best error for degradation detection
 			Harmonic prev_harmonics[COGGING_HARMONICS_COUNT]; // backup of best table
@@ -4349,7 +4634,9 @@ void TMC4671::handleStateCoggingCalibration() {
 				total_samples = 0;
 				float iter_max_err_deg = 0.0f;
 
-				broadcastCalibLog(0, "DFT iteration %u/%u...", dft_iter + 1, MAX_DFT_ITERATIONS);
+			broadcastCalibLog(0, "DFT iteration %u/%u (Kp:%.0f Ki:%.0f Kd:%.0f)...",
+				dft_iter + 1, MAX_DFT_ITERATIONS,
+				pid_soft.Kp, pid_soft.Ki, pid_soft.Kd);
 
 				// Separate storage for CW and CCW harmonics — extracted per direction
 				// so they can be averaged after both sweeps complete
@@ -4448,13 +4735,16 @@ void TMC4671::handleStateCoggingCalibration() {
 									if (fabs(iq_cmd) > max_iq_cmd_used) max_iq_cmd_used = fabs(iq_cmd);
 								}
 								
-								// Cogging feed-forward from current table (zero on first pass)
+								// Cogging feed-forward from THIS profile's table (active_tbl). It is
+								// empty on iteration 0 (so the full cogging is measured), then on
+								// iterations 1..N it feeds back the running estimate so the DFT only
+								// sees the residual, which the phasor-add refines (see commit block).
 								float cog_comp = 0.0f;
 								{
 									float angle_rad = actual_pos_f * 2.0f * PI;
 									for (uint8_t h = 0; h < COGGING_HARMONICS_COUNT; h++) {
-										if (cogging_harmonics[h].amplitude > 0.0f) {
-											cog_comp += cogging_harmonics[h].amplitude * arm_sin_f32(angle_rad * cogging_harmonics[h].order + cogging_harmonics[h].phase);
+										if (active_tbl[h].amplitude > 0.0f) {
+											cog_comp += active_tbl[h].amplitude * arm_sin_f32(angle_rad * active_tbl[h].order + active_tbl[h].phase);
 										}
 									}
 								}
@@ -4547,9 +4837,11 @@ void TMC4671::handleStateCoggingCalibration() {
 				// Magnitude averaging cancels AC-neutral friction bias.
 				// Phase averaging with unwrapping cancels PID tracking lag delta.
 				if (total_samples > 0) {
-					// On first pass, clear the table
+					// On first pass, clear THIS profile's table (active_tbl already
+					// cleared at the top of the profile loop, but this guards against
+					// any stray state from a previous calibration run).
 					if (dft_iter == 0) {
-						memset(cogging_harmonics, 0, sizeof(cogging_harmonics));
+						memset(active_tbl, 0, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
 					}
 
 					// Diagnostics on first iteration
@@ -4590,36 +4882,38 @@ void TMC4671::handleStateCoggingCalibration() {
 						}
 					}
 
-					// Assign to cogging_harmonics
+					// Phasor-add the measured residual into THIS profile's table
+					// (active_tbl). On iter 0 the table is empty so this assigns the full
+					// measured cogging; on later iters the running estimate is refined.
 					for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
 						if (best[n].mag <= 0.0f) continue;
 						uint16_t order = best[n].order;
 						int slot = -1;
 						for (int j = 0; j < COGGING_HARMONICS_COUNT; j++) {
-							if (cogging_harmonics[j].order == order && cogging_harmonics[j].amplitude > 0.0f) {
+							if (active_tbl[j].order == order && active_tbl[j].amplitude > 0.0f) {
 								slot = j; break;
 							}
 						}
 						if (slot < 0) {
 							for (int j = 0; j < COGGING_HARMONICS_COUNT; j++) {
-								if (cogging_harmonics[j].amplitude <= 0.0f) { slot = j; break; }
+								if (active_tbl[j].amplitude <= 0.0f) { slot = j; break; }
 							}
 						}
 						if (slot >= 0) {
 #ifdef COGGING_DFT_USE_IQ_CMD
-							float ex_re = cogging_harmonics[slot].amplitude * cosf(cogging_harmonics[slot].phase);
-							float ex_im = cogging_harmonics[slot].amplitude * sinf(cogging_harmonics[slot].phase);
+							float ex_re = active_tbl[slot].amplitude * cosf(active_tbl[slot].phase);
+							float ex_im = active_tbl[slot].amplitude * sinf(active_tbl[slot].phase);
 							float new_re = best[n].mag * cosf(best[n].phase);
 							float new_im = best[n].mag * sinf(best[n].phase);
 							float sum_re = ex_re + new_re;
 							float sum_im = ex_im + new_im;
-							cogging_harmonics[slot].order = order;
-							cogging_harmonics[slot].amplitude = sqrtf(sum_re*sum_re + sum_im*sum_im);
-							cogging_harmonics[slot].phase = atan2f(sum_im, sum_re);
+							active_tbl[slot].order = order;
+							active_tbl[slot].amplitude = sqrtf(sum_re*sum_re + sum_im*sum_im);
+							active_tbl[slot].phase = atan2f(sum_im, sum_re);
 #else
-							cogging_harmonics[slot].order = order;
-							cogging_harmonics[slot].amplitude = best[n].mag;
-							cogging_harmonics[slot].phase = best[n].phase;
+							active_tbl[slot].order = order;
+							active_tbl[slot].amplitude = best[n].mag;
+							active_tbl[slot].phase = best[n].phase;
 #endif
 						}
 					}
@@ -4713,17 +5007,50 @@ void TMC4671::handleStateCoggingCalibration() {
 				// 	broadcastCalibLog(0, "DFT degraded, keeping previous table (%.2f deg)", prev_iter_err);
 				// 	break;
 				// }
-				// Save backup of current best table
-				memcpy(prev_harmonics, cogging_harmonics, sizeof(prev_harmonics));
+				// Save backup of current best table (this profile's table)
+				memcpy(prev_harmonics, active_tbl, sizeof(prev_harmonics));
 				prev_iter_err = iter_max_err_deg;
 			}
-		}
+
+			// Each profile wrote directly into its own table (active_tbl), so nothing
+			// to copy here. Mark validity ONLY if this profile actually collected
+			// samples (an aborted profile must not leave a valid flag on an empty
+			// table, or blendHarmonicTables() would output 0 at that speed band).
+			if (total_samples > 0) {
+				any_profile_succeeded = true;
+				if (rpm_profile == 1) this->rpm2_table_valid = true;
+				else if (rpm_profile >= 2) this->rpm3_table_valid = true;
+			}
+
+			} // end DFT iteration loop
+			} // end multi-RPM profile loop
 
 		// 3. SAVE & FINALIZE
-		if (!emergency && (total_samples > 0)) {
+		if (!emergency && any_profile_succeeded) {
 			broadcastCalibLog(0, "Cogging calibration successful");
 			refreshWatchdog();
 			saveCoggingTable();
+
+			// Persist the RPM#2/RPM#3 maps and stamp the blend anchors from the
+			// calibrated profile speeds so the runtime blend matches this run.
+			// blend_rpm1 is the lowest profile speed; the crossover anchors default
+			// to the rpm2/rpm3 calibration speeds (user-tunable live via commands).
+			if (this->cogging_calib_count > 0 && this->cogging_calib_rpm[0] > 0.0f)
+				this->blend_rpm1 = this->cogging_calib_rpm[0];
+			if (this->rpm2_table_valid) {
+				if (this->cogging_calib_count > 1 && this->cogging_calib_rpm[1] > 0.0f)
+					this->blend_rpm2 = this->cogging_calib_rpm[1];
+				saveCoggingTableRpm2();
+			}
+			if (this->rpm3_table_valid) {
+				if (this->cogging_calib_count > 2 && this->cogging_calib_rpm[2] > 0.0f)
+					this->blend_rpm3 = this->cogging_calib_rpm[2];
+				saveCoggingTableRpm3();
+			}
+			broadcastCalibLog(0, "Maps stored (blend %.0f/%.0f/%.0f RPM, rpm2:%s rpm3:%s)",
+				this->blend_rpm1, this->blend_rpm2, this->blend_rpm3,
+				this->rpm2_table_valid ? "yes" : "no",
+				this->rpm3_table_valid ? "yes" : "no");
 
 				// --- 3.5 SCALE CALIBRATION (Position Error Grid Search) ---
 				// Get the raw absolute position (no modulo 1.0 wrapping)
@@ -4742,144 +5069,11 @@ void TMC4671::handleStateCoggingCalibration() {
 				if (main_h != -1) {
 					this->cogging_scale = 1.0f;
 					this->cogging_enabled = true;
+					// Persist anti-cogging metadata (enabled flag + scale) to EEPROM
+					// The harmonic tables were already saved to the flash sector above.
+					saveFlash();
 				}
 
-#ifdef COGGING_SCALE_SWEEP
-				// --- 3.6 SPEED-DEPENDENT SCALE CURVE SWEEP ---
-				// Gradient descent: 3rpm=1.0, then ±0.1 refine, then ±0.01 fine.
-				// Predict next magnitude from 2+ previous points for faster convergence.
-				{
-					this->cogging_enabled = true;
-					setMotionMode(MotionMode::torque, true);
-
-					const float rpm_list[14] = {3,4,5,7,10,15,20,30,40,50,60,70,80,100};
-					scale_curve_count = 14;
-					broadcastCalibLog(0, "Speed-dependent scale sweep (gradient descent)...");
-
-					uint32_t period_us = getActualCalibPeriod(TIM_TMC_ARR);
-					float dt_sec = (float)period_us / 1000000.0f;
-					uint32_t warmup_ms = 1500;
-
-					// Averaged max position error measurement (3 passes) to reject noise
-					auto measureError = [&](float testRpm, float scale) -> float {
-						float err_sum = 0.0f;
-						uint8_t valid_passes = 0;
-						for (uint8_t pass = 0; pass < 3 && !emergency && hasPower(); pass++) {
-							arm_pid_init_f32(&pid_soft, 1);
-							float target_pos_f = getFilteredPosition();
-							float max_err = 0.0f;
-							uint32_t sweeptime_ms = (uint32_t)(240000.0f / testRpm); // ~4 revolutions
-							sweeptime_ms = clip<uint32_t>(sweeptime_ms, 4000, 20000);
-							uint32_t next_tick = micros();
-							uint32_t endWarmup = HAL_GetTick() + warmup_ms;
-							uint32_t endMeasure = endWarmup + sweeptime_ms;
-
-							startCalibTimers(TIM_TMC_ARR);
-							while (HAL_GetTick() < endMeasure && !emergency && hasPower()) {
-								next_tick += period_us;
-								refreshWatchdog();
-								target_pos_f += (testRpm / 60.0f) * dt_sec;
-								target_pos_f = target_pos_f - floorf(target_pos_f);
-								float actual_pos_f = getFilteredPosition();
-								float err = getWrappedError(target_pos_f, actual_pos_f);
-								float iq_pid = arm_pid_f32(&pid_soft, err);
-								float cog = 0.0f;
-								float ar = actual_pos_f * 2.0f * PI;
-								for (uint8_t h = 0; h < COGGING_HARMONICS_COUNT; h++) {
-									if (cogging_harmonics[h].amplitude > 0.0f)
-										cog += cogging_harmonics[h].amplitude * arm_sin_f32(ar * cogging_harmonics[h].order + cogging_harmonics[h].phase);
-								}
-								float total = iq_pid + scale * cog;
-								total = clip<float,float>(total, -max_test_torque, max_test_torque);
-								applySafeTorque(total);
-								if (HAL_GetTick() >= endWarmup) {
-									float aerr = fabsf(err) * 360.0f; // position error in degrees
-									if (aerr > max_err) max_err = aerr;
-								}
-								while ((micros() - next_tick) & 0x80000000) {}
-							}
-							stopCalibTimers();
-							applySafeTorque(0);
-							Delay(250);
-							if (max_err < 99999.0f) {
-								err_sum += max_err;
-								valid_passes++;
-							}
-						}
-						return (valid_passes > 0) ? (err_sum / (float)valid_passes) : 999999.0f;
-					};
-
-					for (uint8_t pt = 0; pt < 14 && !emergency && hasPower(); pt++) {
-						float testRpm = rpm_list[pt];
-
-						// 3 RPM: force 1.0, no search
-						if (pt == 0) {
-							scale_curve_values[0] = 1.0f;
-							this->cogging_scale = 1.0f;
-							broadcastCalibLog(0, "RPM 3 -> scale 1.00 (fixed)");
-							continue;
-						}
-
-						// Predict: linear extrapolation, clamped to not go lower
-						float last_best = scale_curve_values[pt-1];
-						float seed = last_best;
-						if (pt >= 2) {
-							float x1 = rpm_list[pt-2], x2 = rpm_list[pt-1];
-							float y1 = scale_curve_values[pt-2], y2 = scale_curve_values[pt-1];
-							float slope = (y2 - y1) / (x2 - x1);
-							seed = y2 + slope * (testRpm - x2);
-						}
-						// Never go below last best (scale should only increase)
-						if (seed < last_best) seed = last_best;
-						seed = clip<float>(seed, 0.1f, 3.0f);
-
-						this->cogging_scale = seed;
-						float best_scale = seed;
-						float best_err = measureError(testRpm, best_scale);
-						broadcastCalibLog(0, "Sweep RPM %.0f seed=%.2f err=%.2f\xC2\xB0", testRpm, seed, best_err);
-
-						// Helper: walk both uphill and downhill, stepping until no more improvement
-						auto refine = [&](float testRpm, const char* label, float step) {
-							// Walk uphill while improving
-							while (!emergency && hasPower()) {
-								float trial = best_scale + step;
-								if (trial > 3.0f) break;
-								float r = measureError(testRpm, trial);
-								broadcastCalibLog(0, "  %s+ %.2f err=%.2f\xC2\xB0", label, trial, r);
-								if (r < best_err) { best_err = r; best_scale = trial; }
-								else break;
-							}
-							// Walk downhill while improving
-							while (!emergency && hasPower()) {
-								float trial = best_scale - step;
-								if (trial < last_best) break;
-								float r = measureError(testRpm, trial);
-								broadcastCalibLog(0, "  %s- %.2f err=%.2f\xC2\xB0", label, trial, r);
-								if (r < best_err) { best_err = r; best_scale = trial; }
-								else break;
-							}
-						};
-
-						// Coarse: ±0.25
-						refine(testRpm, "coarse", 0.25f);
-						// Fine: ±0.1
-						refine(testRpm, "fine", 0.10f);
-						// Finer: ±0.05 (RPM ≤ 20 only)
-						if (testRpm <= 20.0f)
-							refine(testRpm, "finer", 0.05f);
-
-						scale_curve_values[pt] = best_scale;
-						this->cogging_scale = best_scale;
-						broadcastCalibLog(0, "Final RPM %.0f -> scale %.2f (err %.2f\xC2\xB0)", testRpm, best_scale, best_err);
-						refreshWatchdog();
-					}
-					scale_curve_valid = true;
-					this->cogging_scale = 1.0f;
-					broadcastCalibLog(0, "Scale curve sweep complete (%u points)", scale_curve_count);
-				}
-#endif
-				// --- 4. RETURN TO CENTER (Unwinding multi-turn) ---
-				
 				calib_rpm = 20.0f; // Return speed (RPM). Increase if unwinding is too slow.
 				// Note: PID was tuned for slow acquisition speed. If tracking oscillates
 				// at high return speeds, reduce coggingSpeedP/coggingSpeedI or calib_rpm.

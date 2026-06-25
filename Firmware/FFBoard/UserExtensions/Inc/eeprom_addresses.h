@@ -13,7 +13,7 @@
 
 #include "main.h"
 // Change this to the amount of currently registered variables
-#define NB_OF_VAR 387
+#define NB_OF_VAR 399
 extern const uint16_t VirtAddVarTab[NB_OF_VAR];
 
 // Amount of variables in exportable list
@@ -270,4 +270,18 @@ uint16_t EE_ReadVariable(uint16_t VirtAddress, uint16_t* Data) will return 1 if 
 #define ADR_TMC3_H3_AMP    0x4B6
 #define ADR_TMC3_H3_PHASE  0x4B7
 #define ADR_TMC3_H3_ORDER  0x4B8
+// RPM#2/RPM#3 cogging dual-RPM blend (one per TMC driver).
+#define ADR_TMC1_COGGING_BLEND_RPM2 0x4B9
+#define ADR_TMC1_COGGING_RPM2_VALID 0x4BA
+#define ADR_TMC2_COGGING_BLEND_RPM2 0x4BB
+#define ADR_TMC2_COGGING_RPM2_VALID 0x4BC
+#define ADR_TMC3_COGGING_BLEND_RPM2 0x4BD
+#define ADR_TMC3_COGGING_RPM2_VALID 0x4BE
+// RPM#3 map (~100 RPM), one per TMC driver.
+#define ADR_TMC1_COGGING_BLEND_RPM3 0x4BF
+#define ADR_TMC1_COGGING_RPM3_VALID 0x4C0
+#define ADR_TMC2_COGGING_BLEND_RPM3 0x4C1
+#define ADR_TMC2_COGGING_RPM3_VALID 0x4C2
+#define ADR_TMC3_COGGING_BLEND_RPM3 0x4C3
+#define ADR_TMC3_COGGING_RPM3_VALID 0x4C4
 #endif /* EEPROM_ADDRESSES_H_ */

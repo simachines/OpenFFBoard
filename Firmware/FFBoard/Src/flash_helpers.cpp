@@ -247,8 +247,9 @@ __weak bool Flash_Init(){
 #endif
 #if defined(COGGING_TABLE_FLASH_START_ADDRESS)
 
-// Statically allocated buffer for the cogging region (approx 1KB for 3 tables of harmonics)
-static uint8_t cogging_flash_buffer[1024];
+// Statically allocated buffer for the cogging region.
+// Sized for MAX_COGGING_TABLES (3 drivers x 3 maps = 9 tables of 240B = 2160B, rounded up).
+static uint8_t cogging_flash_buffer[4096];
 
 /**
  * @brief Writes a single cogging table to flash using a safe read-modify-write procedure.

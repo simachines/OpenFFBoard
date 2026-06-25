@@ -137,7 +137,11 @@ extern CAN_HandleTypeDef hcan1;
 // Cogging tables in flash
 #define COGGING_HARMONICS_COUNT           20
 #define COGGING_TABLE_FLASH_START_ADDRESS ((uint32_t)0x08010000)
-#define COGGING_TABLE_SIZE                (COGGING_HARMONICS_COUNT * 12) 
-#define MAX_COGGING_TABLES                3
+#define COGGING_TABLE_SIZE                (COGGING_HARMONICS_COUNT * 12)
+// Each TMC driver stores three maps: low (3 RPM), hi (30 RPM), ultra (100 RPM).
+// Slot layout: [drv0_low, drv1_low, drv2_low, drv0_hi, drv1_hi, drv2_hi, drv0_ultra, ...].
+#define COGGING_DRIVER_COUNT              3
+#define COGGING_TABLES_PER_DRIVER         3
+#define MAX_COGGING_TABLES                (COGGING_DRIVER_COUNT * COGGING_TABLES_PER_DRIVER)
 #define COGGING_TABLE_FLASH_SECTOR        FLASH_SECTOR_4
 #endif /* INC_TARGET_CONSTANTS_H_ */

@@ -44,7 +44,6 @@
 #define COGGING_CALIB_DFT_HARMONICS     128     // Number of harmonics to analyze during calibration
 //#define COGGING_CALIB_ENABLE_ID_DIAG            // Enable Point 1 diagnostic (Id axis analysis)
 #define COGGING_DFT_USE_IQ_CMD                  //comment out to use adc iq
-//#define COGGING_SCALE_SWEEP
 #endif
 
 extern SPI_HandleTypeDef HSPIDRV;
@@ -356,6 +355,12 @@ struct TMC4671FlashAddrs{
 	uint16_t h3Shaping = ADR_TMC1_H3_AMP;
 	uint16_t h3PhaseTrim = ADR_TMC1_H3_PHASE;
 	uint16_t h3Mult = ADR_TMC1_H3_ORDER;
+	// Dual-RPM cogging gain scheduling (per TMC). Must stay last: aggregate-init order.
+	uint16_t coggingBlendrpm2 = ADR_TMC1_COGGING_BLEND_RPM2;
+	uint16_t coggingrpm2Valid = ADR_TMC1_COGGING_RPM2_VALID;
+	// rpm3-RPM map (RPM#3, ~100 RPM). Must stay last: aggregate-init order.
+	uint16_t coggingBlendrpm3 = ADR_TMC1_COGGING_BLEND_RPM3;
+	uint16_t coggingrpm3Valid = ADR_TMC1_COGGING_RPM3_VALID;
 #endif
 };
 
@@ -478,7 +483,10 @@ class TMC4671 :
 		extphie,torqueFilter_mode,torqueFilter_f,torqueFilter_q,pidautotune,fluxbrake,pwmfreq,
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
 		cogging,calibrateCogging, coggingTable, coggingScale, coggingSpeedP, coggingSpeedI, coggingHarmonics,
-coggingCwCcw, coggingSave, coggingShape, coggingSpeedD, scaleCurve, phaseAdvCurve, coggingH3
+coggingCwCcw, coggingSave, coggingShape, coggingSpeedD, scaleCurve, phaseAdvCurve, coggingH3,
+coggingHarmonicsRpm2, coggingBlendRpm2, coggingRpm2Valid,
+coggingHarmonicsRpm3, coggingBlendRpm3, coggingRpm3Valid,
+coggingCalibCount, coggingCalibRPM, coggingCalibIters, coggingCalibPidP, coggingCalibPidI, coggingCalibPidD, coggingCalibAutoPid
 #endif
 	};
 
@@ -791,6 +799,10 @@ private:
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
 	// Cogging Calibration
 	Harmonic cogging_harmonics[COGGING_HARMONICS_COUNT];
+	// RPM#2 cogging map (~30 RPM).
+	Harmonic cogging_harmonics_rpm2[COGGING_HARMONICS_COUNT];
+	// RPM#3 cogging map (~100 RPM).
+	Harmonic cogging_harmonics_rpm3[COGGING_HARMONICS_COUNT];
 	bool cogging_enabled = false;
 	float cogging_scale = 0.5f;
 	int32_t last_anticogging_torque = 0;
@@ -811,7 +823,16 @@ private:
 	void recomputeCoggingFromCwCcw(); // rebuilds cogging_harmonics from cw_store/ccw_store + offsets
 
 	void saveCoggingTable();
+	void saveCoggingTableRpm2();
+	void saveCoggingTableRpm3();
 	void clearCoggingTable();
+
+	// Multi-RPM gain scheduling state for RPM#1/#2/#3 blending.
+	float blend_rpm1 = 3.0f;
+	float blend_rpm2 = 30.0f;
+	float blend_rpm3 = 100.0f;
+	bool rpm2_table_valid = false;
+	bool rpm3_table_valid = false;
 
 	static constexpr uint8_t SCALE_CURVE_POINTS = 24;
 	// RPM breakpoints shared by the scale curve and the phase-advance curve (up to 256 RPM)
@@ -857,7 +878,17 @@ private:
 	float coggingSpeedI = 0.0f;
 	float coggingSpeedD = 0.0f;
 	float coggingShape = 1.0f;  // waveshaping factor (1.0 = linear)
+	// Multi-RPM calibration profile variables (configurable from configurator)
+	static constexpr uint8_t COGGING_MAX_CALIB_PROFILES = 5;
+	uint8_t cogging_calib_count = 1;
+	float cogging_calib_rpm[COGGING_MAX_CALIB_PROFILES] = {3.0f, 30.0f, 100.0f, 0.0f, 0.0f};
+	uint16_t cogging_calib_iters[COGGING_MAX_CALIB_PROFILES] = {3, 3, 3, 0, 0};
+	uint32_t cogging_calib_pidP[COGGING_MAX_CALIB_PROFILES] = {0, 0, 0, 0, 0};
+	uint32_t cogging_calib_pidI[COGGING_MAX_CALIB_PROFILES] = {0, 0, 0, 0, 0};
+	uint32_t cogging_calib_pidD[COGGING_MAX_CALIB_PROFILES] = {0, 0, 0, 0, 0};
+	bool cogging_calib_autoPid = true;
 	void handleStateCoggingCalibration();
+	void blendHarmonicTables(float rpm, Harmonic* out_table);
 #endif
 
 	
