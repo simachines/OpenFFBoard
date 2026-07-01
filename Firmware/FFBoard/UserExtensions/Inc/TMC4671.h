@@ -44,7 +44,7 @@
 #define COGGING_CALIB_DFT_HARMONICS     128     // Number of harmonics to analyze during calibration
 //#define COGGING_CALIB_ENABLE_ID_DIAG            // Enable Point 1 diagnostic (Id axis analysis)
 #define COGGING_DFT_USE_IQ_CMD                  //comment out to use adc iq
-#define COGGING_BLEND
+//#define COGGING_BLEND
 #define COGGING_PHASE_SHIFT_CAL
 #endif
 
@@ -838,16 +838,17 @@ private:
 	bool rpm3_table_valid = false;
 
 	static constexpr uint8_t SCALE_CURVE_POINTS = 24;
-	// RPM breakpoints shared by the scale curve and the phase-advance curve (up to 256 RPM)
-	static constexpr float scale_curve_rpm_defaults[24] = {0,5,7,10,12,15,20,25,30,35,40,50,60,70,80,90,100,120,140,160,180,200,225,256};
-	float scale_curve_values[24] = {};  // optimal cogging_scale at each RPM
+	// RPM breakpoints shared by the scale curve and the phase-advance curve.
+	// Writable so COGGING_PHASE_SHIFT_METHOD calibration can store measured RPMs.
+	float scale_curve_rpm_points[SCALE_CURVE_POINTS] = {0,5,7,10,12,15,20,25,30,35,40,50,60,70,80,90,100,120,140,160,180,200,225,256};
+	float scale_curve_values[SCALE_CURVE_POINTS] = {};  // optimal cogging_scale at each RPM
 	uint8_t scale_curve_count = 0;      // number of calibrated points
 	bool scale_curve_valid = false;     // curve has been calibrated
 	float interpolateScale(float rpm);  // linear interpolation for runtime
 
-	// Velocity-based phase advance: degrees of electrical/lookup position advance per RPM.
-	// Same structure as the scale curve. Applied at runtime to shift the cogging lookup position.
-	float phase_advance_curve_values[24] = {};  // degrees at each RPM breakpoint
+	// Velocity-based phase advance: degrees of lookup position advance.
+	// Same breakpoints and structure as the scale curve.
+	float phase_advance_curve_values[SCALE_CURVE_POINTS] = {};  // degrees at each RPM breakpoint
 	bool phase_adv_curve_valid = false;         // curve has been loaded/set
 	float interpolatePhaseAdvance(float rpm);   // linear interpolation (returns degrees)
 

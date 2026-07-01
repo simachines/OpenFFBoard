@@ -326,8 +326,11 @@ void TMC4671::restoreFlash(){
 			scale_curve_values[i] = 0.0f;
 		}
 	}
-	// Validate: 3 RPM scale should be near 1.0. Reject corrupt curves from old code.
-	if (any_valid && scale_curve_values[0] >= 1.0f)
+	// Validate: index 1 is the first calibration point (e.g. 3 RPM); its scale
+	// must be near 1.0.  Reject corrupt curves from old code.
+	// Index 0 is the plateau and is clamped to 1.0 unconditionally.
+	scale_curve_values[0] = 1.0f;
+	if (any_valid && scale_curve_values[1] >= 1.0f)
 		scale_curve_valid = true;
 
 	// Restore velocity-based phase-advance curve (24 points, degrees * 100)
@@ -343,8 +346,67 @@ void TMC4671::restoreFlash(){
 		}
 	}
 	// Consider valid as soon as any point has ever been written to flash.
+	// Index 0 is the plateau and must always be 0.0°.
+	phase_advance_curve_values[0] = 0.0f;
 	if (padv_any_valid)
 		phase_adv_curve_valid = true;
+
+	// Fill all 24 RPM breakpoints using linear interpolation between the
+	// sparse calibrated points so the configurator shows a smooth curve.
+	if (scale_curve_valid || phase_adv_curve_valid) {
+		// Find indices of calibrated (non-zero) points.
+		// When COGGING_DISABLE_SCALE_CURVE is defined, use phase values as anchors.
+		uint8_t calib_idx[SCALE_CURVE_POINTS];
+		uint8_t calib_n = 0;
+		for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
+#ifdef COGGING_DISABLE_SCALE_CURVE
+			if (phase_advance_curve_values[i] != 0.0f || i == 0)
+#else
+			if (scale_curve_values[i] > 0.0f)
+#endif
+				calib_idx[calib_n++] = i;
+		}
+		// Interpolate every breakpoint from nearest calibrated neighbours
+		if (calib_n >= 2) {
+			uint8_t lo = 0;
+			for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
+				while (lo + 1 < calib_n && calib_idx[lo + 1] <= i)
+					lo++;
+				uint8_t hi = (lo + 1 < calib_n) ? lo + 1 : lo;
+				if (hi == lo) {
+					if (calib_n >= 2) {
+						uint8_t a = calib_idx[calib_n - 2], b = calib_idx[calib_n - 1];
+						float drpm_i = scale_curve_rpm_points[i] - scale_curve_rpm_points[b];
+						float denom = scale_curve_rpm_points[b] - scale_curve_rpm_points[a];
+						if (denom > 0.01f) {
+#ifndef COGGING_DISABLE_SCALE_CURVE
+							float ss = (scale_curve_values[b] - scale_curve_values[a]) / denom;
+							scale_curve_values[i] = scale_curve_values[b] + ss * drpm_i;
+#endif
+							float ps = (phase_advance_curve_values[b] - phase_advance_curve_values[a]) / denom;
+							phase_advance_curve_values[i] = phase_advance_curve_values[b] + ps * drpm_i;
+						}
+					}
+				} else {
+					float denom = scale_curve_rpm_points[calib_idx[hi]] - scale_curve_rpm_points[calib_idx[lo]];
+					if (denom > 0.01f) {
+						float t = (scale_curve_rpm_points[i] - scale_curve_rpm_points[calib_idx[lo]]) / denom;
+#ifndef COGGING_DISABLE_SCALE_CURVE
+						scale_curve_values[i] = scale_curve_values[calib_idx[lo]] + t * (scale_curve_values[calib_idx[hi]] - scale_curve_values[calib_idx[lo]]);
+#endif
+						phase_advance_curve_values[i] = phase_advance_curve_values[calib_idx[lo]] + t * (phase_advance_curve_values[calib_idx[hi]] - phase_advance_curve_values[calib_idx[lo]]);
+					}
+				}
+			}
+#ifdef COGGING_DISABLE_SCALE_CURVE
+			for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++)
+				scale_curve_values[i] = 1.0f;
+#else
+			scale_curve_values[0] = 1.0f;
+#endif
+			phase_advance_curve_values[0] = 0.0f;
+		}
+	}
 
 	// Restore cogging waveshaping ("3rd harmonic" tab)
 	uint16_t h3_flash = 0;
@@ -3354,7 +3416,7 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			std::string s;
 			for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
 				if (i > 0) s += ",";
-				s += std::to_string((int16_t)(scale_curve_rpm_defaults[i])) + ":";
+				s += std::to_string((int16_t)(scale_curve_rpm_points[i])) + ":";
 				// Return effective default (1.0) when curve not calibrated yet
 				if (scale_curve_valid) {
 					s += std::to_string((int16_t)(scale_curve_values[i] * 1000.0f));
@@ -3380,7 +3442,7 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			std::string s;
 			for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
 				if (i > 0) s += ",";
-				s += std::to_string((int16_t)(scale_curve_rpm_defaults[i])) + ":";
+				s += std::to_string((int16_t)(scale_curve_rpm_points[i])) + ":";
 				// Return 0 when curve not calibrated yet
 				if (phase_adv_curve_valid) {
 					s += std::to_string((int16_t)(phase_advance_curve_values[i] * 100.0f));
@@ -3868,8 +3930,7 @@ float TMC4671::getAbsolutePosition() {
 
 float TMC4671::interpolateScale(float rpm) {
 	if (!scale_curve_valid || scale_curve_count < 2) return this->cogging_scale;
-	const float* rpm_pts = scale_curve_rpm_defaults;
-	// 0–3 RPM: flat plateau at the 3 RPM calibrated value (typically 1.0)
+	const float* rpm_pts = scale_curve_rpm_points;
 	if (rpm <= rpm_pts[0]) return scale_curve_values[0];
 	for (uint8_t i = 0; i < scale_curve_count - 1; i++) {
 		if (rpm >= rpm_pts[i] && rpm <= rpm_pts[i+1]) {
@@ -3877,21 +3938,29 @@ float TMC4671::interpolateScale(float rpm) {
 			return scale_curve_values[i] + t * (scale_curve_values[i+1] - scale_curve_values[i]);
 		}
 	}
-	return scale_curve_values[scale_curve_count - 1];
+	// Extrapolate past last calibrated point using slope of last segment
+	uint8_t last = scale_curve_count - 1;
+	float slope = (scale_curve_values[last] - scale_curve_values[last-1]) /
+	              (rpm_pts[last] - rpm_pts[last-1]);
+	float extrap = scale_curve_values[last] + slope * (rpm - rpm_pts[last]);
+	return clip<float>(extrap, 0.1f, 3.0f);
 }
 
 float TMC4671::interpolatePhaseAdvance(float rpm) {
-	if (!phase_adv_curve_valid) return 0.0f;
-	const float* rpm_pts = scale_curve_rpm_defaults;
-	// 0–3 RPM: no phase advance (low speed plateau)
+	if (!phase_adv_curve_valid || scale_curve_count < 2) return 0.0f;
+	const float* rpm_pts = scale_curve_rpm_points;
 	if (rpm <= rpm_pts[0]) return phase_advance_curve_values[0];
-	for (uint8_t i = 0; i < SCALE_CURVE_POINTS - 1; i++) {
+	for (uint8_t i = 0; i < scale_curve_count - 1; i++) {
 		if (rpm >= rpm_pts[i] && rpm <= rpm_pts[i+1]) {
 			float t = (rpm - rpm_pts[i]) / (rpm_pts[i+1] - rpm_pts[i]);
 			return phase_advance_curve_values[i] + t * (phase_advance_curve_values[i+1] - phase_advance_curve_values[i]);
 		}
 	}
-	return phase_advance_curve_values[SCALE_CURVE_POINTS - 1];
+	// Extrapolate past last calibrated point using slope of last segment
+	uint8_t last = scale_curve_count - 1;
+	float slope = (phase_advance_curve_values[last] - phase_advance_curve_values[last-1]) /
+	              (rpm_pts[last] - rpm_pts[last-1]);
+	return phase_advance_curve_values[last] + slope * (rpm - rpm_pts[last]);
 }
 
 float TMC4671::getFilteredPosition() {
@@ -4194,6 +4263,9 @@ void TMC4671::handleStateCoggingCalibration() {
 	phase_adv_curve_valid = false;
 	memset(scale_curve_values, 0, sizeof(scale_curve_values));
 	memset(phase_advance_curve_values, 0, sizeof(phase_advance_curve_values));
+	// Plateau (index 0): scale=1.0 (full compensation at low RPM), phase=0.0°.
+	scale_curve_values[0] = 1.0f;
+	phase_advance_curve_values[0] = 0.0f;
 	
 	// Set temporary robust PIDs for velocity control during calibration
 	calibPids.velocityP = 1000;
@@ -4604,24 +4676,34 @@ void TMC4671::handleStateCoggingCalibration() {
 			// iteration of the LAST profile, and can be 0 if that profile aborted
 			// even though earlier profiles — e.g. rpm1 — succeeded).
 			for (uint8_t rpm_profile = 0;
-				 rpm_profile < this->cogging_calib_count && !emergency && hasPower();
+				 rpm_profile <= this->cogging_calib_count && !emergency && hasPower();
 				 rpm_profile++) {
 
-				// Set calibration RPM from current profile
-				calib_rpm = this->cogging_calib_rpm[rpm_profile];
-				if (calib_rpm <= 0.0f) calib_rpm = 60.0f / (float)COGGING_CALIB_TIME_PER_REV_S;
+				// Extra iteration: auto-tune only for the return-home RPM.
+				// No DFT acquisition — just find the optimal Kp for unwinding.
+				bool is_return_tune = (rpm_profile == this->cogging_calib_count);
+				if (is_return_tune) {
+					calib_rpm = this->cogging_calib_rpm[this->cogging_calib_count - 1];
+					if (calib_rpm < 3.0f) calib_rpm = 20.0f;
+				} else {
+					// Set calibration RPM from current profile
+					calib_rpm = this->cogging_calib_rpm[rpm_profile];
+					if (calib_rpm <= 0.0f) calib_rpm = 60.0f / (float)COGGING_CALIB_TIME_PER_REV_S;
+				}
 
-				const uint8_t MAX_DFT_ITERATIONS = this->cogging_calib_iters[rpm_profile];
-				if (MAX_DFT_ITERATIONS < 1) continue;
+				const uint8_t MAX_DFT_ITERATIONS = is_return_tune ? 0 : this->cogging_calib_iters[rpm_profile];
+				if (MAX_DFT_ITERATIONS < 1 && !is_return_tune) continue;
 
 				// Recompute acquisition duration so each CW and CCW sweep
 				// is exactly 1 revolution, regardless of the RPM target.
 				const uint32_t rev_ms = (uint32_t)((60.0f / calib_rpm) * 1500.0f);
 				const uint32_t REVOLUTION_TIME_MS = rev_ms + COGGING_WARMUP_MS;
 
+				if (!is_return_tune) {
 				broadcastCalibLog(0, "RPM profile %u/%u: target %.1f RPM, %u iterations (%.1f s/rev)",
 					rpm_profile + 1, this->cogging_calib_count, calib_rpm, MAX_DFT_ITERATIONS,
 					(float)REVOLUTION_TIME_MS / 1000.0f);
+				}
 
 			// Load per-profile PID into the speed PID globals so the calibration
 			// loop uses this profile's gains instead of always reusing profile 0.
@@ -4631,9 +4713,12 @@ void TMC4671::handleStateCoggingCalibration() {
 				uint32_t pidI = this->cogging_calib_pidI[rpm_profile];
 				uint32_t pidD = this->cogging_calib_pidD[rpm_profile];
 				if (rpm_profile > 0 && pidP == 0 && pidI == 0 && pidD == 0) {
-					pidP = this->cogging_calib_pidP[0];
-					pidI = this->cogging_calib_pidI[0];
-					pidD = this->cogging_calib_pidD[0];
+					// For the return-tune iteration, use the highest calibrated
+					// profile's Kp as the starting point.
+					uint8_t src = is_return_tune ? (this->cogging_calib_count - 1) : 0;
+					pidP = this->cogging_calib_pidP[src];
+					pidI = this->cogging_calib_pidI[src];
+					pidD = this->cogging_calib_pidD[src];
 				}
 				this->coggingSpeedP = (float)pidP;
 				this->coggingSpeedI = (float)pidI;
@@ -4667,6 +4752,7 @@ void TMC4671::handleStateCoggingCalibration() {
 				bool tuning_done = false;
 				bool sweep_up = true;       // current sweep direction: true=UP (×1.25), false=DOWN (÷1.25)
 				bool did_down_sweep = false; // true after first error-growth reversal
+				bool clamp_just_cleared = false; // true after clamp backoff succeeded — use small step
 				uint8_t step_count = 0;
 				static constexpr uint8_t MAX_TUNE_STEPS = 20;
 				static constexpr float KP_TUNE_CEILING = 10000000.0f;
@@ -4782,13 +4868,17 @@ void TMC4671::handleStateCoggingCalibration() {
 					bool valid_p2p = (p2p_deg > 0.0f && p2p_deg < 720.0f);
 
 					// --- CLAMP HANDLING ---
-					// Clamp means oscillation. Strategy:
-					//  - If we have a known-safe best_kp: back off one step. If the
-					//    backoff Kp lands at/below best_kp, skip re-test and accept it.
-					//  - If no safe Kp yet (first-test or all backoffs clamped): keep
-					//    dividing until we escape the clamp zone or hit the floor (50).
-					//  - Never give up with a clamping Kp as "best".
 					if (clamp_hit) {
+						// Clamp means oscillation. The motor is ringing — stop it,
+						// re-init the PID, and wait for the oscillation to decay
+						// before testing the next (lower) Kp.
+						applySafeTorque(0);
+						arm_pid_init_f32(&pid_soft, 1);
+						Delay(500);  // let oscillation decay
+						// Reset trajectory origin to current position so the
+						// next sweep does a clean accel→cruise→decel from here.
+						target_pos_f = getFilteredPosition();
+
 						if (best_kp > 0.0f) {
 							// We have a previously-tested safe Kp.
 							float backoff_kp = test_kp / 1.25f;
@@ -4821,9 +4911,11 @@ void TMC4671::handleStateCoggingCalibration() {
 
 					// --- CLAMP BACKOFF RECOVERY ---
 					// We were backing off from a clamp. If we're now clamp-free,
-					// resume the normal UP sweep from this safe Kp.
+					// resume the UP sweep but use a smaller step (×1.10) to avoid
+					// stepping right back to the Kp that just clamped.
 					if (!sweep_up) {
 						sweep_up = true;
+						clamp_just_cleared = true;
 						broadcastCalibLog(0, "Clamp cleared at Kp:%.0f. Resuming UP sweep.", test_kp);
 					}
 
@@ -4861,9 +4953,12 @@ void TMC4671::handleStateCoggingCalibration() {
 
 					broadcastCalibLog(0, "Tested Kp:%.0f -> P2P:%.2f\xC2\xB0", test_kp, p2p_deg);
 
-					// Step Kp in the current sweep direction
+					// Step Kp in the current sweep direction.
+					// After clearing a clamp, use a smaller step (×1.10 instead
+					// of ×1.25) to avoid stepping right back to the clamping Kp.
 					if (sweep_up) {
-						test_kp *= 1.25f;
+						test_kp *= clamp_just_cleared ? 1.10f : 1.25f;
+						clamp_just_cleared = false;
 					} else {
 						test_kp /= 1.25f;
 						if (test_kp < 50.0f) test_kp = 50.0f;  // floor
@@ -5357,13 +5452,12 @@ void TMC4671::handleStateCoggingCalibration() {
 			any_profile_succeeded = true;
 
 #ifdef COGGING_PHASE_SHIFT_CAL
-			// --- PHASE-SHIFT METHOD: measure phase lag & attenuation per RPM ---
-				// Profile 0 (lowest RPM, e.g. 3 RPM): the "true spatial" base map.
-				// Higher profiles: measure how much the dominant harmonic shifted
-				// and attenuated vs. the base map, and store in the scale/phase-advance
-				// curves for runtime interpolation.
-
-				// Find the dominant harmonic in the stored CW/CCW data for phase tracking.
+				// --- PHASE-SHIFT METHOD: measure phase lag & attenuation ---
+				// The RPM breakpoints (scale_curve_rpm_points) are FIXED and must
+				// match the configurator RPM_POINTS or values won't display.
+				// Each calibration profile is mapped to the NEAREST breakpoint index.
+				//
+				// Find the dominant harmonic in stored CW/CCW data for phase tracking.
 				uint16_t dom_order = 1;
 				float max_cw_mag = 0.0f;
 				for (uint8_t n = 0; n < COGGING_HARMONICS_COUNT; n++) {
@@ -5389,38 +5483,60 @@ void TMC4671::handleStateCoggingCalibration() {
 				// Average magnitude cancels AC-neutral friction bias
 				float avg_mag = (cw_mag_dom + ccw_mag_dom) / 2.0f;
 
+				// Find nearest RPM breakpoint index for this profile's calib_rpm
+				uint8_t bp_idx = 0;
+				float best_dist = 999999.0f;
+				for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
+					float dist = fabsf(scale_curve_rpm_points[i] - calib_rpm);
+					if (dist < best_dist) {
+						best_dist = dist;
+						bp_idx = i;
+					}
+				}
+
 				if (rpm_profile == 0) {
-					// Origin points for the scale and phase-advance curves.
-					// The base table itself is already in cogging_harmonics (active_tbl).
+					// Plateau (index 0) and first calibration point at nearest breakpoint.
+#ifndef COGGING_DISABLE_SCALE_CURVE
 					scale_curve_values[0] = 1.0f;
+					scale_curve_values[bp_idx] = 1.0f;
+#endif
 					phase_advance_curve_values[0] = 0.0f;
+					phase_advance_curve_values[bp_idx] = 0.0f;
 					// Save reference magnitude for computing attenuation in higher profiles.
 					this->last_cogging_scale = avg_mag;
-					broadcastCalibLog(0, "Base map saved at %.1f RPM (phase-shift, dom order %u, ref mag %.0f)",
-						calib_rpm, dom_order, avg_mag);
-				} else if (rpm_profile < SCALE_CURVE_POINTS) {
+					broadcastCalibLog(0, "Base map at %.1f RPM -> bp[%u]=%.0f RPM (dom %u, ref mag %.0f)",
+						calib_rpm, bp_idx, scale_curve_rpm_points[bp_idx], dom_order, avg_mag);
+				} else {
 					// Phase unwrapping for difference calculation
 					float phase_diff = cw_phase_dom - ccw_phase_dom;
 					if (phase_diff > PI) phase_diff -= 2.0f * PI;
 					if (phase_diff < -PI) phase_diff += 2.0f * PI;
 
+#ifndef COGGING_DISABLE_SCALE_CURVE
 					// Scale: attenuation ratio vs. the base profile's dominant magnitude.
 					float scale = (this->last_cogging_scale > 0.0f) ? avg_mag / this->last_cogging_scale : 1.0f;
 					scale = clip<float>(scale, 0.1f, 3.0f);
-					scale_curve_values[rpm_profile] = scale;
+					scale_curve_values[bp_idx] = scale;
+#endif
 
 					// Phase advance: phase_diff is CW-CCW in electrical radians.
-					// Divide by 2 to get the one-way lag.
-					// Divide by dominant_order to get true physical shift in mechanical radians.
 					float lag_mech_rad = fabsf(phase_diff / 2.0f) / (float)dom_order;
 					float lag_mech_deg = lag_mech_rad * (180.0f / PI);
-					phase_advance_curve_values[rpm_profile] = lag_mech_deg;
+					phase_advance_curve_values[bp_idx] = lag_mech_deg;
 
-					broadcastCalibLog(0, "RPM %.1f -> Attenuation: %.2f, Shifted by: %.2f deg (dom order %u)",
-						calib_rpm, scale, lag_mech_deg, dom_order);
+					broadcastCalibLog(0, "RPM %.1f -> bp[%u]=%.0f RPM | Atten: %.2f | Shift: %.2f deg (dom %u)",
+						calib_rpm, bp_idx, scale_curve_rpm_points[bp_idx],
+#ifndef COGGING_DISABLE_SCALE_CURVE
+						scale,
+#else
+						1.0f,
+#endif
+						lag_mech_deg, dom_order);
 				}
 
-				scale_curve_count = rpm_profile + 1;
+				// scale_curve_count = number of distinct breakpoints used
+				if (bp_idx + 1 > scale_curve_count)
+					scale_curve_count = bp_idx + 1;
 #endif // COGGING_PHASE_SHIFT_CAL
 
 #ifndef COGGING_DISABLE_BLEND
@@ -5445,8 +5561,59 @@ void TMC4671::handleStateCoggingCalibration() {
 			// The curve values were populated per-profile above; saveFlash()
 			// (called in the scale calibration block below) will persist them.
 			// Independent of blending — both can coexist.
+#ifndef COGGING_DISABLE_SCALE_CURVE
 			scale_curve_valid = true;
+#endif
 			phase_adv_curve_valid = true;
+			// Fill all 24 RPM breakpoints using linear interpolation between the
+			// sparse calibrated points so the configurator shows a smooth curve.
+			{
+				uint8_t calib_idx[SCALE_CURVE_POINTS];
+				uint8_t calib_n = 0;
+				for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
+#ifdef COGGING_DISABLE_SCALE_CURVE
+					if (phase_advance_curve_values[i] != 0.0f || i == 0)
+#else
+					if (scale_curve_values[i] > 0.0f)
+#endif
+						calib_idx[calib_n++] = i;
+				}
+				if (calib_n >= 2) {
+					uint8_t lo = 0;
+					for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
+						while (lo + 1 < calib_n && calib_idx[lo + 1] <= i) lo++;
+						uint8_t hi = (lo + 1 < calib_n) ? lo + 1 : lo;
+						if (hi == lo && calib_n >= 2) {
+							uint8_t a = calib_idx[calib_n - 2], b = calib_idx[calib_n - 1];
+							float drpm_i = scale_curve_rpm_points[i] - scale_curve_rpm_points[b];
+							float denom = scale_curve_rpm_points[b] - scale_curve_rpm_points[a];
+							if (denom > 0.01f) {
+#ifndef COGGING_DISABLE_SCALE_CURVE
+								float ss = (scale_curve_values[b] - scale_curve_values[a]) / denom;
+								scale_curve_values[i] = scale_curve_values[b] + ss * drpm_i;
+#endif
+								float ps = (phase_advance_curve_values[b] - phase_advance_curve_values[a]) / denom;
+								phase_advance_curve_values[i] = phase_advance_curve_values[b] + ps * drpm_i;
+							}
+						} else {
+							float denom = scale_curve_rpm_points[calib_idx[hi]] - scale_curve_rpm_points[calib_idx[lo]];
+							if (denom > 0.01f) {
+								float t = (scale_curve_rpm_points[i] - scale_curve_rpm_points[calib_idx[lo]]) / denom;
+#ifndef COGGING_DISABLE_SCALE_CURVE
+								scale_curve_values[i] = scale_curve_values[calib_idx[lo]] + t * (scale_curve_values[calib_idx[hi]] - scale_curve_values[calib_idx[lo]]);
+#endif
+								phase_advance_curve_values[i] = phase_advance_curve_values[calib_idx[lo]] + t * (phase_advance_curve_values[calib_idx[hi]] - phase_advance_curve_values[calib_idx[lo]]);
+							}
+						}
+					}
+#ifdef COGGING_DISABLE_SCALE_CURVE
+					for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) scale_curve_values[i] = 1.0f;
+#else
+					scale_curve_values[0] = 1.0f;
+#endif
+					phase_advance_curve_values[0] = 0.0f;
+				}
+			}
 			broadcastCalibLog(0, "Phase-shift curves stored (%u RPM profiles)",
 				scale_curve_count);
 #endif
@@ -5495,17 +5662,18 @@ void TMC4671::handleStateCoggingCalibration() {
 					saveFlash();
 				}
 
-				calib_rpm = 20.0f; // Return speed (RPM). Increase if unwinding is too slow.
-				// Note: PID was tuned for slow acquisition speed. If tracking oscillates
-				// at high return speeds, reduce coggingSpeedP/coggingSpeedI or calib_rpm.
-				
-				// Get current position after fine-tuning
-				actual_pos_f = getAbsolutePosition();
-				
-				broadcastCalibLog(0, "Return to center: Start pos = %.3f turns", actual_pos_f);
-				
-				// USE THE FULL TUNED GAINS
+				calib_rpm = this->cogging_calib_rpm[this->cogging_calib_count - 1];
+				if (calib_rpm < 3.0f) calib_rpm = 20.0f;
+
+				pid_soft.Kp = (float)this->cogging_calib_pidP[this->cogging_calib_count - 1];
+				if (pid_soft.Kp < 50.0f) pid_soft.Kp = this->coggingSpeedP;
+				pid_soft.Ki = 0.0f;
+				pid_soft.Kd = 0.0f;
 				arm_pid_init_f32(&pid_soft, 1);
+
+				// Get current position
+				actual_pos_f = getAbsolutePosition();
+				broadcastCalibLog(0, "Return to center: Start pos = %.3f turns", actual_pos_f);
 
 				float target_pos_f = actual_pos_f;
 				uint32_t period_us = getActualCalibPeriod(TIM_TMC_ARR); 
