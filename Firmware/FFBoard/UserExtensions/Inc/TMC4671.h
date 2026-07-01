@@ -44,6 +44,8 @@
 #define COGGING_CALIB_DFT_HARMONICS     128     // Number of harmonics to analyze during calibration
 //#define COGGING_CALIB_ENABLE_ID_DIAG            // Enable Point 1 diagnostic (Id axis analysis)
 #define COGGING_DFT_USE_IQ_CMD                  //comment out to use adc iq
+#define COGGING_BLEND
+//#define COGGING_PHASE_SHIFT_METHOD
 #endif
 
 extern SPI_HandleTypeDef HSPIDRV;
@@ -880,7 +882,7 @@ private:
 	float coggingShape = 1.0f;  // waveshaping factor (1.0 = linear)
 	// Multi-RPM calibration profile variables (configurable from configurator)
 	static constexpr uint8_t COGGING_MAX_CALIB_PROFILES = 5;
-	uint8_t cogging_calib_count = 1;
+	uint8_t cogging_calib_count = 3;
 	float cogging_calib_rpm[COGGING_MAX_CALIB_PROFILES] = {3.0f, 30.0f, 100.0f, 0.0f, 0.0f};
 	uint16_t cogging_calib_iters[COGGING_MAX_CALIB_PROFILES] = {3, 3, 3, 0, 0};
 	uint32_t cogging_calib_pidP[COGGING_MAX_CALIB_PROFILES] = {0, 0, 0, 0, 0};

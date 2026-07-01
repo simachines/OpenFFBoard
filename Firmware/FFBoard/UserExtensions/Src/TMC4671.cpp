@@ -1759,13 +1759,18 @@ void TMC4671::turn(int16_t power){
 			pos_f = pos_f - floorf(pos_f);
 		}
 
-		// Fourier series compensation with per-RPM harmonic blending.
-		// Three tables were calibrated at different RPMs; blend between them
-		// based on measured_rpm: below blend_rpm1 uses only cogging_harmonics,
-		// between blend_rpm1..blend_rpm2 uses blend of cogging_harmonics + cogging_harmonics_rpm2,
-		// above blend_rpm2 uses blend of cogging_harmonics_rpm2 + cogging_harmonics_rpm3.
+		// Fourier series compensation.
+#ifdef COGGING_DISABLE_BLEND
+		// Blending disabled: use the base cogging table (profile 0) directly.
+		// Phase advance (above) may still be active independently.
+		Harmonic* src_table = this->cogging_harmonics;
+#else
+		// Per-RPM harmonic blending: three tables were calibrated at different
+		// RPMs; blend between them based on measured_rpm.
 		Harmonic blended[COGGING_HARMONICS_COUNT];
 		this->blendHarmonicTables(measured_rpm, blended);
+		Harmonic* src_table = blended;
+#endif
 
 		float compensation = 0;
 		float angle_rad = pos_f * 2.0f * PI;
@@ -1773,12 +1778,12 @@ void TMC4671::turn(int16_t power){
 		// Track the dominant harmonic (largest amplitude) for waveshaping.
 		float dom_amp = 0.0f, dom_order = 1.0f, dom_phase = 0.0f;
 		for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
-			if (blended[i].amplitude > 0.0f) {
-				compensation += blended[i].amplitude * arm_sin_f32(angle_rad * blended[i].order + blended[i].phase);
-				if (blended[i].amplitude > dom_amp) {
-					dom_amp = blended[i].amplitude;
-					dom_order = (float)blended[i].order;
-					dom_phase = blended[i].phase;
+			if (src_table[i].amplitude > 0.0f) {
+				compensation += src_table[i].amplitude * arm_sin_f32(angle_rad * src_table[i].order + src_table[i].phase);
+				if (src_table[i].amplitude > dom_amp) {
+					dom_amp = src_table[i].amplitude;
+					dom_order = (float)src_table[i].order;
+					dom_phase = src_table[i].phase;
 				}
 			}
 		}
@@ -4387,6 +4392,9 @@ void TMC4671::handleStateCoggingCalibration() {
 			float start_pos = getAbsolutePosition();
 			bool friction_broken = false;
 
+			// Hoisted: IMC Kp baseline for per-profile P-gain auto-tuning.
+			float imc_kp = 50.0f;
+
 			if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 			// Step 1.1: Break static friction
 			broadcastCalibLog(0, "Step 1.1: Breaking static friction...");
@@ -4509,7 +4517,7 @@ void TMC4671::handleStateCoggingCalibration() {
 			pid_soft.Ki = clip<float,float>(pid_soft.Ki, 1.0f, 100000.0f);
 			arm_pid_init_f32(&pid_soft, 1);
 
-			float imc_kp = pid_soft.Kp;
+			imc_kp = pid_soft.Kp;
 			float imc_ki = pid_soft.Ki;
 			// Use the initial calib_rpm (3 RPM = 20000 ms) for the IMC validation sweep.
 			uint32_t gain_sweep_timeout_ms = GAIN_SWEEP_WARMUP_MS + ((20000U * 2U) / 3U) + 500U;
@@ -4536,15 +4544,19 @@ void TMC4671::handleStateCoggingCalibration() {
 			// PI sweep disabled — using IMC gains directly to avoid over-driving the motor
 			broadcastCalibLog(0, "Using IMC gains directly (sweep disabled)");
 			float best_sweep_kp = imc_kp;
-			float best_sweep_ki = imc_ki;
 
 			pid_soft.Kp = best_sweep_kp;
-			pid_soft.Ki = best_sweep_ki;
+			pid_soft.Ki = 0.0f;  // I=0 enforced
 			pid_soft.Kd = coggingSpeedD;
+			// Store IMC Kp into profile 0 for auto-tuning baseline.
+			this->cogging_calib_pidP[0] = (uint32_t)best_sweep_kp;
+			this->cogging_calib_pidI[0] = 0;
+			this->cogging_calib_pidD[0] = 0;
 			} else {
 				pid_soft.Kp = coggingSpeedP;
 				pid_soft.Ki = coggingSpeedI;
 				pid_soft.Kd = coggingSpeedD;
+				imc_kp = coggingSpeedP;  // manual P as baseline for auto-tuning
 				broadcastCalibLog(0, "Manual PID Override -> Kp:%.0f Ki:%.0f", pid_soft.Kp, pid_soft.Ki);
 			}
 			arm_pid_init_f32(&pid_soft, 1);
@@ -4610,6 +4622,227 @@ void TMC4671::handleStateCoggingCalibration() {
 			// Re-initialize pid_soft with this profile's gains.
 			// The STEP 2 IMC calc only ran once; each RPM profile
 			// must reset the CMSIS PID state for DFT velocity control.
+			pid_soft.Kp = this->coggingSpeedP;
+			pid_soft.Ki = this->coggingSpeedI;
+			pid_soft.Kd = this->coggingSpeedD;
+			arm_pid_init_f32(&pid_soft, 1);
+
+// --- P-GAIN AUTO-TUNING SEQUENCE ---
+			// Run per RPM profile when cogging_calib_autoPid is enabled.
+			// Uses trapezoidal velocity sweeps (accel -> cruise -> decel) to find
+			// the optimal proportional gain. I and D are held at zero during tuning.
+			// Strategy: sweep UP until clamp or error growth, then sweep DOWN to
+			// bracket the minimum. Clamp backs off until safe Kp found.
+			if (this->cogging_calib_autoPid) {
+				broadcastCalibLog(0, "Auto-tuning Kp for %.1f RPM...", calib_rpm);
+
+				// Start at IMC-derived baseline for profile 0, or below profile 0's stored P.
+				float test_kp = (rpm_profile == 0) ? (imc_kp * 0.75f) : this->cogging_calib_pidP[0] * 0.75f;
+				if (test_kp < 50.0f) test_kp = 50.0f;
+
+				float best_kp = 0.0f;  // invalid until a clamp-free test completes
+				float lowest_p2p = 999.0f;
+				int8_t test_dir = 1;
+				bool tuning_done = false;
+				bool sweep_up = true;
+				bool did_down_sweep = false;
+				uint8_t step_count = 0;
+				static constexpr uint8_t MAX_TUNE_STEPS = 20;
+				static constexpr float KP_TUNE_CEILING = 10000000.0f;
+				const char* stop_reason = "limit";
+
+				// Fixed I=0, D=0 during P-only tuning
+				pid_soft.Ki = 0.0f;
+				pid_soft.Kd = 0.0f;
+
+				uint32_t period_us = getActualCalibPeriod(TIM_TMC_ARR);
+				float dt_sec = (float)period_us / 1000000.0f;
+
+				// --- KINEMATIC TRAJECTORY SETUP ---
+				float j_phys = J / 100.0f;
+				if (j_phys < 0.001f) j_phys = 0.001f;
+				float max_accel_turns_s2 = (max_test_torque * 0.25f) / j_phys / (2.0f * PI);
+				if (max_accel_turns_s2 < 1.0f) max_accel_turns_s2 = 1.0f;
+
+				float target_vel_turns = calib_rpm / 60.0f;
+				float ramp_dist = (target_vel_turns * target_vel_turns) / (2.0f * max_accel_turns_s2);
+				float cruise_dist = 0.25f;
+				float total_dist = (ramp_dist * 2.0f) + cruise_dist;
+
+				float target_pos_f = getFilteredPosition();
+
+				while (test_kp < KP_TUNE_CEILING && step_count < MAX_TUNE_STEPS && !tuning_done && !emergency && hasPower()) {
+					step_count++;
+					pid_soft.Kp = test_kp;
+					arm_pid_init_f32(&pid_soft, 1);
+
+					float max_err_deg = -999.0f;
+					float min_err_deg = 999.0f;
+					bool clamp_hit = false;
+
+					float current_vel_turns = 0.0f;
+					float dist_traveled = 0.0f;
+					uint8_t phase = 0;
+
+					uint32_t next_tick = micros();
+					startCalibTimers(TIM_TMC_ARR);
+
+					while (dist_traveled < total_dist && !emergency && hasPower()) {
+						next_tick += period_us;
+
+						if (phase == 0) {
+							current_vel_turns += max_accel_turns_s2 * dt_sec * test_dir;
+							if (fabsf(current_vel_turns) >= target_vel_turns) {
+								current_vel_turns = target_vel_turns * test_dir;
+								phase = 1;
+							}
+						} else if (phase == 1) {
+							if (total_dist - dist_traveled <= ramp_dist) {
+								phase = 2;
+							}
+						} else if (phase == 2) {
+							current_vel_turns -= max_accel_turns_s2 * dt_sec * test_dir;
+							if ((test_dir > 0 && current_vel_turns <= 0.0f) || (test_dir < 0 && current_vel_turns >= 0.0f)) {
+								current_vel_turns = 0.0f;
+								break;
+							}
+						}
+
+						float step = current_vel_turns * dt_sec;
+						target_pos_f += step;
+						if (target_pos_f >= 1.0f) target_pos_f -= 1.0f;
+						if (target_pos_f < 0.0f) target_pos_f += 1.0f;
+						dist_traveled += fabsf(step);
+
+						float actual_pos_f = getFilteredPosition();
+						float err = getWrappedError(target_pos_f, actual_pos_f);
+						float err_deg = err * 360.0f;
+
+						float iq_pid = arm_pid_f32(&pid_soft, err);
+						float iq_ff = (current_vel_turns > 0.0f) ? dynamic_friction * 0.5f : ((current_vel_turns < 0.0f) ? -dynamic_friction * 0.5f : 0.0f);
+						float iq_cmd = clip<float,float>(iq_pid + iq_ff, -max_test_torque, max_test_torque);
+						applySafeTorque(iq_cmd);
+
+						if (phase == 1) {
+							if (err_deg > max_err_deg) max_err_deg = err_deg;
+							if (err_deg < min_err_deg) min_err_deg = err_deg;
+							if (fabsf(iq_cmd) >= max_test_torque * 0.99f) {
+								clamp_hit = true;
+								break;
+							}
+						}
+
+						refreshWatchdog();
+#ifdef TIM_CALIBRATION
+						if (this->calibTimer != nullptr) this->WaitForNotification();
+						else
+#endif
+						while ((micros() - next_tick) & 0x80000000) {}
+					}
+
+					stopCalibTimers();
+					applySafeTorque(0);
+					Delay(25);
+
+					float p2p_deg = max_err_deg - min_err_deg;
+					bool valid_p2p = (p2p_deg > 0.0f && p2p_deg < 720.0f);
+
+					// --- CLAMP HANDLING ---
+					if (clamp_hit) {
+						if (best_kp > 0.0f) {
+							float backoff_kp = test_kp / 1.25f;
+							if (backoff_kp <= best_kp * 1.01f) {
+								stop_reason = "clamp";
+								broadcastCalibLog(0, "Clamp at Kp:%.0f. Using best safe Kp:%.0f.", test_kp, best_kp);
+								tuning_done = true;
+								break;
+							}
+							broadcastCalibLog(0, "Clamp at Kp:%.0f -- backing off to %.0f.", test_kp, backoff_kp);
+							test_kp = backoff_kp;
+							sweep_up = false;
+							test_dir = -test_dir;
+							continue;
+						}
+						float backoff_kp = test_kp / 1.25f;
+						if (backoff_kp < 50.0f) {
+							stop_reason = "clamp";
+							broadcastCalibLog(0, "Clamp at Kp:%.0f -- hit floor. Cannot find safe Kp.", test_kp);
+							tuning_done = true;
+							break;
+						}
+						broadcastCalibLog(0, "Clamp at Kp:%.0f (no safe Kp). Backing off to %.0f.", test_kp, backoff_kp);
+						test_kp = backoff_kp;
+						sweep_up = false;
+						test_dir = -test_dir;
+						continue;
+					}
+
+					if (!sweep_up) {
+						sweep_up = true;
+						broadcastCalibLog(0, "Clamp cleared at Kp:%.0f. Resuming UP sweep.", test_kp);
+					}
+
+					// --- P2P EVALUATION ---
+					if (valid_p2p) {
+						if (p2p_deg < lowest_p2p) {
+							lowest_p2p = p2p_deg;
+							best_kp = test_kp;
+						} else if (p2p_deg > lowest_p2p * 1.5f && lowest_p2p < 1.0f) {
+							if (!did_down_sweep) {
+								broadcastCalibLog(0, "P2P growing (%.2f\xC2\xB0 > %.2f\xC2\xB0). Sweeping DOWN.", p2p_deg, lowest_p2p);
+								test_kp = best_kp / 1.25f;
+								did_down_sweep = true;
+								sweep_up = false;
+								test_dir = -test_dir;
+								continue;
+							} else {
+								stop_reason = "growth";
+								broadcastCalibLog(0, "P2P growing (%.2f\xC2\xB0 > %.2f\xC2\xB0). Minimum bracketed.", p2p_deg, lowest_p2p);
+								tuning_done = true;
+								break;
+							}
+						}
+					}
+
+					broadcastCalibLog(0, "Tested Kp:%.0f -> P2P:%.2f\xC2\xB0", test_kp, p2p_deg);
+
+					if (sweep_up) {
+						test_kp *= 1.25f;
+					} else {
+						test_kp /= 1.25f;
+						if (test_kp < 50.0f) test_kp = 50.0f;
+					}
+					test_dir = -test_dir;
+				}
+
+				// Report result
+				if (stop_reason[0] == 'c') {
+					if (lowest_p2p >= 999.0f) {
+						float fallback_kp = (rpm_profile == 0) ? (imc_kp * 0.75f) : this->cogging_calib_pidP[0] * 0.75f;
+						if (fallback_kp < 50.0f) fallback_kp = 50.0f;
+						fallback_kp *= 0.5f;
+						best_kp = fallback_kp;
+						broadcastCalibLog(0, "Selected Kp:%.0f (FALLBACK -- all Kp clamped)", best_kp);
+					} else {
+						broadcastCalibLog(0, "Selected Kp:%.0f (Clamp at %.0f, Lowest P2P:%.2f\xC2\xB0)", best_kp, test_kp, lowest_p2p);
+					}
+				} else if (stop_reason[0] == 'g') {
+					broadcastCalibLog(0, "Selected Kp:%.0f (Optimal, Lowest P2P:%.2f\xC2\xB0)", best_kp, lowest_p2p);
+				} else if (step_count >= MAX_TUNE_STEPS) {
+					broadcastCalibLog(0, "Selected Kp:%.0f (Max steps %u, Lowest P2P:%.2f\xC2\xB0)", best_kp, MAX_TUNE_STEPS, lowest_p2p);
+				} else {
+					broadcastCalibLog(0, "Selected Kp:%.0f (Ceiling %.0f, Lowest P2P:%.2f\xC2\xB0)", best_kp, KP_TUNE_CEILING, lowest_p2p);
+				}
+				// Write results back
+				this->coggingSpeedP = best_kp;
+				this->coggingSpeedI = 0.0f;
+				this->coggingSpeedD = 0.0f;
+				this->cogging_calib_pidP[rpm_profile] = (uint32_t)best_kp;
+				this->cogging_calib_pidI[rpm_profile] = 0;
+				this->cogging_calib_pidD[rpm_profile] = 0;
+			}
+
+			// Re-initialize pid_soft with the (possibly auto-tuned) gains for the DFT sweep
 			pid_soft.Kp = this->coggingSpeedP;
 			pid_soft.Ki = this->coggingSpeedI;
 			pid_soft.Kd = this->coggingSpeedD;
@@ -5016,11 +5249,83 @@ void TMC4671::handleStateCoggingCalibration() {
 			// to copy here. Mark validity ONLY if this profile actually collected
 			// samples (an aborted profile must not leave a valid flag on an empty
 			// table, or blendHarmonicTables() would output 0 at that speed band).
-			if (total_samples > 0) {
-				any_profile_succeeded = true;
-				if (rpm_profile == 1) this->rpm2_table_valid = true;
-				else if (rpm_profile >= 2) this->rpm3_table_valid = true;
-			}
+		if (total_samples > 0) {
+			any_profile_succeeded = true;
+
+#ifdef COGGING_PHASE_SHIFT_METHOD
+			// --- PHASE-SHIFT METHOD: measure phase lag & attenuation per RPM ---
+				// Profile 0 (lowest RPM, e.g. 3 RPM): the "true spatial" base map.
+				// Higher profiles: measure how much the dominant harmonic shifted
+				// and attenuated vs. the base map, and store in the scale/phase-advance
+				// curves for runtime interpolation.
+
+				// Find the dominant harmonic in the stored CW/CCW data for phase tracking.
+				uint16_t dom_order = 1;
+				float max_cw_mag = 0.0f;
+				for (uint8_t n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+					if (cw_store[n].amplitude > max_cw_mag) {
+						max_cw_mag = cw_store[n].amplitude;
+						dom_order = cw_store[n].order;
+					}
+				}
+
+				float cw_phase_dom = 0.0f, ccw_phase_dom = 0.0f;
+				float cw_mag_dom = 0.0f, ccw_mag_dom = 0.0f;
+				for (uint8_t n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+					if (cw_store[n].order == dom_order) {
+						cw_phase_dom = cw_store[n].phase;
+						cw_mag_dom = cw_store[n].amplitude;
+					}
+					if (ccw_store[n].order == dom_order) {
+						ccw_phase_dom = ccw_store[n].phase;
+						ccw_mag_dom = ccw_store[n].amplitude;
+					}
+				}
+
+				// Average magnitude cancels AC-neutral friction bias
+				float avg_mag = (cw_mag_dom + ccw_mag_dom) / 2.0f;
+
+				if (rpm_profile == 0) {
+					// Origin points for the scale and phase-advance curves.
+					// The base table itself is already in cogging_harmonics (active_tbl).
+					scale_curve_values[0] = 1.0f;
+					phase_advance_curve_values[0] = 0.0f;
+					// Save reference magnitude for computing attenuation in higher profiles.
+					this->last_cogging_scale = avg_mag;
+					broadcastCalibLog(0, "Base map saved at %.1f RPM (phase-shift, dom order %u, ref mag %.0f)",
+						calib_rpm, dom_order, avg_mag);
+				} else if (rpm_profile < SCALE_CURVE_POINTS) {
+					// Phase unwrapping for difference calculation
+					float phase_diff = cw_phase_dom - ccw_phase_dom;
+					if (phase_diff > PI) phase_diff -= 2.0f * PI;
+					if (phase_diff < -PI) phase_diff += 2.0f * PI;
+
+					// Scale: attenuation ratio vs. the base profile's dominant magnitude.
+					float scale = (this->last_cogging_scale > 0.0f) ? avg_mag / this->last_cogging_scale : 1.0f;
+					scale = clip<float>(scale, 0.1f, 3.0f);
+					scale_curve_values[rpm_profile] = scale;
+
+					// Phase advance: phase_diff is CW-CCW in electrical radians.
+					// Divide by 2 to get the one-way lag.
+					// Divide by dominant_order to get true physical shift in mechanical radians.
+					float lag_mech_rad = fabsf(phase_diff / 2.0f) / (float)dom_order;
+					float lag_mech_deg = lag_mech_rad * (180.0f / PI);
+					phase_advance_curve_values[rpm_profile] = lag_mech_deg;
+
+					broadcastCalibLog(0, "RPM %.1f -> Attenuation: %.2f, Shifted by: %.2f deg (dom order %u)",
+						calib_rpm, scale, lag_mech_deg, dom_order);
+				}
+
+				scale_curve_count = rpm_profile + 1;
+#endif // COGGING_PHASE_SHIFT_METHOD
+
+#ifdef COGGING_BLEND
+			// Mark per-RPM blend tables as valid for runtime blending.
+			// Independent of phase-shift: both can coexist.
+			if (rpm_profile == 1) this->rpm2_table_valid = true;
+			else if (rpm_profile >= 2) this->rpm3_table_valid = true;
+#endif
+		}
 
 			} // end DFT iteration loop
 			} // end multi-RPM profile loop
@@ -5031,10 +5336,21 @@ void TMC4671::handleStateCoggingCalibration() {
 			refreshWatchdog();
 			saveCoggingTable();
 
+#ifdef COGGING_PHASE_SHIFT_METHOD
+			// Phase-shift method: mark scale and phase-advance curves as valid.
+			// The curve values were populated per-profile above; saveFlash()
+			// (called in the scale calibration block below) will persist them.
+			// Independent of blending — both can coexist.
+			scale_curve_valid = true;
+			phase_adv_curve_valid = true;
+			broadcastCalibLog(0, "Phase-shift curves stored (%u RPM profiles)",
+				scale_curve_count);
+#endif
+
+#ifdef COGGING_BLEND
 			// Persist the RPM#2/RPM#3 maps and stamp the blend anchors from the
 			// calibrated profile speeds so the runtime blend matches this run.
-			// blend_rpm1 is the lowest profile speed; the crossover anchors default
-			// to the rpm2/rpm3 calibration speeds (user-tunable live via commands).
+			// Independent of phase-shift — both can coexist.
 			if (this->cogging_calib_count > 0 && this->cogging_calib_rpm[0] > 0.0f)
 				this->blend_rpm1 = this->cogging_calib_rpm[0];
 			if (this->rpm2_table_valid) {
@@ -5051,6 +5367,7 @@ void TMC4671::handleStateCoggingCalibration() {
 				this->blend_rpm1, this->blend_rpm2, this->blend_rpm3,
 				this->rpm2_table_valid ? "yes" : "no",
 				this->rpm3_table_valid ? "yes" : "no");
+#endif
 
 				// --- 3.5 SCALE CALIBRATION (Position Error Grid Search) ---
 				// Get the raw absolute position (no modulo 1.0 wrapping)
