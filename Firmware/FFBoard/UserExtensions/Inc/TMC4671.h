@@ -45,7 +45,7 @@
 //#define COGGING_CALIB_ENABLE_ID_DIAG            // Enable Point 1 diagnostic (Id axis analysis)
 #define COGGING_DFT_USE_IQ_CMD                  //comment out to use adc iq
 #define COGGING_BLEND
-//#define COGGING_PHASE_SHIFT_METHOD
+#define COGGING_PHASE_SHIFT_CAL
 #endif
 
 extern SPI_HandleTypeDef HSPIDRV;
@@ -488,7 +488,8 @@ class TMC4671 :
 coggingCwCcw, coggingSave, coggingShape, coggingSpeedD, scaleCurve, phaseAdvCurve, coggingH3,
 coggingHarmonicsRpm2, coggingBlendRpm2, coggingRpm2Valid,
 coggingHarmonicsRpm3, coggingBlendRpm3, coggingRpm3Valid,
-coggingCalibCount, coggingCalibRPM, coggingCalibIters, coggingCalibPidP, coggingCalibPidI, coggingCalibPidD, coggingCalibAutoPid
+coggingCalibCount, coggingCalibRPM, coggingCalibIters, coggingCalibPidP, coggingCalibPidI, coggingCalibPidD, coggingCalibAutoPid,
+coggingCalibInertiaCorr
 #endif
 	};
 
@@ -829,10 +830,10 @@ private:
 	void saveCoggingTableRpm3();
 	void clearCoggingTable();
 
-	// Multi-RPM gain scheduling state for RPM#1/#2/#3 blending.
-	float blend_rpm1 = 3.0f;
-	float blend_rpm2 = 30.0f;
-	float blend_rpm3 = 100.0f;
+	// Persisted RPM at which each table was actually calibrated (flash, 0 = never calibrated).
+	float blend_rpm1;
+	float blend_rpm2;
+	float blend_rpm3;
 	bool rpm2_table_valid = false;
 	bool rpm3_table_valid = false;
 
@@ -883,12 +884,13 @@ private:
 	// Multi-RPM calibration profile variables (configurable from configurator)
 	static constexpr uint8_t COGGING_MAX_CALIB_PROFILES = 5;
 	uint8_t cogging_calib_count = 3;
-	float cogging_calib_rpm[COGGING_MAX_CALIB_PROFILES] = {3.0f, 30.0f, 100.0f, 0.0f, 0.0f};
-	uint16_t cogging_calib_iters[COGGING_MAX_CALIB_PROFILES] = {3, 3, 3, 0, 0};
+	float cogging_calib_rpm[COGGING_MAX_CALIB_PROFILES] = {3.0f, 10.0f, 20.0f, 0.0f, 0.0f};
+	uint16_t cogging_calib_iters[COGGING_MAX_CALIB_PROFILES] = {1, 1, 1, 0, 0};
 	uint32_t cogging_calib_pidP[COGGING_MAX_CALIB_PROFILES] = {0, 0, 0, 0, 0};
 	uint32_t cogging_calib_pidI[COGGING_MAX_CALIB_PROFILES] = {0, 0, 0, 0, 0};
 	uint32_t cogging_calib_pidD[COGGING_MAX_CALIB_PROFILES] = {0, 0, 0, 0, 0};
 	bool cogging_calib_autoPid = true;
+	bool cogging_calib_inertiaCorr;  // Inertia acceleration correction during DFT
 	void handleStateCoggingCalibration();
 	void blendHarmonicTables(float rpm, Harmonic* out_table);
 #endif

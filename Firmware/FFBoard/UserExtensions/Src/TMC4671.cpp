@@ -175,7 +175,7 @@ void TMC4671::saveFlash(){
 	Flash_Write(flashAddrs.h3PhaseTrim, (uint16_t)(int16_t)clip<float>(this->h3_phase_trim * 1000.0f, -32767, 32767));
 	Flash_Write(flashAddrs.h3Mult, this->h3_mult);
 
-	// Multi-RPM blend anchors (RPM*10) and per-map validity flags.
+	// Multi-RPM blend anchors (RPM*10) and validity flags.
 	Flash_Write(flashAddrs.coggingBlendrpm2, (uint16_t)clip<float>(this->blend_rpm2 * 10.0f, 0.0f, 65535.0f));
 	Flash_Write(flashAddrs.coggingrpm2Valid, this->rpm2_table_valid ? 1 : 0);
 	Flash_Write(flashAddrs.coggingBlendrpm3, (uint16_t)clip<float>(this->blend_rpm3 * 10.0f, 0.0f, 65535.0f));
@@ -298,14 +298,19 @@ void TMC4671::restoreFlash(){
 	uint16_t blend2_flash = 0;
 	if (Flash_Read(flashAddrs.coggingBlendrpm2, &blend2_flash)) {
 		this->blend_rpm2 = (float)(uint16_t)blend2_flash / 10.0f;
-		if (this->blend_rpm2 < 1.0f) this->blend_rpm2 = 30.0f;
-	} else { this->blend_rpm2 = 30.0f; }
+		if (this->blend_rpm2 < 1.0f) this->blend_rpm2 = 10.0f;
+	} else { this->blend_rpm2 = 10.0f; }
 	uint16_t blend3_flash = 0;
 	if (Flash_Read(flashAddrs.coggingBlendrpm3, &blend3_flash)) {
 		this->blend_rpm3 = (float)(uint16_t)blend3_flash / 10.0f;
-		if (this->blend_rpm3 < 1.0f) this->blend_rpm3 = 100.0f;
-	} else { this->blend_rpm3 = 100.0f; }
-
+		if (this->blend_rpm3 < 1.0f) this->blend_rpm3 = 20.0f;
+	} else { this->blend_rpm3 = 20.0f; }
+	// Populate calib RPM targets from persisted blend values so the configurator
+	// remembers the last calibrated speeds on reboot.
+	if (this->rpm2_table_valid && this->blend_rpm2 > 0.0f)
+		this->cogging_calib_rpm[1] = this->blend_rpm2;
+	if (this->rpm3_table_valid && this->blend_rpm3 > 0.0f)
+		this->cogging_calib_rpm[2] = this->blend_rpm3;
 	// Largest single harmonic amplitude as tanh reference.
 	// Using sum-of-all or RMS overestimates, keeping tanh in linear zone.
 	// Restore speed-dependent scale curve (24 points, *1000)
@@ -1759,6 +1764,11 @@ void TMC4671::turn(int16_t power){
 			pos_f = pos_f - floorf(pos_f);
 		}
 
+		// Fourier series compensation with per-RPM harmonic blending.
+		// Three tables were calibrated at different RPMs; blend between them
+		// based on measured_rpm: below blend_rpm1 uses only cogging_harmonics,
+		// between blend_rpm1..blend_rpm2 uses blend of cogging_harmonics + cogging_harmonics_rpm2,
+		// above blend_rpm2 uses blend of cogging_harmonics_rpm2 + cogging_harmonics_rpm3.
 		// Fourier series compensation.
 #ifdef COGGING_DISABLE_BLEND
 		// Blending disabled: use the base cogging table (profile 0) directly.
@@ -1769,7 +1779,6 @@ void TMC4671::turn(int16_t power){
 		// RPMs; blend between them based on measured_rpm.
 		Harmonic blended[COGGING_HARMONICS_COUNT];
 		this->blendHarmonicTables(measured_rpm, blended);
-		Harmonic* src_table = blended;
 #endif
 
 		float compensation = 0;
@@ -1778,12 +1787,12 @@ void TMC4671::turn(int16_t power){
 		// Track the dominant harmonic (largest amplitude) for waveshaping.
 		float dom_amp = 0.0f, dom_order = 1.0f, dom_phase = 0.0f;
 		for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
-			if (src_table[i].amplitude > 0.0f) {
-				compensation += src_table[i].amplitude * arm_sin_f32(angle_rad * src_table[i].order + src_table[i].phase);
-				if (src_table[i].amplitude > dom_amp) {
-					dom_amp = src_table[i].amplitude;
-					dom_order = (float)src_table[i].order;
-					dom_phase = src_table[i].phase;
+			if (blended[i].amplitude > 0.0f) {
+				compensation += blended[i].amplitude * arm_sin_f32(angle_rad * blended[i].order + blended[i].phase);
+				if (blended[i].amplitude > dom_amp) {
+					dom_amp = blended[i].amplitude;
+					dom_order = (float)blended[i].order;
+					dom_phase = blended[i].phase;
 				}
 			}
 		}
@@ -2897,8 +2906,8 @@ void TMC4671::registerCommands(){
 	registerCommand("coggingScale", TMC4671_commands::coggingScale, "Cogging compensation scale (0-100)",CMDFLAG_GET | CMDFLAG_SET);
 	registerCommand("coggingSpeedP", TMC4671_commands::coggingSpeedP, "Manual speed loop P gain for cogging",CMDFLAG_GET | CMDFLAG_SET);
 	registerCommand("coggingSpeedI", TMC4671_commands::coggingSpeedI, "Manual speed loop I gain for cogging",CMDFLAG_GET | CMDFLAG_SET);
-	registerCommand("coggingHarmonics", TMC4671_commands::coggingHarmonics, "Get full harmonic table",CMDFLAG_GET);
-	registerCommand("coggingCwCcw", TMC4671_commands::coggingCwCcw, "Get CW and CCW raw harmonics",CMDFLAG_GET);
+	registerCommand("coggingHarmonics", TMC4671_commands::coggingHarmonics, "Get full harmonic table (adr 0=base, 1=RPM2, 2=RPM3)",CMDFLAG_GET | CMDFLAG_GETADR);
+	registerCommand("coggingCwCcw", TMC4671_commands::coggingCwCcw, "Get CW and CCW raw harmonics", CMDFLAG_GET);
 	registerCommand("coggingSave", TMC4671_commands::coggingSave, "Save cogging table to flash",CMDFLAG_GET);
 	registerCommand("coggingShape", TMC4671_commands::coggingShape, "Waveshaping factor (*100)",CMDFLAG_GET | CMDFLAG_SET);
 	registerCommand("coggingSpeedD", TMC4671_commands::coggingSpeedD, "Speed D gain for cogging",CMDFLAG_GET | CMDFLAG_SET);
@@ -2912,6 +2921,7 @@ void TMC4671::registerCommands(){
 	registerCommand("coggingCalibPidI", TMC4671_commands::coggingCalibPidI, "Get/Set manual I gain per calibration profile (adr=idx, val=PID*1000)",CMDFLAG_GETADR | CMDFLAG_SETADR);
 	registerCommand("coggingCalibPidD", TMC4671_commands::coggingCalibPidD, "Get/Set manual D gain per calibration profile (adr=idx, val=PID*1000)",CMDFLAG_GETADR | CMDFLAG_SETADR);
 	registerCommand("coggingCalibAutoPid", TMC4671_commands::coggingCalibAutoPid, "Get/Set auto PID tune flag (1=auto, 0=manual)",CMDFLAG_GET | CMDFLAG_SET);
+	registerCommand("coggingCalibInertiaCorr", TMC4671_commands::coggingCalibInertiaCorr, "Get/Set inertia acceleration correction during DFT (1=on,0=off)",CMDFLAG_GET | CMDFLAG_SET);
 #endif
 }
 
@@ -3433,7 +3443,7 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			if (first) {
 				s = "0:0:0"; // Empty table
 			}
-			CommandHandler::broadcastCommandReply(CommandReply(s,0), (uint32_t)TMC4671_commands::coggingHarmonics, CMDtype::get);
+			CommandHandler::broadcastCommandReply(CommandReply(s,cmd.adr), (uint32_t)TMC4671_commands::coggingHarmonics, CMDtype::get);
 			return CommandStatus::NO_REPLY;
 		}
 		break;
@@ -3557,6 +3567,14 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			replies.emplace_back(this->cogging_calib_autoPid ? 1 : 0);
 		} else if(cmd.type == CMDtype::set){
 			this->cogging_calib_autoPid = (cmd.val != 0);
+		}
+		break;
+
+	case TMC4671_commands::coggingCalibInertiaCorr:
+		if(cmd.type == CMDtype::get){
+			replies.emplace_back(this->cogging_calib_inertiaCorr ? 1 : 0);
+		} else if(cmd.type == CMDtype::set){
+			this->cogging_calib_inertiaCorr = (cmd.val != 0);
 		}
 		break;
 #endif
@@ -4393,6 +4411,7 @@ void TMC4671::handleStateCoggingCalibration() {
 			bool friction_broken = false;
 
 			// Hoisted: IMC Kp baseline for per-profile P-gain auto-tuning.
+			// Declared here so it's visible in the RPM profile loop below.
 			float imc_kp = 50.0f;
 
 			if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
@@ -4544,11 +4563,13 @@ void TMC4671::handleStateCoggingCalibration() {
 			// PI sweep disabled — using IMC gains directly to avoid over-driving the motor
 			broadcastCalibLog(0, "Using IMC gains directly (sweep disabled)");
 			float best_sweep_kp = imc_kp;
+			float best_sweep_ki = 0.0f;  // I=0 enforced — auto-tuning is P-only
 
 			pid_soft.Kp = best_sweep_kp;
-			pid_soft.Ki = 0.0f;  // I=0 enforced
+			pid_soft.Ki = best_sweep_ki;
 			pid_soft.Kd = coggingSpeedD;
-			// Store IMC Kp into profile 0 for auto-tuning baseline.
+			// Store IMC Kp into profile 0 so the auto-tuning can use it as baseline.
+			// I is forced to zero — the auto-tuning tune is P-only.
 			this->cogging_calib_pidP[0] = (uint32_t)best_sweep_kp;
 			this->cogging_calib_pidI[0] = 0;
 			this->cogging_calib_pidD[0] = 0;
@@ -4629,23 +4650,23 @@ void TMC4671::handleStateCoggingCalibration() {
 
 // --- P-GAIN AUTO-TUNING SEQUENCE ---
 			// Run per RPM profile when cogging_calib_autoPid is enabled.
-			// Uses trapezoidal velocity sweeps (accel -> cruise -> decel) to find
-			// the optimal proportional gain. I and D are held at zero during tuning.
-			// Strategy: sweep UP until clamp or error growth, then sweep DOWN to
-			// bracket the minimum. Clamp backs off until safe Kp found.
+			// Uses trapezoidal velocity sweeps (accel → cruise → decel) to find
+			// the optimal proportional gain that minimizes position tracking error
+			// without inducing oscillation. I and D are held at zero during tuning.
 			if (this->cogging_calib_autoPid) {
 				broadcastCalibLog(0, "Auto-tuning Kp for %.1f RPM...", calib_rpm);
 
 				// Start at IMC-derived baseline for profile 0, or below profile 0's stored P.
+				// IMC runs once in STEP 2 and its Kp is the seed for the slowest RPM.
 				float test_kp = (rpm_profile == 0) ? (imc_kp * 0.75f) : this->cogging_calib_pidP[0] * 0.75f;
 				if (test_kp < 50.0f) test_kp = 50.0f;
 
 				float best_kp = 0.0f;  // invalid until a clamp-free test completes
 				float lowest_p2p = 999.0f;
-				int8_t test_dir = 1;
+				int8_t test_dir = 1; // Alternates 1 and -1 to go back and forth
 				bool tuning_done = false;
-				bool sweep_up = true;
-				bool did_down_sweep = false;
+				bool sweep_up = true;       // current sweep direction: true=UP (×1.25), false=DOWN (÷1.25)
+				bool did_down_sweep = false; // true after first error-growth reversal
 				uint8_t step_count = 0;
 				static constexpr uint8_t MAX_TUNE_STEPS = 20;
 				static constexpr float KP_TUNE_CEILING = 10000000.0f;
@@ -4659,14 +4680,19 @@ void TMC4671::handleStateCoggingCalibration() {
 				float dt_sec = (float)period_us / 1000000.0f;
 
 				// --- KINEMATIC TRAJECTORY SETUP ---
+				// Calculate a safe maximum acceleration using the measured inertia (J)
+				// J was scaled by 100. Restore physical J: J_phys = J / 100
+				// Torque = J * alpha -> alpha_rad = Torque / J_phys
+				// We use 25% of max torque for acceleration, leaving 75% headroom for the PID to fight cogging.
 				float j_phys = J / 100.0f;
-				if (j_phys < 0.001f) j_phys = 0.001f;
+				if (j_phys < 0.001f) j_phys = 0.001f; // Failsafe
 				float max_accel_turns_s2 = (max_test_torque * 0.25f) / j_phys / (2.0f * PI);
 				if (max_accel_turns_s2 < 1.0f) max_accel_turns_s2 = 1.0f;
 
 				float target_vel_turns = calib_rpm / 60.0f;
+				// Distance needed to ramp up: d = v^2 / (2*a)
 				float ramp_dist = (target_vel_turns * target_vel_turns) / (2.0f * max_accel_turns_s2);
-				float cruise_dist = 0.25f;
+				float cruise_dist = 0.25f; // Quarter turn measurement zone
 				float total_dist = (ramp_dist * 2.0f) + cruise_dist;
 
 				float target_pos_f = getFilteredPosition();
@@ -4682,7 +4708,7 @@ void TMC4671::handleStateCoggingCalibration() {
 
 					float current_vel_turns = 0.0f;
 					float dist_traveled = 0.0f;
-					uint8_t phase = 0;
+					uint8_t phase = 0; // 0 = Accel, 1 = Cruise, 2 = Decel
 
 					uint32_t next_tick = micros();
 					startCalibTimers(TIM_TMC_ARR);
@@ -4690,18 +4716,20 @@ void TMC4671::handleStateCoggingCalibration() {
 					while (dist_traveled < total_dist && !emergency && hasPower()) {
 						next_tick += period_us;
 
+						// Trapezoidal Velocity Profile Generator
 						if (phase == 0) {
 							current_vel_turns += max_accel_turns_s2 * dt_sec * test_dir;
 							if (fabsf(current_vel_turns) >= target_vel_turns) {
 								current_vel_turns = target_vel_turns * test_dir;
-								phase = 1;
+								phase = 1; // Reached target velocity, start cruising
 							}
 						} else if (phase == 1) {
 							if (total_dist - dist_traveled <= ramp_dist) {
-								phase = 2;
+								phase = 2; // Time to decelerate
 							}
 						} else if (phase == 2) {
 							current_vel_turns -= max_accel_turns_s2 * dt_sec * test_dir;
+							// Stop exactly at 0
 							if ((test_dir > 0 && current_vel_turns <= 0.0f) || (test_dir < 0 && current_vel_turns >= 0.0f)) {
 								current_vel_turns = 0.0f;
 								break;
@@ -4712,6 +4740,7 @@ void TMC4671::handleStateCoggingCalibration() {
 						target_pos_f += step;
 						if (target_pos_f >= 1.0f) target_pos_f -= 1.0f;
 						if (target_pos_f < 0.0f) target_pos_f += 1.0f;
+
 						dist_traveled += fabsf(step);
 
 						float actual_pos_f = getFilteredPosition();
@@ -4719,13 +4748,18 @@ void TMC4671::handleStateCoggingCalibration() {
 						float err_deg = err * 360.0f;
 
 						float iq_pid = arm_pid_f32(&pid_soft, err);
+						// Add slight friction feedforward to help tracking without altering tuning dynamics
 						float iq_ff = (current_vel_turns > 0.0f) ? dynamic_friction * 0.5f : ((current_vel_turns < 0.0f) ? -dynamic_friction * 0.5f : 0.0f);
+
 						float iq_cmd = clip<float,float>(iq_pid + iq_ff, -max_test_torque, max_test_torque);
 						applySafeTorque(iq_cmd);
 
+						// ONLY measure error during the Cruise phase (ignores accel/decel transients)
 						if (phase == 1) {
 							if (err_deg > max_err_deg) max_err_deg = err_deg;
 							if (err_deg < min_err_deg) min_err_deg = err_deg;
+
+							// A SINGLE clamp hit signifies fatal oscillation
 							if (fabsf(iq_cmd) >= max_test_torque * 0.99f) {
 								clamp_hit = true;
 								break;
@@ -4742,14 +4776,21 @@ void TMC4671::handleStateCoggingCalibration() {
 
 					stopCalibTimers();
 					applySafeTorque(0);
-					Delay(25);
+					Delay(25); // Brief rest to let rotor settle before reversing
 
 					float p2p_deg = max_err_deg - min_err_deg;
 					bool valid_p2p = (p2p_deg > 0.0f && p2p_deg < 720.0f);
 
 					// --- CLAMP HANDLING ---
+					// Clamp means oscillation. Strategy:
+					//  - If we have a known-safe best_kp: back off one step. If the
+					//    backoff Kp lands at/below best_kp, skip re-test and accept it.
+					//  - If no safe Kp yet (first-test or all backoffs clamped): keep
+					//    dividing until we escape the clamp zone or hit the floor (50).
+					//  - Never give up with a clamping Kp as "best".
 					if (clamp_hit) {
 						if (best_kp > 0.0f) {
+							// We have a previously-tested safe Kp.
 							float backoff_kp = test_kp / 1.25f;
 							if (backoff_kp <= best_kp * 1.01f) {
 								stop_reason = "clamp";
@@ -4757,16 +4798,17 @@ void TMC4671::handleStateCoggingCalibration() {
 								tuning_done = true;
 								break;
 							}
-							broadcastCalibLog(0, "Clamp at Kp:%.0f -- backing off to %.0f.", test_kp, backoff_kp);
+							broadcastCalibLog(0, "Clamp at Kp:%.0f — backing off to %.0f.", test_kp, backoff_kp);
 							test_kp = backoff_kp;
 							sweep_up = false;
 							test_dir = -test_dir;
 							continue;
 						}
+						// No safe Kp yet — keep dividing until we escape or hit floor.
 						float backoff_kp = test_kp / 1.25f;
 						if (backoff_kp < 50.0f) {
 							stop_reason = "clamp";
-							broadcastCalibLog(0, "Clamp at Kp:%.0f -- hit floor. Cannot find safe Kp.", test_kp);
+							broadcastCalibLog(0, "Clamp at Kp:%.0f — hit floor. Cannot find safe Kp.", test_kp);
 							tuning_done = true;
 							break;
 						}
@@ -4777,6 +4819,9 @@ void TMC4671::handleStateCoggingCalibration() {
 						continue;
 					}
 
+					// --- CLAMP BACKOFF RECOVERY ---
+					// We were backing off from a clamp. If we're now clamp-free,
+					// resume the normal UP sweep from this safe Kp.
 					if (!sweep_up) {
 						sweep_up = true;
 						broadcastCalibLog(0, "Clamp cleared at Kp:%.0f. Resuming UP sweep.", test_kp);
@@ -4784,11 +4829,17 @@ void TMC4671::handleStateCoggingCalibration() {
 
 					// --- P2P EVALUATION ---
 					if (valid_p2p) {
+						// Track the best (lowest P2P) Kp seen so far
 						if (p2p_deg < lowest_p2p) {
 							lowest_p2p = p2p_deg;
 							best_kp = test_kp;
-						} else if (p2p_deg > lowest_p2p * 1.5f && lowest_p2p < 1.0f) {
+						}
+						// Error growing by >50% from the global minimum: we've passed
+						// the optimum in the current sweep direction.
+						else if (p2p_deg > lowest_p2p * 1.5f && lowest_p2p < 1.0f) {
 							if (!did_down_sweep) {
+								// First overshoot — reverse direction and sweep DOWN
+								// from the best Kp to bracket the minimum from below.
 								broadcastCalibLog(0, "P2P growing (%.2f\xC2\xB0 > %.2f\xC2\xB0). Sweeping DOWN.", p2p_deg, lowest_p2p);
 								test_kp = best_kp / 1.25f;
 								did_down_sweep = true;
@@ -4796,44 +4847,51 @@ void TMC4671::handleStateCoggingCalibration() {
 								test_dir = -test_dir;
 								continue;
 							} else {
+								// Second overshoot (after DOWN sweep) — minimum is bracketed.
 								stop_reason = "growth";
 								broadcastCalibLog(0, "P2P growing (%.2f\xC2\xB0 > %.2f\xC2\xB0). Minimum bracketed.", p2p_deg, lowest_p2p);
 								tuning_done = true;
 								break;
 							}
 						}
+						// If we're in the DOWN sweep and error starts increasing by >50%
+						// above the best from this DOWN phase, we've passed the minimum.
+						// (handled by the else-if above with did_down_sweep==true)
 					}
 
 					broadcastCalibLog(0, "Tested Kp:%.0f -> P2P:%.2f\xC2\xB0", test_kp, p2p_deg);
 
+					// Step Kp in the current sweep direction
 					if (sweep_up) {
 						test_kp *= 1.25f;
 					} else {
 						test_kp /= 1.25f;
-						if (test_kp < 50.0f) test_kp = 50.0f;
+						if (test_kp < 50.0f) test_kp = 50.0f;  // floor
 					}
-					test_dir = -test_dir;
+					test_dir = -test_dir; // Alternate motion direction for next pass
 				}
 
-				// Report result
-				if (stop_reason[0] == 'c') {
+				// Report result with the reason tuning stopped.
+				if (stop_reason[0] == 'c') {  // "clamp"
 					if (lowest_p2p >= 999.0f) {
+						// No valid measurement — every Kp tested clamped.
+						// Fall back to half the initial test Kp as a last resort.
 						float fallback_kp = (rpm_profile == 0) ? (imc_kp * 0.75f) : this->cogging_calib_pidP[0] * 0.75f;
 						if (fallback_kp < 50.0f) fallback_kp = 50.0f;
-						fallback_kp *= 0.5f;
+						fallback_kp *= 0.5f;  // halve it for safety
 						best_kp = fallback_kp;
-						broadcastCalibLog(0, "Selected Kp:%.0f (FALLBACK -- all Kp clamped)", best_kp);
+						broadcastCalibLog(0, "Selected Kp:%.0f (FALLBACK — all Kp clamped, Lowest P2P:N/A)", best_kp);
 					} else {
 						broadcastCalibLog(0, "Selected Kp:%.0f (Clamp at %.0f, Lowest P2P:%.2f\xC2\xB0)", best_kp, test_kp, lowest_p2p);
 					}
-				} else if (stop_reason[0] == 'g') {
+				} else if (stop_reason[0] == 'g') {  // "growth"
 					broadcastCalibLog(0, "Selected Kp:%.0f (Optimal, Lowest P2P:%.2f\xC2\xB0)", best_kp, lowest_p2p);
 				} else if (step_count >= MAX_TUNE_STEPS) {
 					broadcastCalibLog(0, "Selected Kp:%.0f (Max steps %u, Lowest P2P:%.2f\xC2\xB0)", best_kp, MAX_TUNE_STEPS, lowest_p2p);
 				} else {
 					broadcastCalibLog(0, "Selected Kp:%.0f (Ceiling %.0f, Lowest P2P:%.2f\xC2\xB0)", best_kp, KP_TUNE_CEILING, lowest_p2p);
 				}
-				// Write results back
+				// Write results back to per-profile storage
 				this->coggingSpeedP = best_kp;
 				this->coggingSpeedI = 0.0f;
 				this->coggingSpeedD = 0.0f;
@@ -4862,6 +4920,12 @@ void TMC4671::handleStateCoggingCalibration() {
 
 			float prev_iter_err = 999.0f; // track best error for degradation detection
 			Harmonic prev_harmonics[COGGING_HARMONICS_COUNT]; // backup of best table
+
+			// DFT retry: if the acquisition clamps (Kp too high for this RPM),
+			// lower Kp by one step and restart the DFT from scratch.
+			static constexpr uint8_t DFT_MAX_CLAMP_RETRIES = 3;
+			for (uint8_t dft_retry = 0; dft_retry < DFT_MAX_CLAMP_RETRIES && !emergency && hasPower(); dft_retry++) {
+			bool dft_clamped = false;
 
 			for (uint8_t dft_iter = 0; dft_iter < MAX_DFT_ITERATIONS && !emergency && hasPower(); dft_iter++) {
 				total_samples = 0;
@@ -4930,7 +4994,7 @@ void TMC4671::handleStateCoggingCalibration() {
 						int32_t actual_iq_raw = 0;
 						
 						startCalibTimers(TIM_TMC_ARR);
-						while (HAL_GetTick() - calibStartTime < REVOLUTION_TIME_MS && !emergency && hasPower()) {
+						while (HAL_GetTick() - calibStartTime < REVOLUTION_TIME_MS && !dft_clamped && !emergency && hasPower()) {
 							next_tick += period_us;
 							
 							float step = (target_rpm / 60.0f) * dt_sec;
@@ -4952,7 +5016,10 @@ void TMC4671::handleStateCoggingCalibration() {
 								prev_actual_pos_f = actual_pos_f;
 								prev_vel_turns = current_vel_turns;
 								
-								iq_inertia = (J / 100.0f) * current_accel_rad; 
+								iq_inertia = (J / 100.0f) * current_accel_rad;
+								if (this->cogging_calib_inertiaCorr) {
+									iq_pid += iq_inertia;
+								}
 								// Friction FF scaled down: dynamic_friction was measured at 30 RPM,
 								// but calib_rpm is much slower (3-12 RPM). Using full value over-compensates
 								// and creates a DC bias in position error that flips with direction.
@@ -4983,6 +5050,11 @@ void TMC4671::handleStateCoggingCalibration() {
 								}
 								float iq_applied = iq_cmd + (this->cogging_scale * cog_comp);
 								iq_applied = clip<float,float>(iq_applied, -max_test_torque, max_test_torque);
+								// Clamp during DFT means Kp is too high for this RPM —
+								// flag for retry with a lower Kp.
+								if (fabsf(iq_applied) >= max_test_torque * 0.99f) {
+									dft_clamped = true;
+								}
 #ifndef COGGING_DFT_USE_IQ_CMD
 								actual_iq_raw = getActualTorque();
 								dbg.actualIq = actual_iq_raw;
@@ -5005,7 +5077,10 @@ void TMC4671::handleStateCoggingCalibration() {
 #ifdef COGGING_DFT_USE_IQ_CMD
 								float iq = iq_cmd;
 #else
-								float iq = (float)actual_iq_raw; //- iq_inertia;
+								float iq = (float)actual_iq_raw;
+								if (this->cogging_calib_inertiaCorr) {
+									iq -= iq_inertia;
+								}
 #endif
 #ifdef COGGING_CALIB_ENABLE_ID_DIAG
 								float id = (float)getActualFlux();
@@ -5064,6 +5139,10 @@ void TMC4671::handleStateCoggingCalibration() {
 						total_samples += dir_samples;
 					}
 				}
+
+				// If DFT clamped during this iteration, abort the whole
+				// iteration loop so the retry can lower Kp and restart.
+				if (dft_clamped) break;
 
 				// --- CW+CCW HARMONICS COMBINATION (Piccoli phase alignment) ---
 				// Average magnitudes and phases from CW and CCW sweeps.
@@ -5245,6 +5324,31 @@ void TMC4671::handleStateCoggingCalibration() {
 				prev_iter_err = iter_max_err_deg;
 			}
 
+			// --- DFT CLAMP RETRY ---
+			// If the acquisition saturated torque, Kp is too high for this RPM.
+			// Lower it by one step, clear the table, and restart the DFT.
+			if (dft_clamped && dft_retry + 1 < DFT_MAX_CLAMP_RETRIES && !emergency && hasPower()) {
+				float lowered_kp = pid_soft.Kp / 1.25f;
+				if (lowered_kp < 50.0f) lowered_kp = 50.0f;
+				broadcastCalibLog(0, "DFT clamped at Kp:%.0f! Retrying with Kp:%.0f.", pid_soft.Kp, lowered_kp);
+				pid_soft.Kp = lowered_kp;
+				this->coggingSpeedP = lowered_kp;
+				this->cogging_calib_pidP[rpm_profile] = (uint32_t)lowered_kp;
+				arm_pid_init_f32(&pid_soft, 1);
+				memset(active_tbl, 0, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
+				applySafeTorque(0);
+				Delay(250);
+				continue;  // restart DFT for this profile
+			}
+			// If we exhausted retries, fall through and use whatever we got.
+			if (dft_clamped) {
+				broadcastCalibLog(0, "DFT clamp retries exhausted at Kp:%.0f.", pid_soft.Kp);
+			} else {
+				break;  // no clamp — DFT succeeded, exit retry loop
+			}
+
+			} // end DFT retry loop
+
 			// Each profile wrote directly into its own table (active_tbl), so nothing
 			// to copy here. Mark validity ONLY if this profile actually collected
 			// samples (an aborted profile must not leave a valid flag on an empty
@@ -5252,7 +5356,7 @@ void TMC4671::handleStateCoggingCalibration() {
 		if (total_samples > 0) {
 			any_profile_succeeded = true;
 
-#ifdef COGGING_PHASE_SHIFT_METHOD
+#ifdef COGGING_PHASE_SHIFT_CAL
 			// --- PHASE-SHIFT METHOD: measure phase lag & attenuation per RPM ---
 				// Profile 0 (lowest RPM, e.g. 3 RPM): the "true spatial" base map.
 				// Higher profiles: measure how much the dominant harmonic shifted
@@ -5317,9 +5421,9 @@ void TMC4671::handleStateCoggingCalibration() {
 				}
 
 				scale_curve_count = rpm_profile + 1;
-#endif // COGGING_PHASE_SHIFT_METHOD
+#endif // COGGING_PHASE_SHIFT_CAL
 
-#ifdef COGGING_BLEND
+#ifndef COGGING_DISABLE_BLEND
 			// Mark per-RPM blend tables as valid for runtime blending.
 			// Independent of phase-shift: both can coexist.
 			if (rpm_profile == 1) this->rpm2_table_valid = true;
@@ -5336,7 +5440,7 @@ void TMC4671::handleStateCoggingCalibration() {
 			refreshWatchdog();
 			saveCoggingTable();
 
-#ifdef COGGING_PHASE_SHIFT_METHOD
+#ifdef COGGING_PHASE_SHIFT_CAL
 			// Phase-shift method: mark scale and phase-advance curves as valid.
 			// The curve values were populated per-profile above; saveFlash()
 			// (called in the scale calibration block below) will persist them.
@@ -5347,7 +5451,7 @@ void TMC4671::handleStateCoggingCalibration() {
 				scale_curve_count);
 #endif
 
-#ifdef COGGING_BLEND
+#ifndef COGGING_DISABLE_BLEND
 			// Persist the RPM#2/RPM#3 maps and stamp the blend anchors from the
 			// calibrated profile speeds so the runtime blend matches this run.
 			// Independent of phase-shift — both can coexist.
