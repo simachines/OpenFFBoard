@@ -1818,25 +1818,25 @@ void TMC4671::turn(int16_t power){
 		prev_filtered_pos = pos_f;
 		last_vel_tick = now;
 
-		// Velocity-based phase advance: shift the lookup position forward in the
-		// direction of motion to compensate for high-speed lag of the cogging pattern.
+		// --- DO NOT SHIFT pos_f ---
+		// Leave pos_f as the pure, raw spatial position.
+		// Motor inductance acts as an RL low-pass filter whose phase delay
+		// physically cannot exceed 90° electrical. A mechanical shift would
+		// multiply by harmonic order and artificially push high harmonics
+		// past 90°, sometimes flipping them completely (180°+) — that is what
+		// creates texture/bumps at higher RPMs. We therefore compute the
+		// electrical advance separately and apply it ONLY to harmonics at or
+		// below the dominant order (see compensation loop below).
+		float adv_mech_rad = 0.0f;
 		if (phase_adv_curve_valid) {
 			float adv_deg = interpolatePhaseAdvance(measured_rpm);
 			float dir = (signed_rpm >= 0.0f) ? 1.0f : -1.0f;
-			pos_f += dir * adv_deg / 360.0f;
-			// Wrap back into [0,1)
-			pos_f = pos_f - floorf(pos_f);
+			adv_mech_rad = dir * (adv_deg / 360.0f) * 2.0f * PI;
 		}
 
 		// Fourier series compensation with per-RPM harmonic blending.
-		// Three tables were calibrated at different RPMs; blend between them
-		// based on measured_rpm: below blend_rpm1 uses only cogging_harmonics,
-		// between blend_rpm1..blend_rpm2 uses blend of cogging_harmonics + cogging_harmonics_rpm2,
-		// above blend_rpm2 uses blend of cogging_harmonics_rpm2 + cogging_harmonics_rpm3.
-		// Fourier series compensation.
 #ifdef COGGING_DISABLE_BLEND
 		// Blending disabled: use the base cogging table (profile 0) directly.
-		// Phase advance (above) may still be active independently.
 		Harmonic* blended = this->cogging_harmonics;
 #else
 		// Per-RPM harmonic blending: three tables were calibrated at different
@@ -1845,29 +1845,43 @@ void TMC4671::turn(int16_t power){
 		this->blendHarmonicTables(measured_rpm, blended);
 #endif
 
-		float compensation = 0;
 		float angle_rad = pos_f * 2.0f * PI;
 
-		// Track the dominant harmonic (largest amplitude) for waveshaping.
-		float dom_amp = 0.0f, dom_order = 1.0f, dom_phase = 0.0f;
+		// 1. Find the dominant harmonic (largest amplitude)
+		float dom_amp = 0.0f, dom_phase = 0.0f;
+		uint16_t dom_order = 1;
 		for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
-			if (blended[i].amplitude > 0.0f) {
-				compensation += blended[i].amplitude * arm_sin_f32(angle_rad * blended[i].order + blended[i].phase);
-				if (blended[i].amplitude > dom_amp) {
-					dom_amp = blended[i].amplitude;
-					dom_order = (float)blended[i].order;
-					dom_phase = blended[i].phase;
-				}
+			if (blended[i].amplitude > dom_amp) {
+				dom_amp = blended[i].amplitude;
+				dom_order = (uint16_t)blended[i].order;
+				dom_phase = blended[i].phase;
 			}
 		}
 
-		// Cogging waveshaping: subtract/add a harmonic of the DOMINANT cogging
-		// order to reshape the peak/trough profile ("thin peaks / steep slopes"),
-		// since the raw Fourier sum can sit slightly off the physical tooth geometry.
-		//   shaped = compensation - h3_shaping * dom_amp * sin(mult*(dom_order*theta + dom_phase) + phase_trim)
-		// mult=3 and h3_shaping>0 thins the peaks; h3_shaping<0 flattens them.
+		// 2. Calculate Compensation
+		float compensation = 0;
+		for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
+			if (blended[i].amplitude > 0.0f) {
+				float electrical_advance = 0.0f;
+
+				// Only apply the phase advance to the dominant harmonic (and
+				// lower fundamentals). Higher harmonics (the "texture") remain
+				// anchored to their physical spatial locations so they don't
+				// get over-shifted by the inductance phase curve.
+				if (blended[i].order <= dom_order) {
+					electrical_advance = (float)blended[i].order * adv_mech_rad;
+				}
+
+				compensation += blended[i].amplitude * arm_sin_f32(
+					angle_rad * blended[i].order + blended[i].phase + electrical_advance);
+			}
+		}
+
+		// 3. Cogging waveshaping ("3rd harmonic" trim)
 		if (h3_shaping != 0.0f && dom_amp > 0.0f) {
-			float shaped_arg = this->h3_mult * (dom_order * angle_rad + dom_phase) + this->h3_phase_trim;
+			// Apply the advance to the waveshaper too, since it tracks the dominant wave.
+			float dom_elec_adv = (float)dom_order * adv_mech_rad;
+			float shaped_arg = this->h3_mult * ((float)dom_order * angle_rad + dom_phase + dom_elec_adv) + this->h3_phase_trim;
 			compensation -= this->h3_shaping * dom_amp * arm_sin_f32(shaped_arg);
 		}
 		// Speed-dependent scale: interpolate from calibrated curve if available
@@ -4640,8 +4654,13 @@ void TMC4671::handleStateCoggingCalibration() {
 			QuarterErrorStats imc_stats;
 			broadcastCalibLog(0, "IMC validation rotation...");
 			if (!runQuarterTurnValidation(TMC4671CoggingDebugPhase::Validation, imc_kp, imc_ki, GAIN_SWEEP_WARMUP_MS, gain_sweep_timeout_ms, imc_stats)) {
-				errorMessage = emergency ? "Abort: IMC validation interrupted" : (!hasPower() ? "Abort: Power lost during IMC validation" : "Abort: IMC validation did not cover all quarters");
-				goto cleanup;
+				if (emergency || !hasPower()) {
+					errorMessage = emergency ? "Abort: IMC validation interrupted" : "Abort: Power lost during IMC validation";
+					goto cleanup;
+				}
+				// Didn't cover all quarters — motor may be hitting travel limits.
+				// Not fatal; IMC baseline is already computed. Continue with warning.
+				broadcastCalibLog(0, "IMC validation incomplete (quarters missed) — continuing.");
 			}
 			logQuarterErrorStats("IMC", imc_kp, imc_ki, imc_stats);
 
@@ -4785,7 +4804,11 @@ void TMC4671::handleStateCoggingCalibration() {
 				bool clamp_just_cleared = false; // true after clamp backoff succeeded — use small step
 				uint8_t step_count = 0;
 				static constexpr uint8_t MAX_TUNE_STEPS = 20;
-				static constexpr float KP_TUNE_CEILING = 10000000.0f;
+				// Ceiling: cap at 5× IMC baseline or 500k, whichever is lower.
+				// Beyond this, Kp dominates the torque loop and any encoder
+				// noise or cogging instantly saturates max_test_torque.
+				float kp_tune_ceiling = imc_kp * 5.0f;
+				if (kp_tune_ceiling > 500000.0f) kp_tune_ceiling = 500000.0f;
 				const char* stop_reason = "limit";
 
 				// Fixed I=0, D=0 during P-only tuning
@@ -4819,27 +4842,19 @@ void TMC4671::handleStateCoggingCalibration() {
 
 				float target_pos_f = getFilteredPosition();
 
-				while (test_kp < KP_TUNE_CEILING && step_count < MAX_TUNE_STEPS && !tuning_done && !emergency && hasPower()) {
+				while (test_kp < kp_tune_ceiling && step_count < MAX_TUNE_STEPS && !tuning_done && !emergency && hasPower()) {
 					step_count++;
 					pid_soft.Kp = test_kp;
 					arm_pid_init_f32(&pid_soft, 1);
 
-				// Settle: actively stop the motor before each P-tuner sweep.
-				// This is critical between profiles where the motor may still
-				// have residual motion from DFT or the previous sweep.
+				// Coast settle before each P-tuner sweep.
+				applySafeTorque(0);
 				{
-					float hold_pos = getFilteredPosition();
 					uint32_t settleStart = HAL_GetTick();
-					while (HAL_GetTick() - settleStart < 500 && !emergency && hasPower()) {
-						float err = getWrappedError(hold_pos, getFilteredPosition());
-						float iq_hold = arm_pid_f32(&pid_soft, err);
-						iq_hold = clip<float>(iq_hold, -max_test_torque * 0.3f, max_test_torque * 0.3f);
-						applySafeTorque(iq_hold);
+					while (HAL_GetTick() - settleStart < 300 && !emergency && hasPower()) {
 						refreshWatchdog();
-						Delay(1);
+						Delay(10);
 					}
-					applySafeTorque(0);
-					Delay(50);
 					arm_pid_init_f32(&pid_soft, 1);
 				}
 
@@ -5039,7 +5054,7 @@ void TMC4671::handleStateCoggingCalibration() {
 				} else if (step_count >= MAX_TUNE_STEPS) {
 					broadcastCalibLog(0, "Selected Kp:%.0f (Max steps %u, Lowest P2P:%.2f\xC2\xB0)", best_kp, MAX_TUNE_STEPS, lowest_p2p);
 				} else {
-					broadcastCalibLog(0, "Selected Kp:%.0f (Ceiling %.0f, Lowest P2P:%.2f\xC2\xB0)", best_kp, KP_TUNE_CEILING, lowest_p2p);
+					broadcastCalibLog(0, "Selected Kp:%.0f (Ceiling %.0f, Lowest P2P:%.2f\xC2\xB0)", best_kp, kp_tune_ceiling, lowest_p2p);
 				}
 				// Write results back to per-profile storage
 				this->coggingSpeedP = best_kp;
@@ -5081,9 +5096,13 @@ void TMC4671::handleStateCoggingCalibration() {
 			Harmonic prev_harmonics[COGGING_HARMONICS_COUNT]; // backup of best table
 
 			// DFT retry: if the acquisition clamps (Kp too high for this RPM),
-			// lower Kp by one step and restart the DFT from scratch.
-			static constexpr uint8_t DFT_MAX_CLAMP_RETRIES = 3;
-			for (uint8_t dft_retry = 0; dft_retry < DFT_MAX_CLAMP_RETRIES && !emergency && hasPower(); dft_retry++) {
+			// lower Kp and restart. Keeps retrying until Kp hits floor (50)
+			// or the DFT succeeds clamp-free.
+			for (;;) {
+				if (pid_soft.Kp < 50.0f || emergency || !hasPower()) {
+					broadcastCalibLog(0, "DFT clamp retries hit Kp floor (%.0f).", pid_soft.Kp);
+					break;
+				}
 			bool dft_clamped = false;
 
 			for (uint8_t dft_iter = 0; dft_iter < MAX_DFT_ITERATIONS && !emergency && hasPower(); dft_iter++) {
@@ -5123,39 +5142,22 @@ void TMC4671::handleStateCoggingCalibration() {
 #endif
 					uint32_t dir_samples = 0;
 
-					// Active settle: hold position to bring the motor to a full stop
-					// before reversing direction. Scales with RPM — higher speeds
-					// need more time and more braking torque to arrest momentum.
-					{
-						float hold_pos = getFilteredPosition();
-						// Settle duration: at least 1.5s, up to 1 revolution at this RPM
-						float rev_s = 60.0f / fabsf(calib_rpm);
-						uint32_t settle_ms = (uint32_t)(rev_s * 1500.0f); // ~1.5 rev worth
-						if (settle_ms < 1500) settle_ms = 1500;
-						if (settle_ms > 5000) settle_ms = 5000;
-						// Torque limit scales with RPM: 30% base, up to 70% at high RPM
-						float settle_tq_frac = 0.3f + (fabsf(calib_rpm) / 300.0f);
-						if (settle_tq_frac > 0.7f) settle_tq_frac = 0.7f;
-						float settle_tq = max_test_torque * settle_tq_frac;
-
-						uint32_t settleStart = HAL_GetTick();
-						while(HAL_GetTick() - settleStart < settle_ms && !emergency && hasPower()) {
-							float err = getWrappedError(hold_pos, getFilteredPosition());
-							float iq_hold = arm_pid_f32(&pid_soft, err);
-							iq_hold = clip<float>(iq_hold, -settle_tq, settle_tq);
-							applySafeTorque(iq_hold);
-							refreshWatchdog();
-							Delay(1);
-						}
-						applySafeTorque(0);
-						Delay(50);
+				// Coast settle: let rotor spin down naturally with zero torque.
+				// Time scales with RPM — high speeds need more revolutions to
+				// dissipate kinetic energy, low speeds stop almost instantly.
+				applySafeTorque(0);
+				{
+					float rev_s = 60.0f / fabsf(calib_rpm);
+					uint32_t settle_ms = (uint32_t)(rev_s * 2000.0f); // ~2 rev worth
+					if (settle_ms < 500)  settle_ms = 500;
+					if (settle_ms > 3000) settle_ms = 3000;
+					uint32_t settleStart = HAL_GetTick();
+					while (HAL_GetTick() - settleStart < settle_ms && !emergency && hasPower()) {
+						refreshWatchdog();
+						Delay(10);
 					}
-					// Re-init PID after settle — the position-hold may have
-					// accumulated integrator windup and the motor can drift
-					// during the 50ms torque-off gap. A fresh PID prevents
-					// a torque spike when the sweep starts.
-					arm_pid_init_f32(&pid_soft, 1);
-
+				}
+				arm_pid_init_f32(&pid_soft, 1);
 					if (!emergency && hasPower()) {
 						float target_pos_f = getFilteredPosition();
 
@@ -5186,10 +5188,14 @@ void TMC4671::handleStateCoggingCalibration() {
 							next_tick += period_us;
 							
 							// Ramp velocity from 0 to full during warmup to avoid torque spikes
-							// at direction reversals and startup
+							// at direction reversals and startup. Tiny floor ensures the
+							// target moves at least ~1 encoder count/iteration immediately,
+							// preventing stick-slip with high-res encoders at low RPM.
 							float elapsed = (float)(HAL_GetTick() - calibStartTime);
 							if (elapsed < (float)cogging_warmup_ms) {
 								ramp_vel_turns = ramp_rate * elapsed * 0.001f; // turns/s
+								if (ramp_vel_turns < fabsf(full_vel_turns) * 0.005f)
+									ramp_vel_turns = fabsf(full_vel_turns) * 0.005f;
 							} else {
 								ramp_vel_turns = full_vel_turns;
 							}
@@ -5214,7 +5220,14 @@ void TMC4671::handleStateCoggingCalibration() {
 								
 								iq_inertia = (J / 100.0f) * current_accel_rad;
 								if (this->cogging_calib_inertiaCorr) {
-									iq_pid += iq_inertia;
+									// Light inertia FF: 15% of max torque cap.
+									// The PID does the heavy lifting; this just
+									// reduces its burden during acceleration.
+									// Higher values amplify encoder quantization
+									// noise (1-count jitter → spurious accel).
+									float capped = clip<float>(iq_inertia,
+										-max_test_torque * 0.15f, max_test_torque * 0.15f);
+									iq_pid += capped;
 								}
 								// Friction FF scaled down: dynamic_friction was measured at 30 RPM,
 								// but calib_rpm is much slower (3-12 RPM). Using full value over-compensates
@@ -5522,8 +5535,8 @@ void TMC4671::handleStateCoggingCalibration() {
 
 			// --- DFT CLAMP RETRY ---
 			// If the acquisition saturated torque, Kp is too high for this RPM.
-			// Lower it by one step, clear the table, and restart the DFT.
-			if (dft_clamped && dft_retry + 1 < DFT_MAX_CLAMP_RETRIES && !emergency && hasPower()) {
+			// Lower it and restart. Retries until Kp hits floor (50) or DFT succeeds.
+			if (dft_clamped && !emergency && hasPower()) {
 				float lowered_kp = pid_soft.Kp / 1.25f;
 				if (lowered_kp < 50.0f) lowered_kp = 50.0f;
 				broadcastCalibLog(0, "DFT clamped at Kp:%.0f! Retrying with Kp:%.0f.", pid_soft.Kp, lowered_kp);
@@ -5541,39 +5554,24 @@ void TMC4671::handleStateCoggingCalibration() {
 				memset(active_tbl, 0, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
 				applySafeTorque(0);
 				Delay(250);
-				continue;  // restart DFT for this profile
+				continue;  // restart DFT for this profile with lower Kp
 			}
-			// If we exhausted retries, fall through and use whatever we got.
-			if (dft_clamped) {
-				broadcastCalibLog(0, "DFT clamp retries exhausted at Kp:%.0f.", pid_soft.Kp);
-			} else {
-				break;  // no clamp — DFT succeeded, exit retry loop
-			}
+			// DFT succeeded without clamp — exit retry loop
+			break;
 
 			} // end DFT retry loop
 
-			// Settle after DFT: motor may have residual motion from the last
-			// CCW sweep. Bring to a full stop before phase extraction or the
-			// next profile's P-tuner starts.
+			// Coast settle after DFT before next profile.
+			applySafeTorque(0);
 			{
-				float hold_pos = getFilteredPosition();
-				float rev_s = 60.0f / fabsf(calib_rpm);
-				uint32_t settle_ms = (uint32_t)(rev_s * 1000.0f);
-				if (settle_ms < 1000) settle_ms = 1000;
+				uint32_t settle_ms = cogging_warmup_ms;
 				if (settle_ms > 4000) settle_ms = 4000;
-				float settle_tq = max_test_torque * 0.4f;
 				uint32_t settleStart = HAL_GetTick();
 				while (HAL_GetTick() - settleStart < settle_ms && !emergency && hasPower()) {
-					float err = getWrappedError(hold_pos, getFilteredPosition());
-					float iq_hold = arm_pid_f32(&pid_soft, err);
-					iq_hold = clip<float>(iq_hold, -settle_tq, settle_tq);
-					applySafeTorque(iq_hold);
 					refreshWatchdog();
-					Delay(1);
+					Delay(10);
 				}
-				applySafeTorque(0);
-				Delay(50);
-				arm_pid_init_f32(&pid_soft, 1); // fresh PID for next phase
+				arm_pid_init_f32(&pid_soft, 1);
 			}
 
 			// Each profile wrote directly into its own table (active_tbl), so nothing
@@ -5866,44 +5864,68 @@ void TMC4671::handleStateCoggingCalibration() {
 
 				calib_rpm = this->cogging_calib_rpm[this->cogging_calib_count - 1];
 				if (calib_rpm < 3.0f) calib_rpm = 20.0f;
+			pid_soft.Ki = 0.0f;
+				pid_soft.Kd = 0.0f;
+
+			// Compute return RPM from distance first so we can look up
+			// the correct Kp for the ACTUAL return speed (not calib_rpm).
+			actual_pos_f = getAbsolutePosition();
+			float distance_turns = fabs(actual_pos_f);
+			float ret_rpm = distance_turns * 6.0f; // 10-second return
+			if (ret_rpm < 0.5f) ret_rpm = 0.5f;
 
 #ifdef COGGING_PHASE_SHIFT_MULTIRPM
-				// MULTIRPM: use the Kp that was auto-tuned for the return RPM.
-				// Find the nearest scale_curve_rpm_points index to calib_rpm
-				// and use the Kp stored there from the P-gain auto-tuner.
-				pid_soft.Kp = this->coggingSpeedP; // last profile's Kp as fallback
-				{
-					float best_dist = 999999.0f;
-					uint8_t ret_idx = 0;
-					for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
-						float dist = fabsf(scale_curve_rpm_points[i] - calib_rpm);
-						if (dist < best_dist) { best_dist = dist; ret_idx = i; }
+			// Look up Kp tuned for the nearest RPM breakpoint AT OR BELOW ret_rpm.
+			// Using a Kp tuned for a lower speed is safe; using one for a higher
+			// speed would oscillate.
+			{
+				uint8_t ret_idx = 0;
+				float best_dist = 999999.0f;
+				for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
+					float dist = scale_curve_rpm_points[i] - ret_rpm;
+					if (dist <= 0.0f && fabsf(dist) < best_dist) {
+						best_dist = fabsf(dist);
+						ret_idx = i;
 					}
-					// Use stored Kp from the wrapped calib slot that holds this profile's tune
-					uint8_t store_src = (ret_idx - 1 < COGGING_MAX_CALIB_PROFILES) ? (ret_idx - 1) : (COGGING_MAX_CALIB_PROFILES - 1);
-					uint32_t stored_kp = this->cogging_calib_pidP[store_src];
-					if (stored_kp > 0) pid_soft.Kp = (float)stored_kp;
 				}
+				// ret_idx now points to the breakpoint ≤ ret_rpm (or 0 if none found)
+				uint8_t store_src = (ret_idx > 0 && ret_idx - 1 < COGGING_MAX_CALIB_PROFILES)
+					? (ret_idx - 1) : 0;
+				uint32_t stored_kp = this->cogging_calib_pidP[store_src];
+				if (stored_kp > 0) pid_soft.Kp = (float)stored_kp;
+				else pid_soft.Kp = this->coggingSpeedP;
+			}
 #else
-				pid_soft.Kp = (float)this->cogging_calib_pidP[this->cogging_calib_count - 1];
-				if (pid_soft.Kp < 50.0f) pid_soft.Kp = this->coggingSpeedP;
+			pid_soft.Kp = (float)this->cogging_calib_pidP[this->cogging_calib_count - 1];
+			if (pid_soft.Kp < 50.0f) pid_soft.Kp = this->coggingSpeedP;
 #endif
-				pid_soft.Ki = 0.0f;
-				pid_soft.Kd = 0.0f;
+
+			// Return-to-center with clamp retry: if the PID saturates torque
+			// during the return, Kp is too high for ret_rpm.
+			// Lower Kp and restart from the current position (up to 3 tries).
+			static constexpr uint8_t RET_MAX_CLAMP_RETRIES = 3;
+			for (uint8_t ret_clamp_try = 0; ret_clamp_try < RET_MAX_CLAMP_RETRIES && !emergency && hasPower(); ret_clamp_try++) {
+				bool ret_clamped = false;
 				arm_pid_init_f32(&pid_soft, 1);
 
-				// Get current position
+				// Re-read position (may have changed from previous retry)
 				actual_pos_f = getAbsolutePosition();
-				broadcastCalibLog(0, "Return to center: Start pos = %.3f turns", actual_pos_f);
+				if (ret_clamp_try == 0) {
+					broadcastCalibLog(0, "Return to center: dist=%.1f turn%s ret_rpm=%.1f Kp=%.0f",
+						distance_turns, (distance_turns==1.0f?"":"s"), ret_rpm, pid_soft.Kp);
+				} else {
+					broadcastCalibLog(0, "Return retry %u: Kp=%.0f pos=%.3f",
+						ret_clamp_try, pid_soft.Kp, actual_pos_f);
+				}
 
 				float target_pos_f = actual_pos_f;
 				uint32_t period_us = getActualCalibPeriod(TIM_TMC_ARR); 
-				// Fixed 10-second return: calculate RPM from distance
-				// RPM = distance_turns / (10s / 60s) = distance_turns * 6
-				float distance_turns = fabs(actual_pos_f);
-				float ret_rpm = distance_turns * 6.0f; // covers distance in 10 seconds
-				if (ret_rpm < 0.5f) ret_rpm = 0.5f;    // minimum speed for very short moves
-				const float full_ret_rpm = (actual_pos_f > 0.0f) ? -ret_rpm : ret_rpm;
+				// Recalculate distance/RPM from current position (may differ from
+				// pre-loop values on retry after a clamped attempt).
+				float cur_distance = fabs(actual_pos_f);
+				float cur_ret_rpm = cur_distance * 6.0f;
+				if (cur_ret_rpm < 0.5f) cur_ret_rpm = 0.5f;
+				const float full_ret_rpm = (actual_pos_f > 0.0f) ? -cur_ret_rpm : cur_ret_rpm;
 				target_rpm = full_ret_rpm;
 				// Timeout: 10s travel + 5s safety margin
 				uint32_t dynamic_timeout_ms = 15000;
@@ -5911,7 +5933,7 @@ void TMC4671::handleStateCoggingCalibration() {
 				uint32_t return_start = HAL_GetTick();
 				uint32_t next_tick = micros();
 				startCalibTimers(TIM_TMC_ARR);
-				while (fabs(actual_pos_f) > 0.005f && !emergency && hasPower()) {
+				while (fabs(actual_pos_f) > 0.005f && !emergency && hasPower() && !ret_clamped) {
 					next_tick += period_us;
 					
 					// Ramp velocity from 0 to full to prevent torque slam
@@ -5950,6 +5972,12 @@ void TMC4671::handleStateCoggingCalibration() {
 					
 					// Use full test torque limit (standard for all phases)
 					iq_applied = clip<float,float>(iq_applied, -max_test_torque, max_test_torque);
+					
+					// Clamp check: if saturated, abort this return attempt.
+					if (fabsf(iq_applied) >= max_test_torque * 0.99f) {
+						ret_clamped = true;
+					}
+					
 					captureDebug(TMC4671CoggingDebugPhase::ReturnToCenter, target_rpm, target_pos_f, actual_pos_f, error, iq_pid, iq_ff, 0.0f, cog_comp, iq_cmd, iq_applied, 0.0f, 0.0f, J, B, dynamic_friction);
 					applySafeTorque(iq_applied);
 					
@@ -5970,6 +5998,24 @@ void TMC4671::handleStateCoggingCalibration() {
 				}
 				stopCalibTimers();
 				applySafeTorque(0);
+
+				// --- CLAMP RETRY ---
+				if (ret_clamped && ret_clamp_try + 1 < RET_MAX_CLAMP_RETRIES) {
+					float lowered_kp = pid_soft.Kp / 1.25f;
+					if (lowered_kp < 50.0f) lowered_kp = 50.0f;
+					broadcastCalibLog(0, "Return clamped at Kp:%.0f! Retrying with Kp:%.0f.",
+						pid_soft.Kp, lowered_kp);
+					pid_soft.Kp = lowered_kp;
+					Delay(250); // let motor settle before retry
+					continue;
+				}
+				if (ret_clamped) {
+					broadcastCalibLog(0, "Return clamp retries exhausted at Kp:%.0f.",
+						pid_soft.Kp);
+				}
+				break; // success or exhausted — exit retry loop
+			} // end return clamp retry loop
+
 				broadcastCalibLog(0, "Centering done. Re-aligning encoder...");
 				
 				goto cleanup;

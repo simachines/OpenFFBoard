@@ -26,14 +26,17 @@ Total output:
 
 ## Compile-Time Feature Switches
 
-| Define | Effect when defined | Effect when NOT defined |
+| Define | Effect when defined | Current state |
 |---|---|---|
-| `COGGING_PHASE_SHIFT_MULTIRPM` | Tests all 23 fixed RPM breakpoints; extracts phase lag per RPM via master harmonic tracking | User-configured RPM profiles |
-| `COGGING_DISABLE_SCALE_CURVE` | **No scale curve** — `cogging_scale` stays at 1.0 at all RPMs; `phase_adv_curve_valid` also stays false | Scale & phase curves are populated and applied at runtime |
-| `COGGING_DISABLE_BLEND` | Uses only `cogging_harmonics` base table at all RPMs | Blends 3 per-RPM harmonic tables based on measured speed |
-| `COGGING_DFT_USE_IQ_CMD` | DFT uses `iq_cmd` (PID+friction only) — phasor-add mode for iterative refinement | DFT uses `actual_iq_raw` (total torque) — direct replacement on each iteration |
+| `COGGING_PHASE_SHIFT_MULTIRPM` | Tests all 23 fixed RPM breakpoints; extracts phase lag per RPM via master harmonic tracking | ✓ Active |
+| `COGGING_DISABLE_SCALE_CURVE` | **No scale/phase curves** — `cogging_scale`=1.0 at all RPMs | ✗ Commented out (curves active) |
+| `COGGING_DISABLE_BLEND` | Uses only `cogging_harmonics` base table at all RPMs | ✓ Active |
+| `COGGING_DFT_USE_IQ_CMD` | DFT uses `iq_cmd` (PID+friction effort) instead of raw ADC `actual_iq_raw` | ✓ Active |
 
-### `COGGING_DISABLE_SCALE_CURVE` details
+### `COGGING_DISABLE_SCALE_CURVE` (currently commented out)
+
+Scale curve and phase advance are **active** — `turn()` applies per-harmonic electrical advance
+and RPM-dependent amplitude scaling at runtime.
 
 When defined, the following are ALL disabled:
 
@@ -43,7 +46,8 @@ When defined, the following are ALL disabled:
 - Load-time `scale_curve_valid` restoration — skipped
 - Fill-in interpolation for scale values — skipped
 
-Runtime effect: `turn()` uses `cogging_scale` (1.0) directly, no phase-advance shift.
+**Runtime effect when disabled**: `turn()` uses `cogging_scale` (1.0) directly, no phase-advance.
+**Runtime effect when active** (current): per-harmonic electrical advance + scale curve.
 
 ---
 
@@ -191,11 +195,16 @@ if (total_dist < 0.5) total_dist = 0.5;       // min 0.5 turns total
 
 ```cpp
 float test_kp = (rpm_profile==0) ? imc_kp×0.75f : coggingSpeedP×0.75f;
+// Ceiling: min(5× IMC baseline, 500k). Beyond this, encoder noise
+// or cogging instantly saturates max_test_torque at any Kp.
+float kp_tune_ceiling = min(imc_kp × 5.0f, 500000.0f);
 test_dir = ±1 (alternates each test);
 
-while (test_kp < KP_TUNE_CEILING && step_count < MAX_TUNE_STEPS(20)) {
-    // 300ms settle at zero torque between direction changes
-    if (step_count > 1) { applySafeTorque(0); Delay(300); }
+while (test_kp < kp_tune_ceiling && step_count < MAX_TUNE_STEPS(20)) {
+    // 300ms coast settle before each sweep (always, including first)
+    applySafeTorque(0);
+    Delay(300);
+    arm_pid_init_f32(&pid_soft, 1);
 
     // Trapezoidal velocity sweep:
     //   Phase 0: Accelerate at max_accel_turns_s2 to target_vel
@@ -272,7 +281,7 @@ coggingSpeedD = 0.0f;
 
 Each profile runs **1 DFT iteration** with 2 directions.
 
-### Per-direction sweep — Velocity Ramp + Active Settle
+### Per-direction sweep — Velocity Ramp + Coast Settle
 
 ```cpp
 int8_t dirs[2] = {1, -1}; // CW then CCW
@@ -280,67 +289,77 @@ int8_t dirs[2] = {1, -1}; // CW then CCW
 for (int8_t p : dirs) {
     float target_rpm = (p==1) ? calib_rpm : -calib_rpm;
 
-    // --- ACTIVE SETTLE ---
-    // Hold position with 30% torque limit for 1.5s to BRING MOTOR TO STOP.
-    // Passive coasting isn't enough at higher RPMs.
-    {
-        float hold_pos = getFilteredPosition();
-        uint32_t settleStart = HAL_GetTick();
-        while (HAL_GetTick() - settleStart < 1500 && ...) {
-            float err = getWrappedError(hold_pos, getFilteredPosition());
-            float iq_hold = clip(arm_pid_f32(&pid_soft, err),
-                                 -max_test_torque×0.3, max_test_torque×0.3);
-            applySafeTorque(iq_hold);
-            Delay(1);
-        }
-        applySafeTorque(0);
-        Delay(50); // let PID state bleed off
-    }
+    // --- COAST SETTLE ---
+    // Zero torque for ~2 revolutions worth of time. RPM-proportional:
+    // 5 RPM → 3s, 50 RPM → 2.4s, 256 RPM → 0.5s (min).
+    applySafeTorque(0);
+    float rev_s = 60.0f / fabsf(calib_rpm);
+    uint32_t settle_ms = rev_s × 2000; // ~2 rev
+    if (settle_ms < 500)  settle_ms = 500;
+    if (settle_ms > 3000) settle_ms = 3000;
+    // wait...
+    arm_pid_init_f32(&pid_soft, 1); // fresh PID for sweep
 
     // --- VELOCITY RAMP ---
     // Ramp from 0 to full target velocity over cogging_warmup_ms.
+    // Tiny floor (0.5% of target) ensures the target moves at least
+    // ~1 encoder count/iteration on high-CPR encoders, preventing
+    // stick-slip when the rotor is stuck in a cogging valley at t=0.
     float target_pos_f = getFilteredPosition();
-    float prev_vel_turns = 0.0f;           // start from rest
     float full_vel_turns = target_rpm / 60.0f;
+    float ramp_rate = full_vel_turns / cogging_warmup_ms × 1000;
     float ramp_vel_turns = 0.0f;
-    float ramp_rate = full_vel_turns / cogging_warmup_ms × 1000; // turns/s²
 
-    uint32_t rev_ms = (60.0f/calib_rpm) × 1500;
-    uint32_t REVOLUTION_TIME_MS = rev_ms + cogging_warmup_ms;
-
-    startCalibTimers(TIM_TMC_ARR);
     while (HAL_GetTick() - calibStartTime < REVOLUTION_TIME_MS) {
         float elapsed = HAL_GetTick() - calibStartTime;
-        if (elapsed < cogging_warmup_ms)
+        if (elapsed < cogging_warmup_ms) {
             ramp_vel_turns = ramp_rate × elapsed × 0.001;
-        else
+            if (ramp_vel_turns < fabsf(full_vel_turns) × 0.005f)
+                ramp_vel_turns = fabsf(full_vel_turns) × 0.005f; // floor
+        } else {
             ramp_vel_turns = full_vel_turns;
-
+        }
         float step = ramp_vel_turns × dt_sec;
         target_pos_f += step;
 
-        float error = getWrappedError(target_pos_f, actual_pos_f);
-        iq_pid = arm_pid_f32(&pid_soft, error);
+        // PID + friction FF
+        iq_pid = arm_pid_f32(&pid_soft, getWrappedError(target_pos_f, actual_pos_f));
 
-        // Inertia FF (if cogging_calib_inertiaCorr enabled)
+        // Inertia FF: capped at 15% of max_test_torque to prevent encoder
+        // quantization noise (1-count jitter on 2M CPR) from causing vibration
         iq_inertia = (J/100.0f) × current_accel_rad;
-        if (cogging_calib_inertiaCorr) iq_pid += iq_inertia;
+        if (cogging_calib_inertiaCorr)
+            iq_pid += clip(iq_inertia, ±max_test_torque × 0.15);
 
-        // Friction FF: 10% of dynamic_friction, scaled by ramp_vel_turns
         float iq_ff = sign(ramp_vel_turns) × dynamic_friction × 0.1f;
-
         iq_cmd = iq_pid + iq_ff;
-
-        // Cogging feed-forward from active_tbl (empty on iter 0)
-        float cog_comp = Σ active_tbl[h].amplitude × sin(angle×order + phase);
-        float iq_applied = iq_cmd + cogging_scale × cog_comp;
+        iq_applied = clip(iq_cmd + cog_comp, ±max_test_torque);
 
         if (fabs(iq_applied) >= max_test_torque × 0.99f) dft_clamped = true;
-
         applySafeTorque(iq_applied);
     }
     stopCalibTimers();
     applySafeTorque(0);
+}
+```
+
+### DFT Clamp Retry — Unlimited
+
+```cpp
+// No retry limit — keeps dividing Kp by 1.25 until either
+// DFT succeeds or Kp hits floor (50). Exits with warning if floor hit.
+for (;;) {
+    if (pid_soft.Kp < 50.0f || emergency) {
+        broadcastCalibLog(0, "DFT clamp retries hit Kp floor (%.0f).", pid_soft.Kp);
+        break;
+    }
+    // ... run DFT ...
+    if (dft_clamped) {
+        pid_soft.Kp /= 1.25f;
+        if (pid_soft.Kp < 50.0f) pid_soft.Kp = 50.0f;
+        continue;
+    }
+    break; // success
 }
 ```
 
@@ -527,20 +546,23 @@ saveCoggingTable();         // cogging_harmonics → flash
 ## STEP 5 — Return to Center
 
 ```cpp
-// Fixed 10-second return regardless of distance
-actual_pos_f = getAbsolutePosition();  // may be many turns from center
+// Compute distance and return RPM
+actual_pos_f = getAbsolutePosition();
 distance_turns = fabs(actual_pos_f);
+ret_rpm = distance_turns × 6.0; // 10-second return
+if (ret_rpm < 0.5) ret_rpm = 0.5;
 
-// RPM = distance / (10s / 60s) = distance × 6
-ret_rpm = distance_turns × 6.0;
-if (ret_rpm < 0.5) ret_rpm = 0.5;      // minimum speed
-direction = (actual_pos_f > 0) ? -ret_rpm : +ret_rpm;
+// Kp: find nearest breakpoint ≤ ret_rpm, use its stored auto-tuned Kp.
+// This ensures Kp is safe for the actual return speed (not calib_rpm).
+// E.g., 10 turns away → 60 RPM return → Kp from 50 RPM profile.
+
+// Clamp retry (up to 3 tries):
+//   If |iq_applied| ≥ max_test_torque × 0.99 during return:
+//     Kp = Kp / 1.25, delay 250ms, restart from current position.
+//   If retries exhausted, proceed with whatever Kp we have.
 
 timeout = 15000; // 10s travel + 5s safety margin
-
-// Uses Kp auto-tuned for nearest calibrated RPM
-// Velocity ramp from 0 over cogging_warmup_ms
-// Anti-cogging compensation active during return
+// Velocity ramp over cogging_warmup_ms, anti-cogging active
 // Stop at position ≈ 0 ± 0.005 turns
 ```
 
@@ -557,36 +579,66 @@ void TMC4671::turn(int16_t power) {
         float signed_rpm = (pos_f - prev_pos) / dt × 60;
         measured_rpm = fabsf(signed_rpm);
 
-        // Phase-advance position shift (if phase_adv_curve_valid)
+        // --- DO NOT SHIFT pos_f ---
+        // Motor inductance acts as an RL low-pass filter — phase delay
+        // physically cannot exceed 90° electrical. Shifting pos_f mechanically
+        // multiplies the advance by harmonic order, over-shifting high harmonics
+        // past 90° (sometimes 180°+) which creates texture/bumps at high RPM.
+        // Instead we compute the mechanical advance separately and apply it
+        // ONLY to harmonics at or below the dominant order.
+        float adv_mech_rad = 0.0f;
         if (phase_adv_curve_valid) {
             float adv_deg = interpolatePhaseAdvance(measured_rpm);
             float dir = (signed_rpm >= 0) ? 1 : -1;
-            pos_f += dir × adv_deg / 360.0f;
-            pos_f = pos_f - floorf(pos_f);
+            adv_mech_rad = dir × (adv_deg / 360.0f) × 2π;
         }
 
         // Per-RPM harmonic blending or base table
 #ifdef COGGING_DISABLE_BLEND
-        Harmonic* blended = cogging_harmonics; // base table only
+        Harmonic* blended = cogging_harmonics;
 #else
         Harmonic blended[COGGING_HARMONICS_COUNT];
         blendHarmonicTables(measured_rpm, blended);
 #endif
 
-        // Fourier sum
+        float angle_rad = pos_f × 2π;
+
+        // 1. Find dominant harmonic
+        float dom_amp = 0, dom_phase = 0;
+        uint16_t dom_order = 1;
+        for (i = 0; i < COGGING_HARMONICS_COUNT; i++) {
+            if (blended[i].amplitude > dom_amp) {
+                dom_amp = blended[i].amplitude;
+                dom_order = (uint16_t)blended[i].order;
+                dom_phase = blended[i].phase;
+            }
+        }
+
+        // 2. Fourier sum with per-harmonic electrical advance
+        //    Only harmonics ≤ dom_order get the advance — higher harmonics
+        //    stay anchored to their physical spatial positions.
         float compensation = 0;
         for (i = 0; i < COGGING_HARMONICS_COUNT; i++) {
-            if (blended[i].amplitude > 0)
-                compensation += amplitude × sin(2π×pos_f×order + phase);
+            if (blended[i].amplitude > 0) {
+                float elec_adv = 0.0f;
+                if (blended[i].order <= dom_order)
+                    elec_adv = blended[i].order × adv_mech_rad;
+                compensation += blended[i].amplitude
+                    × sin(angle_rad × blended[i].order + blended[i].phase + elec_adv);
+            }
         }
 
-        // H3 waveshaping (if enabled)
+        // 3. H3 waveshaping (tracks dominant wave with its own advance)
         if (h3_shaping != 0.0f && dom_amp > 0.0f) {
-            compensation -= h3_shaping × dom_amp × sin(h3_mult×(dom_order×angle+dom_phase) + h3_phase_trim);
+            float dom_elec_adv = dom_order × adv_mech_rad;
+            float shaped_arg = h3_mult × (dom_order × angle_rad + dom_phase + dom_elec_adv)
+                             + h3_phase_trim;
+            compensation -= h3_shaping × dom_amp × sin(shaped_arg);
         }
 
-        // Speed-dependent scale
-        float dyn_scale = scale_curve_valid ? interpolateScale(measured_rpm) : cogging_scale;
+        // Speed-dependent scale (or constant cogging_scale)
+        float dyn_scale = scale_curve_valid
+            ? interpolateScale(measured_rpm) : cogging_scale;
 
         last_anticogging_torque = dyn_scale × compensation;
         totalPower += last_anticogging_torque;
@@ -594,6 +646,15 @@ void TMC4671::turn(int16_t power) {
     setFluxTorque(flux, totalPower);
 }
 ```
+
+### Why per-harmonic advance instead of shifting `pos_f`?
+
+| Method | Effect on high harmonics |
+|---|---|
+| Shift `pos_f` (old) | 5° mechanical → 50° on order-10, 100° on order-20 — exceeds 90° RL limit, flips phase |
+| Per-harmonic advance (new) | Advance limited to harmonics ≤ dominant order; high-frequency texture stays at physical positions |
+
+The RL low-pass characteristic of motor coils physically caps electrical phase lag at 90°. Multiplying a mechanical shift by harmonic order artificially pushes high harmonics past this limit, destroying the spatial texture. By applying the advance only to the dominant (and lower) harmonics, the main cogging wave is compensated without over-shifting the texture.
 
 ---
 
@@ -671,12 +732,19 @@ When `COGGING_DISABLE_BLEND`: only base table used at all RPMs.
 
 | Date | Change |
 |---|---|
-| 2026-07-01 | DFT: velocity ramp from 0 during warmup (prevents direction-change torque spike) |
-| 2026-07-01 | DFT: active position-hold settle (1.5s, 30% torque) replaces passive 1s wait between CW/CCW |
-| 2026-07-01 | DFT: friction FF uses `ramp_vel_turns` (matches actual velocity during ramp) |
+| 2026-07-02 | DFT: RPM-proportional coast settle (2 rev worth, 0.5–3s) replaces fixed warmup×2 |
+| 2026-07-02 | DFT: minimum ramp velocity floor (0.5% of target) prevents stick-slip on high-CPR encoders |
+| 2026-07-02 | DFT: unlimited clamp retry — keeps dividing Kp until floor at 50 |
+| 2026-07-02 | DFT: removed `init_kick` — instant position offset × high Kp = instant clamp |
+| 2026-07-02 | `turn()`: per-harmonic electrical advance instead of shifting `pos_f` |
+| 2026-07-02 | P-tuner: ceiling capped at `min(imc_kp × 5, 500000)` |
+| 2026-07-02 | P-tuner: coast settle before every sweep (not just between direction changes) |
+| 2026-07-02 | IMC validation: no longer aborts on incomplete quarter coverage |
+| 2026-07-02 | Return-to-center: Kp matched to actual return RPM (≤ nearest breakpoint), clamp retry |
+| 2026-07-02 | Inertia correction: cap reduced to 15% of max_test_torque (encoder noise protection) |
+| 2026-07-01 | DFT: velocity ramp from 0 during warmup |
+| 2026-07-01 | DFT: friction FF uses `ramp_vel_turns` |
 | 2026-07-01 | Return-to-center: fixed 10-second duration (RPM = distance × 6) |
-| 2026-07-01 | P-tuner: time-capped sweeps (`min(total_dist, target_vel×3.0)`) for fast 3 RPM tuning |
-| 2026-07-01 | `COGGING_DISABLE_SCALE_CURVE`: guards `scale_curve_valid` in `loadFlash()`, MULTIRPM writes, and `phase_adv_curve_valid` in finalize |
-| 2026-07-01 | `COGGING_DISABLE_BLEND`: fixed `blended` pointer bug (reading uninitialized stack) |
-| 2026-07-01 | Array bounds: PID storage wrapped to `COGGING_MAX_CALIB_PROFILES-1` in MULTIRPM |
-| 2026-07-01 | Return-to-center Kp: looks up nearest RPM's stored auto-tuned Kp |
+| 2026-07-01 | `COGGING_DISABLE_SCALE_CURVE`: guards in `loadFlash()`, MULTIRPM, finalize |
+| 2026-07-01 | `COGGING_DISABLE_BLEND`: fixed `blended` pointer bug |
+| 2026-07-01 | Array bounds: PID storage wrapped to `COGGING_MAX_CALIB_PROFILES-1` |

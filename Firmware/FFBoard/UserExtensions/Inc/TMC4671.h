@@ -47,7 +47,7 @@
 //#define COGGING_BLEND
 //#define COGGING_PHASE_SHIFT_CAL
 #define COGGING_PHASE_SHIFT_MULTIRPM
-#define COGGING_DISABLE_SCALE_CURVE       // no RPM-dependent amplitude scaling
+//#define COGGING_DISABLE_SCALE_CURVE       // no RPM-dependent amplitude scaling
 #define COGGING_DISABLE_BLEND             // use only base harmonic table, no blending
 #endif
 
