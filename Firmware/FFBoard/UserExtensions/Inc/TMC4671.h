@@ -45,7 +45,10 @@
 //#define COGGING_CALIB_ENABLE_ID_DIAG            // Enable Point 1 diagnostic (Id axis analysis)
 #define COGGING_DFT_USE_IQ_CMD                  //comment out to use adc iq
 //#define COGGING_BLEND
-#define COGGING_PHASE_SHIFT_CAL
+//#define COGGING_PHASE_SHIFT_CAL
+#define COGGING_PHASE_SHIFT_MULTIRPM
+#define COGGING_DISABLE_SCALE_CURVE       // no RPM-dependent amplitude scaling
+#define COGGING_DISABLE_BLEND             // use only base harmonic table, no blending
 #endif
 
 extern SPI_HandleTypeDef HSPIDRV;
@@ -840,7 +843,7 @@ private:
 	static constexpr uint8_t SCALE_CURVE_POINTS = 24;
 	// RPM breakpoints shared by the scale curve and the phase-advance curve.
 	// Writable so COGGING_PHASE_SHIFT_METHOD calibration can store measured RPMs.
-	float scale_curve_rpm_points[SCALE_CURVE_POINTS] = {0,5,7,10,12,15,20,25,30,35,40,50,60,70,80,90,100,120,140,160,180,200,225,256};
+	float scale_curve_rpm_points[SCALE_CURVE_POINTS] = {0,3,7,10,12,15,20,25,30,35,40,50,60,70,80,90,100,120,140,160,180,200,225,256};
 	float scale_curve_values[SCALE_CURVE_POINTS] = {};  // optimal cogging_scale at each RPM
 	uint8_t scale_curve_count = 0;      // number of calibrated points
 	bool scale_curve_valid = false;     // curve has been calibrated
@@ -884,7 +887,7 @@ private:
 	float coggingShape = 1.0f;  // waveshaping factor (1.0 = linear)
 	// Multi-RPM calibration profile variables (configurable from configurator)
 	static constexpr uint8_t COGGING_MAX_CALIB_PROFILES = 5;
-	uint8_t cogging_calib_count = 3;
+	uint8_t cogging_calib_count = 1;
 	float cogging_calib_rpm[COGGING_MAX_CALIB_PROFILES] = {3.0f, 10.0f, 20.0f, 0.0f, 0.0f};
 	uint16_t cogging_calib_iters[COGGING_MAX_CALIB_PROFILES] = {1, 1, 1, 0, 0};
 	uint32_t cogging_calib_pidP[COGGING_MAX_CALIB_PROFILES] = {0, 0, 0, 0, 0};
