@@ -3000,6 +3000,7 @@ void TMC4671::registerCommands(){
 	registerCommand("coggingCalibPidD", TMC4671_commands::coggingCalibPidD, "Get/Set manual D gain per calibration profile (adr=idx, val=PID*1000)",CMDFLAG_GETADR | CMDFLAG_SETADR);
 	registerCommand("coggingCalibAutoPid", TMC4671_commands::coggingCalibAutoPid, "Get/Set auto PID tune flag (1=auto, 0=manual)",CMDFLAG_GET | CMDFLAG_SET);
 	registerCommand("coggingCalibInertiaCorr", TMC4671_commands::coggingCalibInertiaCorr, "Get/Set inertia acceleration correction during DFT (1=on,0=off)",CMDFLAG_GET | CMDFLAG_SET);
+	registerCommand("coggingCalibFrictionFF", TMC4671_commands::coggingCalibFrictionFF, "Get/Set friction feedforward during DFT (1=on,0=off)",CMDFLAG_GET | CMDFLAG_SET);
 #endif
 }
 
@@ -3655,6 +3656,14 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			this->cogging_calib_inertiaCorr = (cmd.val != 0);
 		}
 		break;
+
+	case TMC4671_commands::coggingCalibFrictionFF:
+		if(cmd.type == CMDtype::get){
+			replies.emplace_back(this->cogging_calib_frictionFF ? 1 : 0);
+		} else if(cmd.type == CMDtype::set){
+			this->cogging_calib_frictionFF = (cmd.val != 0);
+		}
+		break;
 #endif
 
 		default:
@@ -4231,7 +4240,7 @@ void TMC4671::handleStateCoggingCalibration() {
 			float actual_pos_turns,
 			float error_turns,
 			float iq_pid,
-			float iq_friction,
+			//float iq_friction,
 			float iq_inertia,
 			float iq_compensation,
 			float iq_cmd,
@@ -4325,7 +4334,15 @@ void TMC4671::handleStateCoggingCalibration() {
 		float tuning_torque = starting_torque;
 		float dynamic_friction = 0.0f;
 
-		uint32_t enc_cpr = this->getCpr();
+	// Unified friction feedforward: sign(velocity) × dynamic_friction × 0.5
+	// Callers pass whatever velocity they have (RPM, turns/s, etc.) — only sign matters.
+	auto calcFrictionFF = [&](float vel) -> float {
+		if (vel > 0.0f) return dynamic_friction * 0.5f;
+		if (vel < 0.0f) return -dynamic_friction * 0.5f;
+		return 0.0f;
+	};
+
+	uint32_t enc_cpr = this->getCpr();
 		uint32_t enc_decimation_ratio = 1;
 		float resolution_penalty = 1.0f;
 		float calib_rpm = 60.0f / (float)COGGING_CALIB_TIME_PER_REV_S;
@@ -4394,11 +4411,11 @@ void TMC4671::handleStateCoggingCalibration() {
 					float actual_pos_turns = getAbsolutePosition();
 					float err = target_pos_turns - actual_pos_turns;
 					float iq_pid = arm_pid_f32(&pid_soft, err);
-					float iq_ff = dynamic_friction * 1.0f;
-					float iq_cmd = clip<float,float>(iq_pid + iq_ff, -max_test_torque, max_test_torque);
+			float iq_ff = this->cogging_calib_frictionFF ? calcFrictionFF(calib_rpm) : 0.0f;
+			float iq_cmd = clip<float,float>(iq_pid + iq_ff, -max_test_torque, max_test_torque);
 
-					captureDebug(phase, calib_rpm, target_pos_turns, actual_pos_turns, err, iq_pid, iq_ff, 0.0f, 0.0f, iq_cmd, iq_cmd, 0.0f, 0.0f, J, B, dynamic_friction);
-					applySafeTorque(iq_cmd);
+				captureDebug(phase, calib_rpm, target_pos_turns, actual_pos_turns, err, iq_pid, 0.0f, 0.0f, iq_cmd, iq_cmd, 0.0f, 0.0f, J, B, dynamic_friction);
+				applySafeTorque(iq_cmd);
 
 					if (HAL_GetTick() - eval_start >= warmup_ms) {
 						float wrapped_pos = actual_pos_turns - (float)((int32_t)actual_pos_turns);
@@ -4905,11 +4922,9 @@ void TMC4671::handleStateCoggingCalibration() {
 
 						float iq_pid = arm_pid_f32(&pid_soft, err);
 						// Add slight friction feedforward to help tracking without altering tuning dynamics
-						float iq_ff = (current_vel_turns > 0.0f) ? dynamic_friction * 0.5f : ((current_vel_turns < 0.0f) ? -dynamic_friction * 0.5f : 0.0f);
-
-						float iq_cmd = clip<float,float>(iq_pid + iq_ff, -max_test_torque, max_test_torque);
-						applySafeTorque(iq_cmd);
-
+					float iq_ff = this->cogging_calib_frictionFF ? calcFrictionFF(current_vel_turns) : 0.0f;
+				float iq_cmd = clip<float,float>(iq_pid + iq_ff, -max_test_torque, max_test_torque);
+				applySafeTorque(iq_cmd);
 						// ONLY measure error during the Cruise phase (ignores accel/decel transients)
 						if (phase == 1) {
 							if (err_deg > max_err_deg) max_err_deg = err_deg;
@@ -5217,32 +5232,20 @@ void TMC4671::handleStateCoggingCalibration() {
 								
 								prev_actual_pos_f = actual_pos_f;
 								prev_vel_turns = current_vel_turns;
-								
-								iq_inertia = (J / 100.0f) * current_accel_rad;
+
 								if (this->cogging_calib_inertiaCorr) {
-									// Light inertia FF: 15% of max torque cap.
-									// The PID does the heavy lifting; this just
-									// reduces its burden during acceleration.
-									// Higher values amplify encoder quantization
-									// noise (1-count jitter → spurious accel).
-									float capped = clip<float>(iq_inertia,
-										-max_test_torque * 0.15f, max_test_torque * 0.15f);
-									iq_pid += capped;
+								iq_inertia = (J / 100.0f) * current_accel_rad;
 								}
-								// Friction FF scaled down: dynamic_friction was measured at 30 RPM,
-								// but calib_rpm is much slower (3-12 RPM). Using full value over-compensates
-								// and creates a DC bias in position error that flips with direction.
-								// 0.5x is a conservative estimate; integrator handles the rest.
-								float iq_ff = (ramp_vel_turns > 0) ? dynamic_friction * 0.1f : -dynamic_friction * 0.1f;
+							float iq_ff = this->cogging_calib_frictionFF ? calcFrictionFF(ramp_vel_turns) : 0.0f;
 								iq_cmd = iq_pid + iq_ff;
 
-								if (HAL_GetTick() - calibStartTime > cogging_warmup_ms) {
-									// EMA-filtered error rejects single-sample glitches
-									// (e.g. encoder SPI glitch that would otherwise spike max_err_seen 100x)
-									ema_err = ema_err * 0.8f + fabsf(error) * 0.2f;
-									if (ema_err > max_err_seen) max_err_seen = ema_err;
-									if (fabs(iq_cmd) > max_iq_cmd_used) max_iq_cmd_used = fabs(iq_cmd);
-								}
+							if (HAL_GetTick() - calibStartTime > cogging_warmup_ms) {
+								// EMA-filtered error rejects single-sample glitches
+								// (e.g. encoder SPI glitch that would otherwise spike max_err_seen 100x)
+								ema_err = ema_err * 0.8f + fabsf(error) * 0.2f;
+								if (ema_err > max_err_seen) max_err_seen = ema_err;
+								if (fabs(iq_cmd) > max_iq_cmd_used) max_iq_cmd_used = fabs(iq_cmd);
+							}
 								
 								// Cogging feed-forward from THIS profile's table (active_tbl). It is
 								// empty on iteration 0 (so the full cogging is measured), then on
@@ -5264,11 +5267,12 @@ void TMC4671::handleStateCoggingCalibration() {
 								if (fabsf(iq_applied) >= max_test_torque * 0.99f) {
 									dft_clamped = true;
 								}
+								
 #ifndef COGGING_DFT_USE_IQ_CMD
 								actual_iq_raw = getActualTorque();
 								dbg.actualIq = actual_iq_raw;
 #endif
-								captureDebug(TMC4671CoggingDebugPhase::Acquisition, target_rpm, target_pos_f, actual_pos_f, error, iq_pid, iq_ff, iq_inertia, this->cogging_scale * cog_comp, iq_cmd, iq_applied, current_vel_turns, current_accel_rad, J, B, dynamic_friction);
+								captureDebug(TMC4671CoggingDebugPhase::Acquisition, target_rpm, target_pos_f, actual_pos_f, error, iq_pid, iq_inertia, this->cogging_scale * cog_comp, iq_cmd, iq_applied, current_vel_turns, current_accel_rad, J, B, dynamic_friction);
 								applySafeTorque(iq_applied);
 							}
 							
@@ -5285,6 +5289,11 @@ void TMC4671::handleStateCoggingCalibration() {
 								// iq_cmd        = PID + friction only (residual cogging, for phasor-add)
 #ifdef COGGING_DFT_USE_IQ_CMD
 								float iq = iq_cmd;
+								if (this->cogging_calib_inertiaCorr) {
+									// Subtract inertia from DFT signal to isolate
+									// pure cogging. Motor still gets inertia via iq_pid.
+									iq -= iq_inertia;
+								}
 #else
 								float iq = (float)actual_iq_raw;
 								if (this->cogging_calib_inertiaCorr) {
@@ -5954,8 +5963,8 @@ void TMC4671::handleStateCoggingCalibration() {
 					
 					// Calculate torque via the CMSIS PID
 					float iq_pid = arm_pid_f32(&pid_soft, error);
-					float iq_ff = (target_rpm > 0) ? dynamic_friction * 0.5f : -dynamic_friction * 0.5f;
-					float iq_cmd = iq_pid + iq_ff;
+				float iq_ff = this->cogging_calib_frictionFF ? calcFrictionFF(target_rpm) : 0.0f;
+				float iq_cmd = iq_pid + iq_ff;
 					
 					// Anti-cogging compensation (uses table extracted by DFT)
 					float cog_comp = 0.0f;
@@ -5978,7 +5987,7 @@ void TMC4671::handleStateCoggingCalibration() {
 						ret_clamped = true;
 					}
 					
-					captureDebug(TMC4671CoggingDebugPhase::ReturnToCenter, target_rpm, target_pos_f, actual_pos_f, error, iq_pid, iq_ff, 0.0f, cog_comp, iq_cmd, iq_applied, 0.0f, 0.0f, J, B, dynamic_friction);
+					captureDebug(TMC4671CoggingDebugPhase::ReturnToCenter, target_rpm, target_pos_f, actual_pos_f, error, iq_pid, 0.0f, cog_comp, iq_cmd, iq_applied, 0.0f, 0.0f, J, B, dynamic_friction);
 					applySafeTorque(iq_applied);
 					
 					refreshWatchdog();

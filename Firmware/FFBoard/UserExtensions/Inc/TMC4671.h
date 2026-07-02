@@ -492,7 +492,8 @@ coggingCwCcw, coggingSave, coggingShape, coggingSpeedD, scaleCurve, phaseAdvCurv
 coggingHarmonicsRpm2, coggingBlendRpm2, coggingRpm2Valid,
 coggingHarmonicsRpm3, coggingBlendRpm3, coggingRpm3Valid,
 coggingCalibCount, coggingCalibRPM, coggingCalibIters, coggingCalibPidP, coggingCalibPidI, coggingCalibPidD, coggingCalibAutoPid,
-coggingCalibInertiaCorr
+coggingCalibInertiaCorr,
+coggingCalibFrictionFF
 #endif
 	};
 
@@ -895,6 +896,7 @@ private:
 	uint32_t cogging_calib_pidD[COGGING_MAX_CALIB_PROFILES] = {0, 0, 0, 0, 0};
 	bool cogging_calib_autoPid = true;
 	bool cogging_calib_inertiaCorr;  // Inertia acceleration correction during DFT
+	bool cogging_calib_frictionFF = false; // Friction feedforward during DFT
 	void handleStateCoggingCalibration();
 	void blendHarmonicTables(float rpm, Harmonic* out_table);
 #endif
