@@ -42,11 +42,12 @@
 #define COGGING_CALIB_LUT_RESOLUTION    2880 	// Resolution for legacy protocol communication
 #define COGGING_CALIB_TIME_PER_REV_S    20 	 	// Time in seconds to complete one revolution (8s = 7.5 RPM)
 #define COGGING_CALIB_DFT_HARMONICS     128     // Number of harmonics to analyze during calibration
+#define COGGING_DFT_BIN_COUNT           720     // Spatial bin count for noise-robust DFT (0.5 deg per bin)
 //#define COGGING_CALIB_ENABLE_ID_DIAG            // Enable Point 1 diagnostic (Id axis analysis)
 #define COGGING_DFT_USE_IQ_CMD                  //comment out to use adc iq
 //#define COGGING_BLEND
 //#define COGGING_PHASE_SHIFT_CAL
-#define COGGING_PHASE_SHIFT_MULTIRPM
+//#define COGGING_PHASE_SHIFT_MULTIRPM
 //#define COGGING_DISABLE_SCALE_CURVE       // no RPM-dependent amplitude scaling
 #define COGGING_DISABLE_BLEND             // use only base harmonic table, no blending
 #endif
@@ -121,7 +122,7 @@ struct TMC4671CoggingDebugVars {
 	float iqCompensation = 0.0f;
 	float iqCmd = 0.0f;
 	float Appliediq = 0.0f;
-	float currentVelTurns = 0.0f;
+	float angle = 0.0f;  // actual angle in degrees (0-360)
 	float currentAccelRad = 0.0f;
 	float dynamicFriction = 0.0f;
 	int32_t actualIq = 0;
@@ -493,7 +494,9 @@ coggingHarmonicsRpm2, coggingBlendRpm2, coggingRpm2Valid,
 coggingHarmonicsRpm3, coggingBlendRpm3, coggingRpm3Valid,
 coggingCalibCount, coggingCalibRPM, coggingCalibIters, coggingCalibPidP, coggingCalibPidI, coggingCalibPidD, coggingCalibAutoPid,
 coggingCalibInertiaCorr,
-coggingCalibFrictionFF
+coggingCalibFrictionFF,
+coggingBins,
+coggingFFMode
 #endif
 	};
 
@@ -819,6 +822,30 @@ private:
 	Harmonic cw_store[COGGING_HARMONICS_COUNT];
 	Harmonic ccw_store[COGGING_HARMONICS_COUNT];
 	bool cwccw_data_valid = false;
+
+	// Spatial bin snapshots for configurator readout.
+	// Store per-bin MEAN iq (not sum/count) so the configurator can plot the
+	// clean iq(theta) function that the DFT actually operated on.
+	float cw_bins[COGGING_DFT_BIN_COUNT] = {};
+	float ccw_bins[COGGING_DFT_BIN_COUNT] = {};
+	float ver_cw_bins[COGGING_DFT_BIN_COUNT] = {};
+	float ver_ccw_bins[COGGING_DFT_BIN_COUNT] = {};
+	// Verification residual DFT top-20 per direction (same layout as Harmonic).
+	Harmonic ver_cw_top[20] = {};
+	Harmonic ver_ccw_top[20] = {};
+	bool bins_data_valid = false;
+
+	// Runtime FF mode selector (set via coggingFFMode command).
+	//   0 = harmonic sum from cogging_harmonics[] (default, legacy)
+	//   1 = combined bin LUT: (cw_bins + ccw_bins) / 2  (friction-free, pure cogging)
+	//   2 = per-direction bin LUT: cw_bins when omega>=0, ccw_bins when omega<0
+	//       (includes direction-dependent friction/hysteresis; needs zero-vel deadband)
+	uint8_t cogging_ff_mode = 0;
+	// Precomputed combined LUT (mode 1) — built once after calibration.
+	float cogging_bins_combined[COGGING_DFT_BIN_COUNT] = {};
+	// Last rotation direction for per-direction mode (mode 2) zero-vel deadband.
+	int8_t cogging_last_dir = 1;
+	// (measured_rpm_signed is declared above with the phase-advance fields.)
 
 	// Offset controls for configurator-side CW/CCW tuning
 	float last_cogging_scale = 0.0f;  // current active anti-cogging scale (1.0 = nominal)

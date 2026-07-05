@@ -1847,42 +1847,86 @@ void TMC4671::turn(int16_t power){
 
 		float angle_rad = pos_f * 2.0f * PI;
 
-		// 1. Find the dominant harmonic (largest amplitude)
-		float dom_amp = 0.0f, dom_phase = 0.0f;
-		uint16_t dom_order = 1;
-		for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
-			if (blended[i].amplitude > dom_amp) {
-				dom_amp = blended[i].amplitude;
-				dom_order = (uint16_t)blended[i].order;
-				dom_phase = blended[i].phase;
+		// --- FF source selection (cogging_ff_mode) ---
+		//   0 = harmonic sum (default, legacy)
+		//   1 = combined bin LUT (friction-free, pure cogging)
+		//   2 = per-direction bin LUT (includes friction asymmetry / hysteresis)
+		float compensation = 0.0f;
+		bool using_bins = (this->cogging_ff_mode != 0) && this->bins_data_valid;
+
+		if (using_bins) {
+			// Pick which bin array to read from.
+			const float* bin_src = nullptr;
+			if (this->cogging_ff_mode == 1) {
+				bin_src = this->cogging_bins_combined;
+			} else { // mode 2: per-direction
+				// Zero-velocity deadband: below this |omega|, hold the last-used
+				// direction to avoid the FF flipping and creating a torque step.
+				// The deadband is intentionally tiny (0.05 RPM) so it only bites
+				// at true standstill.
+				if (fabsf(signed_rpm) < 0.05f) {
+					bin_src = (this->cogging_last_dir >= 0) ? this->cw_bins : this->ccw_bins;
+				} else {
+					if (signed_rpm >= 0.0f) {
+						bin_src = this->cw_bins;
+						this->cogging_last_dir = +1;
+					} else {
+						bin_src = this->ccw_bins;
+						this->cogging_last_dir = -1;
+					}
+				}
 			}
-		}
+			// Linear interpolation between bin centers.
+			// pos_f is in [0,1), so pos_scaled spans [0, BIN_COUNT).
+			float pos_scaled = pos_f * (float)COGGING_DFT_BIN_COUNT;
+			uint32_t b0 = (uint32_t)pos_scaled;
+			float frac = pos_scaled - (float)b0;
+			if (b0 >= COGGING_DFT_BIN_COUNT) b0 = COGGING_DFT_BIN_COUNT - 1;
+			uint32_t b1 = b0 + 1;
+			if (b1 >= COGGING_DFT_BIN_COUNT) b1 = 0; // wrap (position is cyclic)
+			compensation = bin_src[b0] * (1.0f - frac) + bin_src[b1] * frac;
+			// NOTE: bin values are iq_cmd means captured during calibration.
+			// During calibration the controller drove iq_cmd = -T_cog (to hold
+			// constant speed), so the stored value IS the FF we want to inject
+			// to cancel cogging. No sign flip needed.
+		} else {
+			// Legacy harmonic-sum path (modes 0 or no bins available).
+			// 1. Find the dominant harmonic (largest amplitude)
+			float dom_amp = 0.0f, dom_phase = 0.0f;
+			uint16_t dom_order = 1;
+			for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
+				if (blended[i].amplitude > dom_amp) {
+					dom_amp = blended[i].amplitude;
+					dom_order = (uint16_t)blended[i].order;
+					dom_phase = blended[i].phase;
+				}
+			}
 
-		// 2. Calculate Compensation
-		float compensation = 0;
-		for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
-			if (blended[i].amplitude > 0.0f) {
-				float electrical_advance = 0.0f;
+			// 2. Calculate Compensation
+			for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
+				if (blended[i].amplitude > 0.0f) {
+					float electrical_advance = 0.0f;
 
-			// Apply phase advance to the dominant harmonic, its 2nd
-			// multiple (e.g. H12 → H24), and any lower fundamentals.
-			// Higher multiples and texture harmonics remain anchored to
-			// their physical spatial locations.
-			if (blended[i].order <= dom_order || (dom_order > 0 && blended[i].order == dom_order * 2)) {
+				// Apply phase advance to the dominant harmonic, its 2nd
+				// multiple (e.g. H12 → H24), and any lower fundamentals.
+				// Higher multiples and texture harmonics remain anchored to
+				// their physical spatial locations.
+				if (blended[i].order <= dom_order || (dom_order > 0 && blended[i].order == dom_order * 2)) {
 					electrical_advance = (float)blended[i].order * adv_mech_rad;
 				}
 
 				compensation += blended[i].amplitude * arm_sin_f32(
 					angle_rad * blended[i].order + blended[i].phase + electrical_advance);
+				}
 			}
-		}
 
-		// 3. Cogging waveshaping ("3rd harmonic" trim)
-		if (h3_shaping != 0.0f && dom_amp > 0.0f) {
-			// Apply the advance to the waveshaper too, since it tracks the dominant wave.
-			float dom_elec_adv = (float)dom_order * adv_mech_rad;
-			float shaped_arg = this->h3_mult * ((float)dom_order * angle_rad + dom_phase + dom_elec_adv) + this->h3_phase_trim;
-			compensation -= this->h3_shaping * dom_amp * arm_sin_f32(shaped_arg);
+			// 3. Cogging waveshaping ("3rd harmonic" trim)
+			if (h3_shaping != 0.0f && dom_amp > 0.0f) {
+				// Apply the advance to the waveshaper too, since it tracks the dominant wave.
+				float dom_elec_adv = (float)dom_order * adv_mech_rad;
+				float shaped_arg = this->h3_mult * ((float)dom_order * angle_rad + dom_phase + dom_elec_adv) + this->h3_phase_trim;
+				compensation -= this->h3_shaping * dom_amp * arm_sin_f32(shaped_arg);
+			}
 		}
 		// Speed-dependent scale: interpolate from calibrated curve if available
 		float dyn_scale = this->cogging_scale;
@@ -3001,6 +3045,8 @@ void TMC4671::registerCommands(){
 	registerCommand("coggingCalibAutoPid", TMC4671_commands::coggingCalibAutoPid, "Get/Set auto PID tune flag (1=auto, 0=manual)",CMDFLAG_GET | CMDFLAG_SET);
 	registerCommand("coggingCalibInertiaCorr", TMC4671_commands::coggingCalibInertiaCorr, "Get/Set inertia acceleration correction during DFT (1=on,0=off)",CMDFLAG_GET | CMDFLAG_SET);
 	registerCommand("coggingCalibFrictionFF", TMC4671_commands::coggingCalibFrictionFF, "Get/Set friction feedforward during DFT (1=on,0=off)",CMDFLAG_GET | CMDFLAG_SET);
+	registerCommand("coggingBins", TMC4671_commands::coggingBins, "Get spatial bin snapshots (adr 0=CW 1=CCW 2=verCW 3=verCCW 4=verCWharm 5=verCCWharm)",CMDFLAG_GET | CMDFLAG_GETADR);
+	registerCommand("coggingFFMode", TMC4671_commands::coggingFFMode, "FF source: 0=harmonics 1=combined bins 2=per-direction bins",CMDFLAG_GET | CMDFLAG_SET);
 #endif
 }
 
@@ -3480,6 +3526,9 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 	case TMC4671_commands::coggingH3:
 		// Cogging waveshaping. adr/index 0 = shaping (*1000, signed),
 		// 1 = phase trim (millirad, signed), 2 = mult (1..31).
+		// adr=3: clear harmonic table (val: 0=base, 1=rpm2, 2=rpm3).
+		// adr=4: set harmonic (val = slot<<24 | order<<16 | amplitude).
+		// adr=5: set harmonic phase (val = slot<<24 | phase_mrad).
 		if (cmd.type == CMDtype::get) {
 			std::string s;
 			s += std::to_string((int16_t)(this->h3_shaping * 1000.0f)) + ":";
@@ -3495,6 +3544,31 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			} else if (idx == 2) {
 				uint16_t m = (uint16_t)cmd.val;
 				if (m >= 1 && m <= 31) this->h3_mult = m;
+			} else if (idx == 3) {
+				// Clear harmonic table
+				uint8_t table_idx = (uint8_t)cmd.val;
+				Harmonic* tbl = cogging_harmonics;
+				if (table_idx == 1) { tbl = cogging_harmonics_rpm2; rpm2_table_valid = false; }
+				if (table_idx == 2) { tbl = cogging_harmonics_rpm3; rpm3_table_valid = false; }
+				memset(tbl, 0, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
+			} else if (idx == 4) {
+				// Set harmonic amplitude+order: slot<<24 | order<<16 | amplitude
+				uint8_t slot = (uint8_t)((cmd.val >> 24) & 0xFF);
+				uint16_t order = (uint16_t)((cmd.val >> 16) & 0xFF);
+				int16_t amp = (int16_t)(cmd.val & 0xFFFF);
+				// Write to base table only (extend later if needed)
+				if (slot < COGGING_HARMONICS_COUNT && order > 0) {
+					cogging_harmonics[slot].order = order;
+					cogging_harmonics[slot].amplitude = (float)amp;
+					// keep existing phase if any
+				}
+			} else if (idx == 5) {
+				// Set harmonic phase: slot<<24 | phase_mrad
+				uint8_t slot = (uint8_t)((cmd.val >> 24) & 0xFF);
+				int16_t phase_mrad = (int16_t)(cmd.val & 0xFFFF);
+				if (slot < COGGING_HARMONICS_COUNT) {
+					cogging_harmonics[slot].phase = (float)phase_mrad / 1000.0f;
+				}
 			}
 		}
 		break;
@@ -3662,6 +3736,93 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			replies.emplace_back(this->cogging_calib_frictionFF ? 1 : 0);
 		} else if(cmd.type == CMDtype::set){
 			this->cogging_calib_frictionFF = (cmd.val != 0);
+		}
+		break;
+
+	case TMC4671_commands::coggingBins:
+		// Chunked spatial-bin readout for the configurator.
+		// adr: 0=CW bins, 1=CCW bins, 2=verCW bins, 3=verCCW bins,
+		//      4=verCW top-20 DFT, 5=verCCW top-20 DFT.
+		// Bins are sent as "B<adr>:item:<offset>,data:(v0,v1,...)" chunks of ~80
+		// values so each reply stays well under the serial line limit. The
+		// configurator routes chunks by the B<adr>: prefix.
+		// Top-20 DFT uses "B<adr>:order:amp:phase,...".
+		if(cmd.type == CMDtype::getat || cmd.type == CMDtype::get){
+			if(!this->bins_data_valid){
+				CommandHandler::broadcastCommandReply(CommandReply("NOBINS", cmd.adr),
+					(uint32_t)TMC4671_commands::coggingBins, CMDtype::get);
+				return CommandStatus::NO_REPLY;
+			}
+			uint8_t adr = (uint8_t)cmd.adr;
+			if(adr <= 3){
+				// Bin array readout — chunked.
+				const float* src = nullptr;
+				switch(adr){
+					case 0: src = this->cw_bins; break;
+					case 1: src = this->ccw_bins; break;
+					case 2: src = this->ver_cw_bins; break;
+					case 3: src = this->ver_ccw_bins; break;
+				}
+				const uint32_t CHUNK = 80;
+				for(uint32_t off = 0; off < COGGING_DFT_BIN_COUNT; off += CHUNK){
+					std::string s = "B";
+					s += std::to_string(adr);
+					s += ":item:";
+					s += std::to_string(off);
+					s += ",data:(";
+					uint32_t end = off + CHUNK;
+					if(end > COGGING_DFT_BIN_COUNT) end = COGGING_DFT_BIN_COUNT;
+					for(uint32_t i = off; i < end; i++){
+						if(i > off) s += ",";
+						// Round to int16 to keep payload compact; bin means are
+						// torque units in the thousands, so 1-unit resolution is fine.
+						s += std::to_string((int16_t)src[i]);
+					}
+					s += ")";
+					CommandHandler::broadcastCommandReply(CommandReply(s, adr),
+						(uint32_t)TMC4671_commands::coggingBins, CMDtype::get);
+				}
+			} else if(adr == 4 || adr == 5){
+				// Verification top-20 DFT readout
+				const Harmonic* src = (adr == 4) ? this->ver_cw_top : this->ver_ccw_top;
+				std::string s = "B";
+				s += std::to_string(adr);
+				s += ":";
+				bool any = false;
+				for(int n = 0; n < 20; n++){
+					if(src[n].order == 0 && src[n].amplitude <= 0.0f) continue;
+					if(any) s += ",";
+					any = true;
+					s += std::to_string(src[n].order) + ":";
+					s += std::to_string((int16_t)src[n].amplitude) + ":";
+					s += std::to_string((int16_t)(src[n].phase * 1000.0f));
+				}
+				if(!any) s += "0:0:0";
+				CommandHandler::broadcastCommandReply(CommandReply(s, adr),
+					(uint32_t)TMC4671_commands::coggingBins, CMDtype::get);
+			}
+			return CommandStatus::NO_REPLY;
+		}
+		break;
+
+	case TMC4671_commands::coggingFFMode:
+		// 0 = harmonic sum (default), 1 = combined bins, 2 = per-direction bins.
+		if (cmd.type == CMDtype::get) {
+			replies.emplace_back((uint32_t)this->cogging_ff_mode);
+		} else if (cmd.type == CMDtype::set) {
+			uint8_t m = (uint8_t)cmd.val;
+			if (m > 2) m = 0;
+			// Modes 1 and 2 require bins to be valid (calibration must have run).
+			// Do NOT push to replies from a SET branch (board-reboot gotcha) —
+			// use a broadcast tagged as calibrateCogging instead so it shows in
+			// the calibration log without faulting the command handler.
+			if (m != 0 && !this->bins_data_valid) {
+				CommandHandler::broadcastCommandReply(
+					CommandReply("(\"coggingFFMode: bins not available - run calibration first\",0)"),
+					(uint32_t)TMC4671_commands::calibrateCogging, CMDtype::get);
+				m = 0;
+			}
+			this->cogging_ff_mode = m;
 		}
 		break;
 #endif
@@ -4196,6 +4357,10 @@ void TMC4671::handleStateCoggingCalibration() {
 	const char* errorMessage = nullptr;
 	float* iq_acc_cos = nullptr;
 	float* iq_acc_sin = nullptr;
+	// Spatial-bin arrays for noise-robust DFT (see allocation block for rationale).
+	float* iq_bin_sum = nullptr;
+	uint16_t* iq_bin_count = nullptr;
+	// COGGING_DFT_BIN_COUNT now defined in TMC4671.h (720) — shared with member arrays.
 #ifdef COGGING_CALIB_ENABLE_ID_DIAG
 	float* id_acc_cos = nullptr;
 	float* id_acc_sin = nullptr;
@@ -4261,13 +4426,13 @@ void TMC4671::handleStateCoggingCalibration() {
 		dbg.lastCaptureDebugUs = now_us;
 		
 		dbg.positionErrorDeg = error_turns * 36000.0f; // ×10 scaled so sub-degree error is visible alongside mA-scale iqCmd
-		//dbg.iqPid = iq_pid;
-		//dbg.iqFriction = iq_friction;
-		//dbg.iqInertia = iq_inertia;
+		dbg.angle = actual_pos_turns * 360.0f; // actual angle in degrees (0-360)
 		dbg.iqCompensation = iq_compensation;
 		dbg.iqCmd = iq_cmd;
 		dbg.Appliediq = iq_applied;
-		//dbg.currentVelTurns = current_vel_turns;
+		//dbg.iqPid = iq_pid;
+		//dbg.iqFriction = iq_friction;
+		//dbg.iqInertia = iq_inertia;
 		//dbg.currentAccelRad = current_accel_rad;
 		//dbg.dynamicFriction = dynamic_friction;
 	};
@@ -4285,6 +4450,7 @@ void TMC4671::handleStateCoggingCalibration() {
 	
 	// Reset cogging table and scale/phase curves for fresh calibration
 	clearCoggingTable();
+	this->bins_data_valid = false;
 	scale_curve_valid = false;
 	phase_adv_curve_valid = false;
 	memset(scale_curve_values, 0, sizeof(scale_curve_values));
@@ -4303,14 +4469,26 @@ void TMC4671::handleStateCoggingCalibration() {
 	setBiquadFlux(curFilters.flux);
 	
 	// 1. ALLOCATE ACCUMULATORS
+	// The live time-domain DFT (cos/sin accumulation in the sweep loop) was
+	// biasing the stored FF high: with Kp in the millions, iq_cmd = Kp*pos_err
+	// oscillates ±hundreds of units around the true cogging mean, and that
+	// noise correlates with angle because cogging velocity ripple clusters
+	// samples at troughs. The DFT then traced the upper envelope of iq_cmd
+	// instead of its mean.
+	// Fix: bin samples by angle (0.5° resolution), average within each bin,
+	// then run a clean rectangular DFT on the per-bin mean. The per-bin
+	// average drives the position-correlated PID noise toward its local
+	// mean before the DFT sees it.
 	iq_acc_cos = (float*)pvPortMalloc(COGGING_CALIB_DFT_HARMONICS * sizeof(float));
 	iq_acc_sin = (float*)pvPortMalloc(COGGING_CALIB_DFT_HARMONICS * sizeof(float));
+	iq_bin_sum = (float*)pvPortMalloc(COGGING_DFT_BIN_COUNT * sizeof(float));
+	iq_bin_count = (uint16_t*)pvPortMalloc(COGGING_DFT_BIN_COUNT * sizeof(uint16_t));
 #ifdef COGGING_CALIB_ENABLE_ID_DIAG
 	id_acc_cos = (float*)pvPortMalloc(COGGING_CALIB_DFT_HARMONICS * sizeof(float));
 	id_acc_sin = (float*)pvPortMalloc(COGGING_CALIB_DFT_HARMONICS * sizeof(float));
 #endif
 	
-	if(!iq_acc_cos || !iq_acc_sin 
+	if(!iq_acc_cos || !iq_acc_sin || !iq_bin_sum || !iq_bin_count
 #ifdef COGGING_CALIB_ENABLE_ID_DIAG
 		|| !id_acc_cos || !id_acc_sin
 #endif
@@ -4321,6 +4499,8 @@ void TMC4671::handleStateCoggingCalibration() {
 
 	memset(iq_acc_cos, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
 	memset(iq_acc_sin, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
+	memset(iq_bin_sum, 0, COGGING_DFT_BIN_COUNT * sizeof(float));
+	memset(iq_bin_count, 0, COGGING_DFT_BIN_COUNT * sizeof(uint16_t));
 #ifdef COGGING_CALIB_ENABLE_ID_DIAG
 	memset(id_acc_cos, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
 	memset(id_acc_sin, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
@@ -4736,32 +4916,23 @@ void TMC4671::handleStateCoggingCalibration() {
 				const uint8_t MAX_DFT_ITERATIONS = 1;
 #else
 			for (uint8_t rpm_profile = 0;
-				 rpm_profile <= this->cogging_calib_count && !emergency && hasPower();
+				 rpm_profile < this->cogging_calib_count && !emergency && hasPower();
 				 rpm_profile++) {
 
-				bool is_return_tune = (rpm_profile == this->cogging_calib_count);
-				if (is_return_tune) {
-					calib_rpm = this->cogging_calib_rpm[this->cogging_calib_count - 1];
-					if (calib_rpm < 3.0f) calib_rpm = 20.0f;
-				} else {
-					calib_rpm = this->cogging_calib_rpm[rpm_profile];
-					if (calib_rpm <= 0.0f) calib_rpm = 60.0f / (float)COGGING_CALIB_TIME_PER_REV_S;
-				}
-
-				const uint8_t MAX_DFT_ITERATIONS = is_return_tune ? 0 : this->cogging_calib_iters[rpm_profile];
+				calib_rpm = this->cogging_calib_rpm[rpm_profile];
+				if (calib_rpm <= 0.0f) calib_rpm = 60.0f / (float)COGGING_CALIB_TIME_PER_REV_S;
+				const uint8_t MAX_DFT_ITERATIONS = this->cogging_calib_iters[rpm_profile];
 #endif
-				if (MAX_DFT_ITERATIONS < 1 && !is_return_tune) continue;
+				if (MAX_DFT_ITERATIONS < 1) continue;
 
 				// Recompute acquisition duration so each CW and CCW sweep
 				// is exactly 1 revolution, regardless of the RPM target.
 				const uint32_t rev_ms = (uint32_t)((60.0f / calib_rpm) * 1500.0f);
 				const uint32_t REVOLUTION_TIME_MS = rev_ms + cogging_warmup_ms;
 
-				if (!is_return_tune) {
 				broadcastCalibLog(0, "RPM profile %u/%u: target %.1f RPM, %u iterations (%.1f s/rev)",
 					rpm_profile + 1, this->cogging_calib_count, calib_rpm, MAX_DFT_ITERATIONS,
 					(float)REVOLUTION_TIME_MS / 1000.0f);
-				}
 
 			// Load per-profile PID.  Under MULTIRPM, wrap to the last
 			// configured profile slot for any profile beyond the array.
@@ -4775,10 +4946,9 @@ void TMC4671::handleStateCoggingCalibration() {
 				uint32_t pidI = this->cogging_calib_pidI[pid_src];
 				uint32_t pidD = this->cogging_calib_pidD[pid_src];
 				if (pid_src > 0 && pidP == 0 && pidI == 0 && pidD == 0) {
-					uint8_t src = is_return_tune ? (this->cogging_calib_count - 1) : 0;
-					pidP = this->cogging_calib_pidP[src];
-					pidI = this->cogging_calib_pidI[src];
-					pidD = this->cogging_calib_pidD[src];
+					pidP = this->cogging_calib_pidP[0];
+					pidI = this->cogging_calib_pidI[0];
+					pidD = this->cogging_calib_pidD[0];
 				}
 				this->coggingSpeedP = (float)pidP;
 				this->coggingSpeedI = (float)pidI;
@@ -5139,6 +5309,8 @@ void TMC4671::handleStateCoggingCalibration() {
 					// Clear accumulators per direction so CW and CCW DFTs don't mix
 					memset(iq_acc_cos, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
 					memset(iq_acc_sin, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
+					memset(iq_bin_sum, 0, COGGING_DFT_BIN_COUNT * sizeof(float));
+					memset(iq_bin_count, 0, COGGING_DFT_BIN_COUNT * sizeof(uint16_t));
 #ifdef COGGING_CALIB_ENABLE_ID_DIAG
 					memset(id_acc_cos, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
 					memset(id_acc_sin, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
@@ -5170,7 +5342,7 @@ void TMC4671::handleStateCoggingCalibration() {
 						float dt_sec = (float)period_us / 1000000.0f;
 						
 						float prev_actual_pos_f = getFilteredPosition();
-						float prev_vel_turns = 0.0f; // start from rest
+						float prev_vel_turns = target_rpm / 60.0f; // start at steady-state to avoid accel spike
 						float full_vel_turns = target_rpm / 60.0f;
 						float ramp_vel_turns = 0.0f; // ramped velocity
 						// Ramp-up time equals warmup: accelerate smoothly from 0 to target
@@ -5179,7 +5351,7 @@ void TMC4671::handleStateCoggingCalibration() {
 						uint32_t enc_decimation_counter = 0;
 						// DFT decimation: keep DFT accumulation ≤ ~4 kHz to prevent
 						// 32-bit float overflow
-						uint32_t dft_decimation_ratio = 4;
+						uint32_t dft_decimation_ratio = 2;
 						uint32_t dft_decimation_counter = 0;
 						float iq_cmd = 0.0f;
 						float iq_inertia = 0.0f;
@@ -5290,22 +5462,27 @@ void TMC4671::handleStateCoggingCalibration() {
 #endif
 #ifdef COGGING_CALIB_ENABLE_ID_DIAG
 								float id = (float)getActualFlux();
-#endif
+								// Legacy time-domain DFT kept for ID diagnostic only.
 								float s1, c1;
 								arm_sin_cos_f32(actual_pos_f * 360.0f, &s1, &c1);
-
 								float cur_s = s1, cur_c = c1;
 								for (int k = 1; k < COGGING_CALIB_DFT_HARMONICS; k++) {
-									iq_acc_cos[k] += (iq * cur_c);
-									iq_acc_sin[k] += (iq * cur_s);
-#ifdef COGGING_CALIB_ENABLE_ID_DIAG
 									id_acc_cos[k] += (id * cur_c);
 									id_acc_sin[k] += (id * cur_s);
-#endif
 									float next_c = cur_c * c1 - cur_s * s1;
 									float next_s = cur_c * s1 + cur_s * c1;
 									cur_c = next_c; cur_s = next_s;
 								}
+#endif
+								// Spatial binning of iq: accumulate per 0.5° angular bin.
+								// The per-bin average (computed in the extraction phase)
+								// rejects the Kp*pos_error noise that was biasing the
+								// old time-domain iq DFT high (it was tracing the
+								// upper envelope of iq_cmd instead of its mean).
+								uint32_t bin = (uint32_t)(actual_pos_f * (float)COGGING_DFT_BIN_COUNT);
+								if (bin >= COGGING_DFT_BIN_COUNT) bin = COGGING_DFT_BIN_COUNT - 1;
+								iq_bin_sum[bin] += iq;
+								if (iq_bin_count[bin] != 0xFFFF) iq_bin_count[bin]++;
 								dir_samples++;
 							}
 						}
@@ -5328,12 +5505,35 @@ void TMC4671::handleStateCoggingCalibration() {
 						iter_max_err_deg = max_err_seen * 360.0f;
 					}
 
-					// Extract per-direction harmonics immediately after this sweep
+					// Extract per-direction harmonics via binned DFT.
+					// Compute the mean iq per 0.5° bin, then run a rectangular
+					// DFT on that clean iq(theta) function. Phase reference is
+					// the bin center (b+0.5)/N, matching the sample-by-sample
+					// DFT's angle reference (each sample's actual_pos_f).
 					if (dir_samples > 0) {
-						float norm = 2.0f / (float)dir_samples;
+						float norm = 2.0f / (float)COGGING_DFT_BIN_COUNT;
 						for (int k = 1; k < COGGING_CALIB_DFT_HARMONICS; k++) {
-							float re = iq_acc_cos[k] * norm;
-							float im = iq_acc_sin[k] * norm;
+							float re = 0.0f, im = 0.0f;
+							// Starting angle = bin-0 center angle for harmonic k
+							// = (0.5 / N) * 2*pi * k = 180 * k / N degrees
+							float s_start, c_start;
+							arm_sin_cos_f32((float)k * 180.0f / (float)COGGING_DFT_BIN_COUNT, &s_start, &c_start);
+							// Per-bin angle increment for harmonic k = 360 * k / N degrees
+							float s1, c1;
+							arm_sin_cos_f32((float)k * 360.0f / (float)COGGING_DFT_BIN_COUNT, &s1, &c1);
+							float cur_s = s_start, cur_c = c_start;
+							for (uint32_t b = 0; b < COGGING_DFT_BIN_COUNT; b++) {
+								if (iq_bin_count[b] > 0) {
+									float mean = iq_bin_sum[b] / (float)iq_bin_count[b];
+									re += mean * cur_c;
+									im += mean * cur_s;
+								}
+								float next_c = cur_c * c1 - cur_s * s1;
+								float next_s = cur_c * s1 + cur_s * c1;
+								cur_c = next_c; cur_s = next_s;
+							}
+							re *= norm;
+							im *= norm;
 							if (p == 1) { // CW
 								cw_harms[k].mag = sqrtf(re*re + im*im);
 								cw_harms[k].phase = atan2f(re, im);
@@ -5341,6 +5541,12 @@ void TMC4671::handleStateCoggingCalibration() {
 								ccw_harms[k].mag = sqrtf(re*re + im*im);
 								ccw_harms[k].phase = atan2f(re, im);
 							}
+						}
+						// Snapshot per-bin mean for configurator readout.
+						{
+							float* dst = (p == 1) ? this->cw_bins : this->ccw_bins;
+							for (uint32_t b = 0; b < COGGING_DFT_BIN_COUNT; b++)
+								dst[b] = (iq_bin_count[b] > 0) ? (iq_bin_sum[b] / (float)iq_bin_count[b]) : 0.0f;
 						}
 						total_samples += dir_samples;
 					}
@@ -5372,19 +5578,25 @@ void TMC4671::handleStateCoggingCalibration() {
 					Sel best[COGGING_HARMONICS_COUNT];
 					memset(best, 0, sizeof(best));
 
-					for (int k = 5; k < COGGING_CALIB_DFT_HARMONICS; k++) {
-						// Average magnitude (friction is AC-neutral, doesn't affect magnitude)
-						float avg_mag = (cw_harms[k].mag + ccw_harms[k].mag) / 2.0f;
+					// Start at 1 to include Order 1, 2, 3, etc. (Skip 0, which is DC offset)
+					for (int k = 1; k < COGGING_CALIB_DFT_HARMONICS; k++) {
+    
+    				// 1. Average amplitude
+    				float avg_mag = (cw_harms[k].mag + ccw_harms[k].mag) / 2.0f;
 
-						// Phase unwrapping: avoid averaging +179° and -179° to 0°
-						float cw_phase = cw_harms[k].phase;
-						float ccw_phase = ccw_harms[k].phase;
-						float phase_diff = cw_phase - ccw_phase;
-						if (phase_diff > PI) ccw_phase += 2.0f * PI;
-						if (phase_diff < -PI) ccw_phase -= 2.0f * PI;
+					// 2. Convert phases to complex vectors (Re/Im) to avoid wrapping bugs
+					float cw_re = cosf(cw_harms[k].phase);
+					float cw_im = sinf(cw_harms[k].phase);
+					
+					float ccw_re = cosf(ccw_harms[k].phase);
+					float ccw_im = sinf(ccw_harms[k].phase);
 
-						// Average phase (cancels tracking lag delta between CW and CCW)
-						float avg_phase = (cw_phase + ccw_phase) / 2.0f;
+					// 3. Average the vectors
+					float avg_re = (cw_re + ccw_re) / 2.0f;
+					float avg_im = (cw_im + ccw_im) / 2.0f;
+
+					// 4. Extract the combined phase
+					float avg_phase = atan2f(avg_im, avg_re);
 
 						// Insertion sort: keep top COGGING_HARMONICS_COUNT by magnitude
 						for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
@@ -5739,6 +5951,194 @@ void TMC4671::handleStateCoggingCalibration() {
 			if (rpm_profile == 1) this->rpm2_table_valid = true;
 			else if (rpm_profile >= 2) this->rpm3_table_valid = true;
 #endif
+			// Broadcast combined harmonic table for this profile immediately
+			// so the configurator can display it right away.
+			// Prefix with "profile:N:" so the configurator routes to the correct
+			// per-profile storage without needing the adr from the serial frame.
+			{
+				uint8_t profile_adr = (rpm_profile >= 2) ? 2 : rpm_profile;
+				std::string hs = "profile:";
+				hs += std::to_string(rpm_profile + 1); // 1-based profile number
+				hs += ":";
+				bool any = false;
+				for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
+					if (active_tbl[i].amplitude > 0.0f || active_tbl[i].order > 0) {
+						if (any) hs += ",";
+						any = true;
+						hs += std::to_string(active_tbl[i].order) + ":";
+						hs += std::to_string((int16_t)active_tbl[i].amplitude) + ":";
+						hs += std::to_string((int16_t)(active_tbl[i].phase * 1000.0f));
+					}
+				}
+				if (!any) hs += "0:0:0";
+				CommandHandler::broadcastCommandReply(CommandReply(hs, profile_adr),
+					(uint32_t)TMC4671_commands::coggingHarmonics, CMDtype::get);
+			}
+
+			// --- VERIFICATION PASS: measure residual cogging with feedforward active ---
+			// Runs CW and CCW sweeps using the finalized table as feedforward,
+			// then prints the detected harmonics per direction so the user can see
+			// how much cogging remains after compensation in each direction.
+			if (!emergency && hasPower() && total_samples > 0) {
+				broadcastCalibLog(0, "Verification pass: measuring residual with feedforward...");
+				applySafeTorque(0);
+				Delay(500);
+
+				float ver_rpm = calib_rpm;
+				uint32_t ver_rev_ms = (uint32_t)((60.0f / ver_rpm) * 1000.0f);
+				uint32_t period_us = getActualCalibPeriod(TIM_TMC_ARR);
+				float dt_sec = (float)period_us / 1000000.0f;
+				uint32_t dft_decimation_ratio = 2;
+
+				int8_t dirs[2] = {1, -1};
+				const char* dir_names[2] = {"CW", "CCW"};
+
+				for (uint8_t di = 0; di < 2; di++) {
+					int8_t p = dirs[di];
+					float target_rpm = (p == 1) ? ver_rpm : -ver_rpm;
+					float full_vel_turns = target_rpm / 60.0f;
+
+					arm_pid_init_f32(&pid_soft, 1);
+					memset(iq_acc_cos, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
+					memset(iq_acc_sin, 0, COGGING_CALIB_DFT_HARMONICS * sizeof(float));
+					memset(iq_bin_sum, 0, COGGING_DFT_BIN_COUNT * sizeof(float));
+					memset(iq_bin_count, 0, COGGING_DFT_BIN_COUNT * sizeof(uint16_t));
+					uint32_t ver_samples = 0;
+
+					applySafeTorque(0);
+					Delay(300);
+
+					float target_pos_f = getFilteredPosition();
+					calibStartTime = HAL_GetTick();
+					uint32_t next_tick = micros();
+					uint32_t dft_decimation_counter = 0;
+
+					startCalibTimers(TIM_TMC_ARR);
+					while (HAL_GetTick() - calibStartTime < ver_rev_ms && !emergency && hasPower()) {
+						next_tick += period_us;
+						float step = full_vel_turns * dt_sec;
+						target_pos_f += step;
+						if (target_pos_f >= 1.0f) target_pos_f -= 1.0f;
+						if (target_pos_f < 0.0f) target_pos_f += 1.0f;
+
+						float actual_pos_f = getFilteredPosition();
+						float error = getWrappedError(target_pos_f, actual_pos_f);
+						float iq_pid = arm_pid_f32(&pid_soft, error);
+
+						// Feedforward from the finalized active_tbl
+						float cog_comp = 0.0f;
+						float angle_rad = actual_pos_f * 2.0f * PI;
+						for (uint8_t h = 0; h < COGGING_HARMONICS_COUNT; h++) {
+							if (active_tbl[h].amplitude > 0.0f) {
+								cog_comp += active_tbl[h].amplitude * arm_sin_f32(angle_rad * active_tbl[h].order + active_tbl[h].phase);
+							}
+						}
+						float iq_applied = iq_pid + cog_comp;
+						iq_applied = clip<float,float>(iq_applied, -max_test_torque, max_test_torque);
+						applySafeTorque(iq_applied);
+
+						captureDebug(TMC4671CoggingDebugPhase::Validation,
+							target_rpm, target_pos_f, actual_pos_f, error,
+							iq_pid, 0.0f, cog_comp, iq_pid, iq_applied,
+							0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+
+						dft_decimation_counter++;
+						if (dft_decimation_counter % dft_decimation_ratio == 0) {
+							float iq = iq_pid;
+							// Spatial binning — same rationale as the main DFT.
+							// Verification is even more sensitive to noise because
+							// the residual iq_pid is small and the PID noise floor
+							// is unchanged, so SNR is poor without binning.
+							uint32_t bin = (uint32_t)(actual_pos_f * (float)COGGING_DFT_BIN_COUNT);
+							if (bin >= COGGING_DFT_BIN_COUNT) bin = COGGING_DFT_BIN_COUNT - 1;
+							iq_bin_sum[bin] += iq;
+							if (iq_bin_count[bin] != 0xFFFF) iq_bin_count[bin]++;
+							ver_samples++;
+						}
+
+						refreshWatchdog();
+#ifdef TIM_CALIBRATION
+						if (this->calibTimer != nullptr) {
+							this->WaitForNotification();
+						} else
+#endif
+						{
+							while ((micros() - next_tick) & 0x80000000) { }
+						}
+					}
+					stopCalibTimers();
+					applySafeTorque(0);
+
+					if (ver_samples > 0) {
+						struct { float mag; float phase; uint16_t order; } top[20];
+						memset(top, 0, sizeof(top));
+						float norm = 2.0f / (float)COGGING_DFT_BIN_COUNT;
+						for (int k = 1; k < COGGING_CALIB_DFT_HARMONICS; k++) {
+							float re = 0.0f, im = 0.0f;
+							float s_start, c_start;
+							arm_sin_cos_f32((float)k * 180.0f / (float)COGGING_DFT_BIN_COUNT, &s_start, &c_start);
+							float s1, c1;
+							arm_sin_cos_f32((float)k * 360.0f / (float)COGGING_DFT_BIN_COUNT, &s1, &c1);
+							float cur_s = s_start, cur_c = c_start;
+							for (uint32_t b = 0; b < COGGING_DFT_BIN_COUNT; b++) {
+								if (iq_bin_count[b] > 0) {
+									float mean = iq_bin_sum[b] / (float)iq_bin_count[b];
+									re += mean * cur_c;
+									im += mean * cur_s;
+								}
+								float next_c = cur_c * c1 - cur_s * s1;
+								float next_s = cur_c * s1 + cur_s * c1;
+								cur_c = next_c; cur_s = next_s;
+							}
+							re *= norm;
+							im *= norm;
+							float mag = sqrtf(re*re + im*im);
+							for (int n = 0; n < 20; n++) {
+								if (mag > top[n].mag) {
+									for (int s = 19; s > n; s--) top[s] = top[s-1];
+									top[n].mag = mag;
+									top[n].phase = atan2f(re, im);
+									top[n].order = (uint16_t)k;
+									break;
+								}
+							}
+						}
+						// Sort by order
+						for (int i = 0; i < 19; i++) {
+							for (int j = i + 1; j < 20; j++) {
+								if (top[i].order > top[j].order && top[j].order > 0) {
+									auto tmp = top[i]; top[i] = top[j]; top[j] = tmp;
+								}
+							}
+						}
+						broadcastCalibLog(0, "VERIFY %s residual (order : amplitude : phase_rad):", dir_names[di]);
+						for (int n = 0; n < 20; n++) {
+							if (top[n].order == 0 && top[n].mag <= 0.0f) continue;
+							broadcastCalibLog(0, "%u : %.1f : %.4f",
+								top[n].order, top[n].mag, top[n].phase);
+						}
+						// Broadcast verify harmonics so they appear in the
+						// Harmonic Editor tab / calibration debug text box.
+						{
+							std::string bs = "VERIFY:";
+							bs += dir_names[di];
+							bs += ":";
+							bool any = false;
+							for (int n = 0; n < 20; n++) {
+								if (top[n].order == 0 && top[n].mag <= 0.0f) continue;
+								if (any) bs += ",";
+								any = true;
+								bs += std::to_string(top[n].order) + ":";
+								bs += std::to_string((int16_t)top[n].mag) + ":";
+								bs += std::to_string((int16_t)(top[n].phase * 1000.0f));
+							}
+							if (!any) bs += "0:0:0";
+							CommandHandler::broadcastCommandReply(CommandReply(bs, 0),
+								(uint32_t)TMC4671_commands::coggingCwCcw, CMDtype::get);
+						}
+					}
+				}
+			}
 		}
 
 			} // end DFT iteration loop
@@ -5747,8 +6147,13 @@ void TMC4671::handleStateCoggingCalibration() {
 		// 3. SAVE & FINALIZE
 		if (!emergency && any_profile_succeeded) {
 			broadcastCalibLog(0, "Cogging calibration successful");
-			refreshWatchdog();
-			saveCoggingTable();
+				refreshWatchdog();
+				saveCoggingTable();
+				this->bins_data_valid = true;
+				// Precompute the combined bin LUT (mode 1) once, here, so runtime
+				// turn() doesn't pay for the average on every call.
+				for (uint32_t b = 0; b < COGGING_DFT_BIN_COUNT; b++)
+					this->cogging_bins_combined[b] = (this->cw_bins[b] + this->ccw_bins[b]) * 0.5f;
 
 #if defined(COGGING_PHASE_SHIFT_CAL) || defined(COGGING_PHASE_SHIFT_MULTIRPM)
 			// Phase-shift method: mark scale and phase-advance curves as valid.
@@ -6035,6 +6440,8 @@ cleanup:
 
 	if(iq_acc_cos) vPortFree(iq_acc_cos);
 	if(iq_acc_sin) vPortFree(iq_acc_sin);
+	if(iq_bin_sum) vPortFree(iq_bin_sum);
+	if(iq_bin_count) vPortFree(iq_bin_count);
 #ifdef COGGING_CALIB_ENABLE_ID_DIAG
 	if(id_acc_cos) vPortFree(id_acc_cos);
 	if(id_acc_sin) vPortFree(id_acc_sin);

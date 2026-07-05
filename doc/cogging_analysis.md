@@ -1,54 +1,243 @@
-# Anti-Cogging and Motor Diagnostic Analysis (Continuous DFT-128 Method)
+# Anti-Cogging Calibration Guide — Continuous DFT-128 Method
 
-This document describes the harmonic-based anti-cogging compensation and motor diagnostic system for the OpenFFBoard (TMC4671). The system uses a **Continuous Discrete Fourier Transform (DFT)** integration with multi-RPM gain scheduling, speed-dependent scale curves, velocity-based phase advance, and harmonic waveshaping.
+This document describes the harmonic-based anti-cogging calibration system for the OpenFFBoard TMC4671 driver.
+The system uses cosine/sine accumulation at 128 harmonic orders over one mechanical revolution to extract
+the detent torque profile, then replays it as a Fourier-series feedforward to cancel cogging in real time.
+
+---
+
+## 1. Quickstart — Running a Calibration
+
+1. Open the **Configurator**, select your TMC driver tab.
+2. Click **"Cogging Calibration"** (button below the state indicator). This opens the multi-tab dialog.
+3. In the **"Cogging Calibration"** tab (first tab):
+   - Set the **number of RPM profiles** (read-only — comes from firmware, currently always 3).
+   - PER-PROFILE: set the target RPM and number of DFT iterations.  
+     *One iteration at 3 RPM is usually enough for a clean map.*
+   - Check **"Auto Velocity PID Tune"** to let the firmware find the optimal speed-loop P gain for each profile.
+   - Keep **"Inertia Acceleration Correction"** OFF unless you have high inertia and see noisy results.  
+     *(When ON, the DFT subtracts $J \cdot \alpha$ from the signal. Requires a valid $J$ from SysId.)*
+   - Keep **"Friction Feedforward"** OFF unless you need to cancel viscous drag during the sweep.
+4. Press **"Start Cogging Calibration"**.
+5. Watch the calibration log. The motor will:
+   - Break static friction, then measure $J$ (inertia pulse) and $B$ (30 RPM steady-state).
+   - Compute IMC-optimal PID gains and run a validation rotation.
+   - For each RPM profile: auto-tune P (if enabled), run CW+CCW DFT sweeps, broadcast the harmonic table.
+   - Run a **verification pass** — spins with feedforward active and prints residual harmonic amplitudes.
+6. The **Harmonic Editor** tab (third tab) populates with per-harmonic magnitude spinboxes after each profile completes. You can edit magnitudes and press **"Apply to Firmware"** to push changes live.
 
 ---
 
-## 1. Process Overview
+## 2. End-to-End Data Flow
 
-### 1.1 Encoder Identification & System Identification (SysId)
+### 2.1 Encoder Counts → Normalized Position
 
-Before DFT acquisition, the system performs a deterministic identification of the motor's physical parameters to calculate ideal PID gains (using CMSIS-DSP):
+```
+raw_encoder_counts % CPR → remainder → (float)remainder / CPR → pos_f ∈ [0.0, 1.0)
+```
 
-- **Encoder Profiling**: Audits `enc_cpr` to mathematically decimate the PID execution rate.
-- **Breakout Torque**: Measures minimum torque to overcome static friction.
-- **Mechanical Inertia ($J$)**: $J = \tau / \alpha$ from a constant torque pulse (150 ms).
-- **Viscous Friction ($B$)**: $B = \tau / \omega$ from steady-state 30 RPM velocity hold (2000 ms).
-- **IMC Pole Placement**: Critically damped PID ($\zeta = 1.0$) with bandwidth $f_{bw}$ dynamically degraded by inertia.
+Integer modulo *before* float conversion preserves the encoder's full fractional resolution — critical for high-CPR encoders (22-bit BISS-C, etc.) where float mantissa would otherwise lose precision after accumulating full turns.
 
-### 1.2 Multi-RPM DFT Acquisition
+### 2.2 DFT Accumulation (Recursive Chebyshev)
 
-The system runs **three iterative DFT passes** at three different sweep speeds, producing three independent cogging maps. The DFT loop is factored into a reusable lambda (`runDftPass`) with local reference aliases so the unchanged loop body binds to whichever target array the caller passes.
+During each CW or CCW sweep, at every Nth loop iteration (decimated by `dft_decimation_ratio = 2`):
 
-| Pass | RPM | Purpose |
-| :--- | :--- | :--- |
-| **RPM#1** (Low) | 3 RPM (or encoder-dependent) | Baseline cogging at near-static speed — minimal current-loop attenuation or phase lag |
-| **RPM#2** (Hi) | `COGGING_CALIB_HI_RPM` (default 30) | Absorbs closed-loop torque-path distortion (current-loop attenuation + phase lag) in the mid-speed band |
-| **RPM#3** (Ultra) | `COGGING_CALIB_ULTRA_RPM` (default 100) | Absorbs high-speed dynamics for the upper RPM range |
+```cpp
+float s1, c1;
+arm_sin_cos_f32(pos_f * 360.0f, &s1, &c1);     // sin(θ), cos(θ) — just once per sample
 
-Each pass uses identical DFT math: 128 harmonics, 3 iterations with CW+CCW sweeps and Piccoli phase averaging, top-20 insertion sort, and phasor-addition residual reduction on iterations 2-3.
+float cur_s = s1, cur_c = c1;
+for (int k = 1; k < 128; k++) {
+    iq_acc_cos[k] += (iq * cur_c);               // accumulate Re
+    iq_acc_sin[k] += (iq * cur_s);               // accumulate Im
 
-#### DFT Sweep Details
+    // Angle-addition formulas for the next harmonic — no extra trig calls
+    float next_c = cur_c * c1 - cur_s * s1;       // cos((k+1)θ) = cos(kθ)·cos(θ) − sin(kθ)·sin(θ)
+    float next_s = cur_c * s1 + cur_s * c1;       // sin((k+1)θ) = sin(kθ)·cos(θ) + cos(kθ)·sin(θ)
+    cur_c = next_c; cur_s = next_s;
+}
+```
 
-- **Per-direction integration**: Exactly 360° of displacement after a 1500 ms warmup period.
-- **Decimated DFT accumulation**: Every 4th loop cycle (~1 kHz) to prevent float accumulator overflow at 4 kHz.
-- **Recursive complex multiplication**: $e^{i(k+1)\theta} = e^{ik\theta} \cdot e^{i\theta}$ — only one `arm_sin_cos_f32` call per sample for all 128 harmonics.
-- **Real-time inertia feedforward**: $iq_{\text{inertia}} = J \cdot \alpha$ subtracted from measured torque before DFT.
-- **Cogging feed-forward during sweeps**: The running harmonic table is applied as FF, so later iterations measure only the residual (phasor-added onto the table).
+The DFT signal `iq` is the **PID residual torque** (velocity-loop output + friction FF, optionally minus inertia). When `COGGING_DFT_USE_IQ_CMD` is defined (the default), it's the command-units PID output — dimensionally uniform with the compensation table.
 
-#### Encoder Profiling Constants
+### 2.3 Normalization → Magnitude & Phase
 
-| Encoder Class | CPR Range | PID Rate | Kp Penalty | Calib RPM |
-| :--- | :--- | :--- | :--- | :--- |
-| **High-Res** | > 50,000 | 4 kHz | 1.0× | 3.0 |
-| **Medium-Res** | 20,000–50,000 | 1 kHz | 0.5× | 6.0 |
-| **Low-Res** | < 20,000 | 500 Hz | 0.2× | 12.0 |
+```cpp
+float norm = 2.0f / dir_samples;        // DFT normalization
+float re = iq_acc_cos[k] * norm;
+float im = iq_acc_sin[k] * norm;
+float mag = sqrtf(re*re + im*im);       // amplitude in torque-command units
+float phase = atan2f(re, im);           // phase in radians
+```
 
-### 1.3 Scale Calibration (Optional)
+### 2.4 CW+CCW Averaging (Piccoli Method)
 
-If `COGGING_SCALE_SWEEP` is defined, a gradient-descent sweep across 14 RPM breakpoints (3–100 RPM) optimizes `cogging_scale` at each speed, populating the 24-point scale curve.
+CW and CCW sweeps produce independent `[mag, phase]` pairs. Directly averaging phases can produce wrong results near ±π due to wrap-around. Instead, the phases are converted to complex vectors and averaged:
+
+```cpp
+float cw_re = cosf(cw_phase), cw_im = sinf(cw_phase);
+float ccw_re = cosf(ccw_phase), ccw_im = sinf(ccw_phase);
+float avg_re = (cw_re + ccw_re) / 2.0f;
+float avg_im = (cw_im + ccw_im) / 2.0f;
+float avg_phase = atan2f(avg_im, avg_re);
+float avg_mag = (cw_mag + ccw_mag) / 2.0f;
+```
+
+This cancels friction bias (AC-neutral) and PID tracking-lag delta (phase shifts in opposite directions for CW vs CCW).
+
+### 2.5 Top-N Selection → Compensation Table
+
+The top 20 harmonic orders by combined magnitude become `cogging_harmonics[]`.
+
+### 2.6 Runtime Feedforward
+
+In `TMC4671::turn()`, the harmonic table is summed as a Fourier series each time torque is commanded:
+
+```cpp
+float compensation = 0;
+for (uint8_t i = 0; i < COGGING_HARMONICS_COUNT; i++) {
+    if (cogging_harmonics[i].amplitude > 0.0f) {
+        compensation += cogging_harmonics[i].amplitude
+            * arm_sin_f32(angle_rad * cogging_harmonics[i].order + cogging_harmonics[i].phase);
+    }
+}
+totalPower += cogging_scale * compensation;
+```
 
 ---
+
+## 3. System Identification (SysId)
+
+Before DFT, the calibration measures the motor's physical parameters to compute IMC-optimal PID gains.
+
+| Step | What | How |
+|:---|:---|:---|
+| Breakout torque | Min torque to move | Incremental torque ramps until position moves ≥0.005 turns |
+| Inertia $J$ | $J = (\tau \cdot \Delta t^2) / (2 \cdot \Delta\theta)$ × 100 | 150 ms constant-torque pulse |
+| Viscous friction $B$ | $B = (\tau_{\text{avg}} / \omega) \times 100$ | 2 s CW rotation at 30 RPM |
+| IMC bandwidth | $f_{bw} = \text{clamp}(16.5 - 0.0047J,\ 6,\ 15)$ Hz | Degrades with inertia |
+
+All values are in abstract TMC torque-command units. J and B are scaled ×100 to stay in a numerically stable range for the CMSIS PID computations.
+
+---
+
+## 4. P-Gain Auto-Tuning (per RPM profile)
+
+When "Auto Velocity PID Tune" is enabled, the firmware runs a **trapezoidal velocity sweep** (accel → cruise → decel) with zero I and D to find the optimal P that minimizes peak-to-peak position error without saturation:
+
+- Starts at 75% of the IMC-derived baseline Kp (or profile 0's stored Kp for higher profiles).
+- Sweeps up (×1.25 per step) and down, alternating direction to bracket the minimum.
+- If the torque command saturates (clamps), backs off and re-tests.
+- Reports `Selected Kp:XXXX (Optimal, Lowest P2P:X.XX°)`.
+
+The auto-tuned P is stored in `cogging_calib_pidP[rpm_profile]` for the DFT sweeps.
+
+---
+
+## 5. Multi-RPM Profile System
+
+Three independent cogging maps, each calibrated at a user-configurable RPM:
+
+| Profile | Default RPM | Flash Index | RAM Table |
+|:---|:---|:---|:---|
+| Profile 1 (Low) | 3 | `drv-1 + 0×3` | `cogging_harmonics` |
+| Profile 2 (Mid) | 30 | `drv-1 + 1×3` | `cogging_harmonics_rpm2` |
+| Profile 3 (High) | 100 | `drv-1 + 2×3` | `cogging_harmonics_rpm3` |
+
+Each profile writes directly into its own target table (`active_tbl` pointer). At runtime, `blendHarmonicTables()` interpolates between adjacent tables based on measured RPM. Below `blend_rpm1` → 100% low; above highest valid → 100% that table.
+
+---
+
+## 6. Verification Pass
+
+After each profile's DFT completes, the firmware runs a **CW + CCW verification pass**: one revolution in each direction with the finalized feedforward active, then extracts and prints the residual harmonics:
+
+```
+VERIFY CW residual (order : amplitude : phase_rad):
+1 : 115.7 : -0.0779
+2 : 73.9 : 1.3866
+...
+VERIFY CCW residual (order : amplitude : phase_rad):
+1 : 120.2 : -3.0138
+2 : 76.0 : -1.3629
+...
+```
+
+This shows exactly what cogging remains after compensation. Use the Harmonic Editor to tweak magnitudes and re-verify.
+
+---
+
+## 7. Configurator — Harmonic Editor Tab
+
+Replaces the old waveshaping controls with direct per-harmonic magnitude editing:
+
+- **RPM profile selector**: Switch between calibrated RPM maps.
+- **Chart view toggle**: Waveform (angle domain) or Harmonic Magnitudes (bar chart).
+- **Per-harmonic magnitude spinboxes**: Edit the amplitude of each harmonic. Amplitudes are in abstract torque-command units (same as the DFT output).
+- **"Apply to Firmware" button**: Sends the edited magnitudes to the MCU via `coggingH3` setat commands (adr=3 clear table, adr=4 set amplitude+order, adr=5 set phase).
+- **Live position dot + angle readout**: Red dot on the waveform chart tracks the actual rotor angle, with a numeric "Angle: XXX.X°" label.
+- **CW/CCW overlay checkbox**: Shows raw direction-specific waveforms for comparison.
+- **Download/Copy/Load/Clear buttons**: Export/import harmonic data as text files.
+
+---
+
+## 8. Scale Curve & Phase Advance
+
+24-point RPM breakpoints: `{3, 5, 7, 10, 12, 15, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200, 225, 256}`.
+
+- **Scale curve**: Interpolates `cogging_scale` by measured RPM. Compensates for current-loop amplitude rolloff at higher speeds.
+- **Phase advance**: Shifts the cogging lookup position by `sign(rpm) * adv_deg / 360` before the Fourier sum. Compensates for loop latency phase lag.
+
+Both curves are stored in EEPROM and editable from the Configurator's Scale Curve / Phase Advance tabs. Live RPM dot shows current velocity on the chart.
+
+---
+
+## 9. ST-Link Debug Watch
+
+The global struct `g_tmc4671_cogging_debug` provides live inspection during calibration:
+
+| Field | Description |
+|:---|:---|
+| `phase` | Current calibration phase (SysId, Validation, Acquisition, etc.) |
+| `positionErrorDeg` | Tracking error × 36000 (×10 scaled) |
+| `angle` | Actual rotor angle 0–360° |
+| `iqCmd` | PID + friction torque command |
+| `iqCompensation` | Cogging feedforward torque |
+| `Appliediq` | Total applied torque (iqCmd + compensation) |
+| `pidExecRate` | Microseconds between captureDebug calls (inverse of PID rate) |
+
+---
+
+## 10. Commands Reference
+
+| Command | Access | Description |
+|:---|:---|:---|
+| `calibrateCogging` | GET | Start calibration |
+| `cogging` | GET/SET | Enable/disable (1/0) |
+| `coggingScale` | GET/SET | Global scale (×10000) |
+| `coggingHarmonics` | GET | Harmonic table: `order:amp:phase,…` (adr 0=low, 1=rpm2, 2=rpm3) |
+| `coggingCwCcw` | GET | Raw CW/CCW harmonics |
+| `coggingH3` | GET/SETADR | Set harmonics: adr 3=clear, 4=set amp+order, 5=set phase |
+| `coggingSave` | GET | Save cogging table to flash |
+| `scaleCurve` | GET/SETADR | 24-pt scale curve (×1000) |
+| `phaseAdvCurve` | GET/SETADR | 24-pt phase advance (deg ×100) |
+| `coggingCalibCount` | GET | Number of RPM profiles |
+| `coggingCalibRPM` | GETADR/SETADR | RPM ×10 per profile |
+| `coggingCalibIters` | GETADR/SETADR | DFT iterations per profile |
+| `coggingCalibPidP/I/D` | GETADR/SETADR | Manual PID per profile |
+| `coggingCalibAutoPid` | GET/SET | Auto PID tune (1=auto, 0=manual) |
+| `coggingCalibInertiaCorr` | GET/SET | Inertia acceleration correction (1=on) |
+| `coggingCalibFrictionFF` | GET/SET | Friction feedforward during DFT (1=on) |
+
+---
+
+## 11. Key Details & Gotchas
+
+- **Phase is in radians** everywhere in `cogging_harmonics[]`. The configurator receives phase ×1000 in the serial protocol and converts back.
+- **DFT signal source**: With `COGGING_DFT_USE_IQ_CMD` defined, the DFT uses `iq_cmd` (PID output). Without it, `actual_iq_raw` (ADC counts) is used. Both are in the same abstract unit space for a given board.
+- **Warmup excludes data**: The first `cogging_warmup_ms` (default 1500 ms, scales with $J$) is ramp-only — no DFT accumulation during this period.
+- **Return-to-center**: After calibration, the motor automatically returns to position 0 to undo accumulated rotations.
+- **SET commands must NOT push to replies**: For commands with CMDFLAG_SET, the SET branch must return nothing. Pushing to replies from SET causes board resets.
 
 ## 2. Runtime Compensation
 
