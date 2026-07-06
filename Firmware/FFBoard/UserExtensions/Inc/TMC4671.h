@@ -816,6 +816,7 @@ private:
 	bool cogging_enabled = false;
 	float cogging_scale = 0.5f;
 	int32_t last_anticogging_torque = 0;
+	int32_t last_power_setpoint = 0;  // Pre-anticogging torque setpoint (iqCmd)
 
 	// CW/CCW raw DFT harmonics stored for configurator-side offset tuning
 	// Only the top COGGING_HARMONICS_COUNT entries (by magnitude) are preserved per direction.

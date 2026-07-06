@@ -1941,6 +1941,7 @@ void TMC4671::turn(int16_t power){
 
 		this->last_anticogging_torque = (int32_t)(dyn_scale * compensation);
 		this->last_cogging_scale = dyn_scale;
+		this->last_power_setpoint = power;
 
 		totalPower += this->last_anticogging_torque;
 		
@@ -3162,10 +3163,13 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			std::string replyStr = std::to_string(current.second) + ":" + std::to_string(current.first);
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
 			replyStr += ":" + std::to_string(this->last_anticogging_torque);
-			// Append scale then position
+			// Append scale then position then pre-cogging iqCmd setpoint then RPM
 			replyStr += ":" + std::to_string((int16_t)(this->last_cogging_scale * 100.0f));
 			replyStr += ":" + std::to_string((int32_t)(this->getFilteredPosition() * 10000.0f));
+			replyStr += ":" + std::to_string((int16_t)(this->last_power_setpoint));
 			replyStr += ":" + std::to_string((int16_t)(this->measured_rpm));
+#else
+			replyStr += ":" + std::to_string((int16_t)(this->last_power_setpoint));
 #endif
 			replies.emplace_back(CommandReply(replyStr, current.second, current.first));
 		}
@@ -4569,16 +4573,16 @@ void TMC4671::handleStateCoggingCalibration() {
 				QuarterErrorStats& stats) {
 			resetQuarterErrorStats(stats);
 
+			uint32_t act_period = getActualCalibPeriod(1000);
+			float dt_sec = (float)act_period / 1000000.0f;
 			pid_soft.Kp = clip<float,float>(kp, 50.0f, 250000.0f);
 			pid_soft.Ki = clip<float,float>(ki, 0.0f, 100000.0f);
-			pid_soft.Kd = coggingSpeedD;
+			pid_soft.Kd = coggingSpeedD / dt_sec; // rate-compensated (1/Ts)
 			arm_pid_init_f32(&pid_soft, 1);
 
 			float target_pos_turns = getAbsolutePosition();
 			uint32_t eval_start = HAL_GetTick();
 			uint32_t next_tick = micros();
-			uint32_t act_period = getActualCalibPeriod(1000);
-			float dt_sec = (float)act_period / 1000000.0f;
 			uint32_t enc_decimation_counter = 0;
 			bool all_quarters_seen = false;
 
@@ -4866,20 +4870,33 @@ void TMC4671::handleStateCoggingCalibration() {
 			float best_sweep_kp = imc_kp;
 			float best_sweep_ki = 0.0f;  // I=0 enforced — auto-tuning is P-only
 
+			// Rate-compensated Kd: CMSIS PID D-term scales with Ts², so we divide
+			// by sample time to get a continuous-time-equivalent derivative gain.
+			// Without this, D needs absurdly large values (e.g. 9M at 7kHz) to have
+			// any effect on cogging-speed position oscillations.
+			float dt_soft = (float)TIM_TMC_ARR / 1000000.0f;
 			pid_soft.Kp = best_sweep_kp;
 			pid_soft.Ki = best_sweep_ki;
-			pid_soft.Kd = coggingSpeedD;
+			pid_soft.Kd = coggingSpeedD / dt_soft;
 			// Store IMC Kp into profile 0 so the auto-tuning can use it as baseline.
 			// I is forced to zero — the auto-tuning tune is P-only.
 			this->cogging_calib_pidP[0] = (uint32_t)best_sweep_kp;
 			this->cogging_calib_pidI[0] = 0;
 			this->cogging_calib_pidD[0] = 0;
 			} else {
+				float dt_soft = (float)TIM_TMC_ARR / 1000000.0f;
 				pid_soft.Kp = coggingSpeedP;
 				pid_soft.Ki = coggingSpeedI;
-				pid_soft.Kd = coggingSpeedD;
+				pid_soft.Kd = coggingSpeedD / dt_soft;
 				imc_kp = coggingSpeedP;  // manual P as baseline for auto-tuning
-				broadcastCalibLog(0, "Manual PID Override -> Kp:%.0f Ki:%.0f", pid_soft.Kp, pid_soft.Ki);
+#ifndef COGGING_PHASE_SHIFT_MULTIRPM
+				// Store manual values into profile 0 so the RPM profile loop
+				// below reloads them instead of zeroing them out.
+				this->cogging_calib_pidP[0] = (uint32_t)coggingSpeedP;
+				this->cogging_calib_pidI[0] = (uint32_t)coggingSpeedI;
+				this->cogging_calib_pidD[0] = (uint32_t)coggingSpeedD;
+#endif
+				broadcastCalibLog(0, "Manual PID Override -> Kp:%.0f Ki:%.0f Kd:%.0f", pid_soft.Kp, pid_soft.Ki, pid_soft.Kd);
 			}
 			arm_pid_init_f32(&pid_soft, 1);
 			Delay(250);
@@ -4960,7 +4977,10 @@ void TMC4671::handleStateCoggingCalibration() {
 			// must reset the CMSIS PID state for DFT velocity control.
 			pid_soft.Kp = this->coggingSpeedP;
 			pid_soft.Ki = this->coggingSpeedI;
-			pid_soft.Kd = this->coggingSpeedD;
+			{
+				float dt_dft = (float)getActualCalibPeriod(TIM_TMC_ARR) / 1000000.0f;
+				pid_soft.Kd = this->coggingSpeedD / dt_dft;
+			}
 			arm_pid_init_f32(&pid_soft, 1);
 
 // --- P-GAIN AUTO-TUNING SEQUENCE ---
@@ -5250,7 +5270,10 @@ void TMC4671::handleStateCoggingCalibration() {
 			// Re-initialize pid_soft with the (possibly auto-tuned) gains for the DFT sweep
 			pid_soft.Kp = this->coggingSpeedP;
 			pid_soft.Ki = this->coggingSpeedI;
-			pid_soft.Kd = this->coggingSpeedD;
+			{
+				float dt_dft = (float)getActualCalibPeriod(TIM_TMC_ARR) / 1000000.0f;
+				pid_soft.Kd = this->coggingSpeedD / dt_dft;
+			}
 			arm_pid_init_f32(&pid_soft, 1);
 
 			// Per-profile target table: the calibration routine is IDENTICAL for
@@ -5278,7 +5301,26 @@ void TMC4671::handleStateCoggingCalibration() {
 				}
 			bool dft_clamped = false;
 
+			// Save base PID gains for per-iteration halving.
+			// As the feedforward table improves with each iteration,
+			// the residual cogging shrinks — gentler gains reduce
+			// PID-induced noise in the DFT measurement.
+			float base_Kp = pid_soft.Kp;
+			float base_Ki = pid_soft.Ki;
+			float base_Kd = pid_soft.Kd;
+
 			for (uint8_t dft_iter = 0; dft_iter < MAX_DFT_ITERATIONS && !emergency && hasPower(); dft_iter++) {
+				// Halve PID gains for each extra iteration (÷2, ÷4, ÷8, ...).
+				// Iteration 0 uses full gains; higher iterations use
+				// progressively gentler gains tuned to the shrinking residual.
+				if (dft_iter > 0) {
+					float div = (float)(1 << dft_iter);
+					pid_soft.Kp = base_Kp / div;
+					pid_soft.Ki = base_Ki / div;
+					pid_soft.Kd = base_Kd / div;
+					arm_pid_init_f32(&pid_soft, 1);
+				}
+
 				total_samples = 0;
 				float iter_max_err_deg = 0.0f;
 
@@ -5985,7 +6027,14 @@ void TMC4671::handleStateCoggingCalibration() {
 				Delay(500);
 
 				float ver_rpm = calib_rpm;
-				uint32_t ver_rev_ms = (uint32_t)((60.0f / ver_rpm) * 1000.0f);
+				// Add warmup time so the motor accelerates smoothly before
+				// binning starts — otherwise the startup transient (high iq_pid
+				// while accelerating from rest) contaminates the DFT with
+				// spurious low-order content.
+				// Use 1.5x rev time (same as main DFT's rev_ms formula) so
+				// integrated_distance has margin to reach 1.0 even with
+				// velocity ripple from residual cogging.
+				uint32_t ver_rev_ms = (uint32_t)((60.0f / ver_rpm) * 1500.0f) + cogging_warmup_ms;
 				uint32_t period_us = getActualCalibPeriod(TIM_TMC_ARR);
 				float dt_sec = (float)period_us / 1000000.0f;
 				uint32_t dft_decimation_ratio = 2;
@@ -6009,6 +6058,12 @@ void TMC4671::handleStateCoggingCalibration() {
 					Delay(300);
 
 					float target_pos_f = getFilteredPosition();
+					float integrated_distance = 0.0f;
+					float ramp_vel_turns = 0.0f;
+					// Ramp-up rate matches the main DFT: accelerate smoothly from
+					// 0 to target over cogging_warmup_ms.  Tiny floor ensures the
+					// target moves at least ~1 encoder count/iteration immediately.
+					float ramp_rate = full_vel_turns / (float)cogging_warmup_ms * 1000.0f; // turns/s²
 					calibStartTime = HAL_GetTick();
 					uint32_t next_tick = micros();
 					uint32_t dft_decimation_counter = 0;
@@ -6016,7 +6071,18 @@ void TMC4671::handleStateCoggingCalibration() {
 					startCalibTimers(TIM_TMC_ARR);
 					while (HAL_GetTick() - calibStartTime < ver_rev_ms && !emergency && hasPower()) {
 						next_tick += period_us;
-						float step = full_vel_turns * dt_sec;
+
+						// Velocity ramp: 0 → full_vel_turns during warmup,
+						// then hold at full speed.
+						float elapsed = (float)(HAL_GetTick() - calibStartTime);
+						if (elapsed < (float)cogging_warmup_ms) {
+							ramp_vel_turns = ramp_rate * elapsed * 0.001f; // turns/s
+							if (ramp_vel_turns < fabsf(full_vel_turns) * 0.005f)
+								ramp_vel_turns = fabsf(full_vel_turns) * 0.005f;
+						} else {
+							ramp_vel_turns = full_vel_turns;
+						}
+						float step = ramp_vel_turns * dt_sec;
 						target_pos_f += step;
 						if (target_pos_f >= 1.0f) target_pos_f -= 1.0f;
 						if (target_pos_f < 0.0f) target_pos_f += 1.0f;
@@ -6042,18 +6108,26 @@ void TMC4671::handleStateCoggingCalibration() {
 							iq_pid, 0.0f, cog_comp, iq_pid, iq_applied,
 							0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 
-						dft_decimation_counter++;
-						if (dft_decimation_counter % dft_decimation_ratio == 0) {
-							float iq = iq_pid;
-							// Spatial binning — same rationale as the main DFT.
-							// Verification is even more sensitive to noise because
-							// the residual iq_pid is small and the PID noise floor
-							// is unchanged, so SNR is poor without binning.
-							uint32_t bin = (uint32_t)(actual_pos_f * (float)COGGING_DFT_BIN_COUNT);
-							if (bin >= COGGING_DFT_BIN_COUNT) bin = COGGING_DFT_BIN_COUNT - 1;
-							iq_bin_sum[bin] += iq;
-							if (iq_bin_count[bin] != 0xFFFF) iq_bin_count[bin]++;
-							ver_samples++;
+						// Only count distance and bin during the first full
+						// revolution of steady-state motion (after warmup).
+						// This matches the main DFT's pattern exactly:
+						// integrated_distance is incremented INSIDE the gate,
+						// so it only counts steps that are actually binned.
+						if (integrated_distance < 1.0f && (HAL_GetTick() - calibStartTime > cogging_warmup_ms)) {
+							integrated_distance += fabs(step);
+							dft_decimation_counter++;
+							if (dft_decimation_counter % dft_decimation_ratio == 0) {
+								float iq = iq_pid;
+								// Spatial binning — same rationale as the main DFT.
+								// Verification is even more sensitive to noise because
+								// the residual iq_pid is small and the PID noise floor
+								// is unchanged, so SNR is poor without binning.
+								uint32_t bin = (uint32_t)(actual_pos_f * (float)COGGING_DFT_BIN_COUNT);
+								if (bin >= COGGING_DFT_BIN_COUNT) bin = COGGING_DFT_BIN_COUNT - 1;
+								iq_bin_sum[bin] += iq;
+								if (iq_bin_count[bin] != 0xFFFF) iq_bin_count[bin]++;
+								ver_samples++;
+							}
 						}
 
 						refreshWatchdog();
@@ -6111,6 +6185,25 @@ void TMC4671::handleStateCoggingCalibration() {
 								}
 							}
 						}
+
+						// Save per-bin means to ver_cw_bins / ver_ccw_bins so the
+						// configurator can read them via coggingBins adr 2-3.
+						{
+							float* dst = (p == 1) ? this->ver_cw_bins : this->ver_ccw_bins;
+							for (uint32_t b = 0; b < COGGING_DFT_BIN_COUNT; b++)
+								dst[b] = (iq_bin_count[b] > 0) ? (iq_bin_sum[b] / (float)iq_bin_count[b]) : 0.0f;
+						}
+						// Save top-20 DFT harmonics to ver_cw_top / ver_ccw_top
+						// so the configurator can read them via coggingBins adr 4-5.
+						{
+							Harmonic* dst = (p == 1) ? this->ver_cw_top : this->ver_ccw_top;
+							for (int n = 0; n < 20; n++) {
+								dst[n].order = top[n].order;
+								dst[n].amplitude = top[n].mag;
+								dst[n].phase = top[n].phase;
+							}
+						}
+
 						broadcastCalibLog(0, "VERIFY %s residual (order : amplitude : phase_rad):", dir_names[di]);
 						for (int n = 0; n < 20; n++) {
 							if (top[n].order == 0 && top[n].mag <= 0.0f) continue;
