@@ -1,26 +1,27 @@
 # OpenFFBoard Anti-Cogging Calibration — Step-by-Step Guide
 
-> **Active defines:** `COGGING_TABLE_FLASH_START_ADDRESS`, `COGGING_PHASE_SHIFT_MULTIRPM`
+> **Active defines:** `COGGING_TABLE_FLASH_START_ADDRESS`, `COGGING_DFT_USE_IQ_CMD`, `COGGING_DISABLE_BLEND`
 >
-> **Optional defines:** `COGGING_DISABLE_SCALE_CURVE`, `COGGING_DISABLE_BLEND`, `COGGING_DFT_USE_IQ_CMD`
+> **Optional defines:** `COGGING_DISABLE_SCALE_CURVE`, `COGGING_PHASE_SHIFT_MULTIRPM`
 
 ---
 
 ## Overview
 
-The calibration measures motor cogging torque and computes speed-dependent phase lag.  
-It runs **23 RPM profiles** (all `scale_curve_rpm_points` except RPM 0 plateau), each with:
+The calibration measures motor cogging torque and computes a harmonic Fourier feedforward table.  
+It runs **up to 5 configurable RPM profiles** (default 3 profiles at 3/10/20 RPM), each with:
 
 1. **P-gain auto-tuning** — finds optimal velocity-loop Kp via trapezoidal sweeps
 2. **DFT acquisition** — CW/CCW constant-speed revolutions while recording IQ torque
-3. **Phase-lag extraction** — computes attenuation & phase shift from CW/CCW demodulation
+3. **CW+CCW harmonic averaging** — cancels friction bias and PID tracking lag
 
 Total output:
 
-- `cogging_harmonics[20]` — spatial anti-cogging Fourier table (saved on profile 0 only)
+- `cogging_harmonics[20]` — spatial anti-cogging Fourier table (per profile, stored in flash)
 - `scale_curve_values[24]` — attenuation vs RPM (unless `COGGING_DISABLE_SCALE_CURVE`)
 - `phase_advance_curve_values[24]` — phase shift in mechanical degrees vs RPM (unless `COGGING_DISABLE_SCALE_CURVE`)
-- `scale_curve_rpm_points[24]` — RPM breakpoints (fixed, configurator-compatible)
+- `cw_bins[720]` / `ccw_bins[720]` — raw spatial bin snapshots (per direction, for configurator readout)
+- `cogging_bins_combined[720]` — averaged CW/CCW bin LUT (used by FF mode 1 at runtime)
 
 ---
 
@@ -28,26 +29,44 @@ Total output:
 
 | Define | Effect when defined | Current state |
 |---|---|---|
-| `COGGING_PHASE_SHIFT_MULTIRPM` | Tests all 23 fixed RPM breakpoints; extracts phase lag per RPM via master harmonic tracking | ✓ Active |
+| `COGGING_PHASE_SHIFT_MULTIRPM` | Tests all 23 fixed RPM breakpoints; extracts phase lag per RPM via master harmonic tracking | ✗ Commented out |
 | `COGGING_DISABLE_SCALE_CURVE` | **No scale/phase curves** — `cogging_scale`=1.0 at all RPMs | ✗ Commented out (curves active) |
 | `COGGING_DISABLE_BLEND` | Uses only `cogging_harmonics` base table at all RPMs | ✓ Active |
 | `COGGING_DFT_USE_IQ_CMD` | DFT uses `iq_cmd` (PID+friction effort) instead of raw ADC `actual_iq_raw` | ✓ Active |
 
+### `COGGING_DISABLE_BLEND` (currently active)
+
+When active (the default), the runtime feedforward always reads from the base `cogging_harmonics[]` table.
+Multi-RPM blending between the three stored tables (low/mid/high) is disabled.
+
+When commented out, `blendHarmonicTables(measured_rpm, blended)` blends adjacent tables at the
+**harmonic level** (matches orders, lerps amplitude and phase with unwrapping).
+
 ### `COGGING_DISABLE_SCALE_CURVE` (currently commented out)
 
-Scale curve and phase advance are **active** — `turn()` applies per-harmonic electrical advance
-and RPM-dependent amplitude scaling at runtime.
+Scale curve and phase advance are **active** — `turn()` applies RPM-dependent amplitude scaling
+and phase advance at runtime.
 
 When defined, the following are ALL disabled:
 
 - `scale_curve_valid` — never set to true (calibration or loadFlash)
-- `phase_adv_curve_valid` — never set to true (calibration only; loadFlash still restores it)
-- `scale_curve_values[]` writes in MULTIRPM block — skipped
+- `phase_adv_curve_valid` — never set to true
+- `scale_curve_values[]` writes — skipped
 - Load-time `scale_curve_valid` restoration — skipped
 - Fill-in interpolation for scale values — skipped
 
 **Runtime effect when disabled**: `turn()` uses `cogging_scale` (1.0) directly, no phase-advance.
-**Runtime effect when active** (current): per-harmonic electrical advance + scale curve.
+**Runtime effect when active** (current): RPM-dependent amplitude scaling via the scale curve.
+
+### `COGGING_PHASE_SHIFT_MULTIRPM` (currently commented out)
+
+When active, tests all 23 fixed RPM breakpoints from `scale_curve_rpm_points[]` and extracts
+phase lag per RPM via master harmonic tracking. Populates both `scale_curve_values[]` and
+`phase_advance_curve_values[]` from the calibration data.
+
+When commented out (current), the calibration uses only the user-configured `cogging_calib_count`
+profiles (default 3: 3/10/20 RPM). Scale and phase-advance curves can still be tuned manually
+from the configurator.
 
 ---
 
@@ -62,16 +81,15 @@ When defined, the following are ALL disabled:
 | `B` | `float` | Measured | Viscous friction |
 | `dynamic_friction` | `float` | Measured | Coulomb friction breakout torque |
 | `cogging_warmup_ms` | `uint32_t` | `max(1500, J/100×rpm + 1000)`, capped 8000 | Velocity ramp-up duration |
-| `multirpm_count` | `uint8_t` | `23` | Number of profiles = `SCALE_CURVE_POINTS - 1` |
-| `master_dom_order` | `static uint16_t` | `1` then locked | Dominant harmonic order from profile 0 |
-| `master_ref_mag` | `static float` | `0.0f` then set | Reference magnitude at profile 0 |
+| `cogging_calib_count` | `uint8_t` | `1` (default 3 from init) | Number of RPM profiles (up to `COGGING_MAX_CALIB_PROFILES` = 5) |
+| `cogging_calib_rpm[]` | `float[5]` | `{3.0, 10.0, 20.0, 0, 0}` | RPM targets per profile |
+| `cogging_calib_iters[]` | `uint16_t[5]` | `{1, 1, 1, 0, 0}` | DFT iterations per profile |
 
 ### Curve arrays zeroed
 
 ```cpp
 memset(scale_curve_values, 0, sizeof(scale_curve_values));
 memset(phase_advance_curve_values, 0, sizeof(phase_advance_curve_values));
-// Plateau always scale=1.0, phase=0.0°
 scale_curve_values[0] = 1.0f;
 phase_advance_curve_values[0] = 0.0f;
 ```
@@ -141,33 +159,29 @@ cogging_warmup_ms = max(1500, J/100.0f × calib_rpm + 1000), capped at 8000;
 ## STEP 3 — Multi-RPM Calibration Loop
 
 ```cpp
-#ifdef COGGING_PHASE_SHIFT_MULTIRPM
-    uint8_t multirpm_count = SCALE_CURVE_POINTS - 1; // 23 profiles
-    for (uint8_t rpm_profile = 0; rpm_profile < multirpm_count; rpm_profile++) {
-        calib_rpm = scale_curve_rpm_points[rpm_profile + 1]; // skip RPM 0
-        // calib_rpm = 5, 7, 10, 12, 15, 20, 25, ..., 256
-#else
-    for (rpm_profile = 0; rpm_profile <= cogging_calib_count; rpm_profile++) {
-        calib_rpm = cogging_calib_rpm[rpm_profile]; // user-configured
-#endif
+for (uint8_t rpm_profile = 0;
+     rpm_profile < this->cogging_calib_count && !emergency && hasPower();
+     rpm_profile++) {
+
+    calib_rpm = this->cogging_calib_rpm[rpm_profile];
+    if (calib_rpm <= 0.0f) calib_rpm = 60.0f / (float)COGGING_CALIB_TIME_PER_REV_S;
+    const uint8_t MAX_DFT_ITERATIONS = this->cogging_calib_iters[rpm_profile];
 ```
 
 ### 3a — Per-Profile PID Loading
 
 ```cpp
-// MULTIRPM: wrap profile index to COGGING_MAX_CALIB_PROFILES-1 for array safety
 uint8_t pid_src = rpm_profile;
-#ifdef COGGING_PHASE_SHIFT_MULTIRPM
-    if (pid_src >= COGGING_MAX_CALIB_PROFILES) pid_src = COGGING_MAX_CALIB_PROFILES - 1;
-#endif
-pid_soft.Kp = cogging_calib_pidP[pid_src];
-pid_soft.Ki = cogging_calib_pidI[pid_src];
-pid_soft.Kd = cogging_calib_pidD[pid_src];
-
+uint32_t pidP = this->cogging_calib_pidP[pid_src];
+uint32_t pidI = this->cogging_calib_pidI[pid_src];
+uint32_t pidD = this->cogging_calib_pidD[pid_src];
 // If all zeros (unconfigured slot), copy from slot 0 (IMC baseline):
 if (pid_src > 0 && pidP == 0 && pidI == 0 && pidD == 0) {
-    pidP = cogging_calib_pidP[0]; // fallback to IMC
+    pidP = this->cogging_calib_pidP[0];
+    pidI = this->cogging_calib_pidI[0];
+    pidD = this->cogging_calib_pidD[0];
 }
+this->coggingSpeedP = (float)pidP;
 ```
 
 ---
@@ -262,17 +276,14 @@ while (test_kp < kp_tune_ceiling && step_count < MAX_TUNE_STEPS(20)) {
 ### Store result
 
 ```cpp
-coggingSpeedP = best_kp;
-coggingSpeedI = 0.0f;
-coggingSpeedD = 0.0f;
-#ifdef COGGING_PHASE_SHIFT_MULTIRPM
-    uint8_t store_src = min(rpm_profile, COGGING_MAX_CALIB_PROFILES-1);
-    cogging_calib_pidP[store_src] = (uint32_t)best_kp;
-    cogging_calib_pidI[store_src] = 0;
-    cogging_calib_pidD[store_src] = 0;
-#else
-    cogging_calib_pidP[rpm_profile] = (uint32_t)best_kp;
-#endif
+this->coggingSpeedP = best_kp;
+this->coggingSpeedI = 0.0f;
+this->coggingSpeedD = 0.0f;
+uint8_t store_src = (rpm_profile < COGGING_MAX_CALIB_PROFILES)
+    ? rpm_profile : (COGGING_MAX_CALIB_PROFILES - 1);
+this->cogging_calib_pidP[store_src] = (uint32_t)best_kp;
+this->cogging_calib_pidI[store_src] = 0;
+this->cogging_calib_pidD[store_src] = 0;
 ```
 
 ---
@@ -392,45 +403,62 @@ for (int k = 1; k < COGGING_CALIB_DFT_HARMONICS; k++) {
 }
 ```
 
-### CW+CCW Combination (Piccoli phase alignment)
+### CW+CCW Combination (complex vector averaging)
 
 ```cpp
 // Build top-20 combined harmonics:
-for (int k = 5; k < COGGING_CALIB_DFT_HARMONICS; k++) {
+for (int k = 1; k < COGGING_CALIB_DFT_HARMONICS; k++) {
     float avg_mag = (cw_harms[k].mag + ccw_harms[k].mag) / 2.0f;
 
-    // Phase unwrapping:
-    float phase_diff = cw_phase - ccw_phase;
-    if (phase_diff > π) ccw_phase += 2π;
-    if (phase_diff < -π) ccw_phase -= 2π;
-    float avg_phase = (cw_phase + ccw_phase) / 2.0f;
+    // Convert phases to complex vectors → average → extract combined phase
+    // (avoids wrap-around bugs near ±π)
+    float cw_re = cosf(cw_harms[k].phase);
+    float cw_im = sinf(cw_harms[k].phase);
+    float ccw_re = cosf(ccw_harms[k].phase);
+    float ccw_im = sinf(ccw_harms[k].phase);
+    float avg_re = (cw_re + ccw_re) / 2.0f;
+    float avg_im = (cw_im + ccw_im) / 2.0f;
+    float avg_phase = atan2f(avg_im, avg_re);
 
     // Insertion sort into top-20 by magnitude
 }
 
-// Broadcast CW/CCW raw data for configurator:
+// Store CW/CCW raw harmonics for configurator offset tuning:
 cw_store[0..19] = top CW harmonics;
 ccw_store[0..19] = top CCW harmonics;
 ```
 
-### DFT Clamp Retry
+### DFT Clamp Retry (unlimited)
 
 ```cpp
 // If acquisition saturated torque, Kp is too high for this RPM.
-// Lower Kp and restart DFT (up to DFT_MAX_CLAMP_RETRIES(3) times).
-if (dft_clamped && retries_remaining) {
-    pid_soft.Kp /= 1.25f;
-    coggingSpeedP = pid_soft.Kp;
-    memset(active_tbl, 0, ...);
-    applySafeTorque(0);
-    Delay(250);
-    continue;
+// Lower Kp and restart DFT. No retry limit — keeps dividing by
+// 1.25 until either DFT succeeds or Kp hits floor (50).
+for (;;) {
+    if (pid_soft.Kp < 50.0f || emergency) {
+        broadcastCalibLog(0, "DFT clamp retries hit Kp floor (%.0f).", pid_soft.Kp);
+        break;
+    }
+    // ... run DFT ...
+    if (dft_clamped) {
+        pid_soft.Kp /= 1.25f;
+        memset(active_tbl, 0, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
+        applySafeTorque(0);
+        Delay(250);
+        continue;
+    }
+    break; // success
 }
 ```
 
 ---
 
-## STEP 3d — Phase-Lag Extraction (MULTIRPM)
+## STEP 3d — Phase-Lag Extraction
+
+*Requires `COGGING_PHASE_SHIFT_MULTIRPM` to be defined (currently commented out).*
+
+When active, tracks the dominant harmonic across all RPM profiles to extract
+amplitude attenuation and phase lag vs the baseline profile:
 
 ```cpp
 #ifdef COGGING_PHASE_SHIFT_MULTIRPM
@@ -462,34 +490,21 @@ if (dft_clamped && retries_remaining) {
     float phase_diff = cw_ph - ccw_ph;
     if (phase_diff > π) phase_diff -= 2π;
     if (phase_diff < -π) phase_diff += 2π;
-```
 
-### Profile 0 (baseline)
-
-```cpp
+    // Profile 0 = baseline (scale=1.0, phase=0.0°)
     if (rpm_profile == 0) {
-#ifndef COGGING_DISABLE_SCALE_CURVE
         scale_curve_values[0] = 1.0f;
-#endif
         phase_advance_curve_values[0] = 0.0f;
         master_ref_mag = avg_mag;
     }
-```
-
-### Higher profiles (extract phase lag & attenuation)
-
-```cpp
+    // Higher profiles: extract scale & phase lag
     else {
         float scale = avg_mag / master_ref_mag;
         scale = clip(scale, 0.1f, 3.0f);
-
         float lag_mech_rad = fabsf(phase_diff/2.0f) / (float)master_dom_order;
         float lag_mech_deg = lag_mech_rad × (180.0f/π);
-
         uint8_t idx = rpm_profile + 1;
-#ifndef COGGING_DISABLE_SCALE_CURVE
         scale_curve_values[idx] = scale;
-#endif
         phase_advance_curve_values[idx] = lag_mech_deg;
         scale_curve_count = max(scale_curve_count, idx+1);
     }
@@ -534,12 +549,47 @@ scale_curve_values[0] = 1.0f;
 phase_advance_curve_values[0] = 0.0f;
 ```
 
-### Save to flash
+### Precompute combined bins + Save to flash
 
 ```cpp
+// Average CW and CCW bins into combined LUT (used by FF mode 1)
+for (uint32_t b = 0; b < COGGING_DFT_BIN_COUNT; b++)
+    this->cogging_bins_combined[b] = (this->cw_bins[b] + this->ccw_bins[b]) * 0.5f;
+
 saveCoggingTable();         // cogging_harmonics → flash
 // saveFlash() only writes scale_curve if scale_curve_valid is true
 ```
+
+---
+
+## Verification Pass
+
+After each profile's DFT completes, the firmware runs a **CW + CCW verification pass** (one revolution each direction) with the finalized feedforward active. The residual torque is collected into spatial bins (`ver_cw_bins[720]` / `ver_ccw_bins[720]`), and the top-20 residual harmonics are extracted and saved to `ver_cw_top[20]` / `ver_ccw_top[20]`.
+
+```cpp
+// Broadcast residual (order : amplitude : phase_rad):
+VERIFY CW residual (order : amplitude : phase_rad):
+1 : 115.7 : -0.0779
+2 : 73.9 : 1.3866
+...
+```
+
+Low residuals → good calibration. High residuals → try more DFT iterations or adjust PID.
+
+The verification data is readable from the configurator via `coggingBins` command (adr 2-3 = ver bins, adr 4-5 = ver top-20 DFT).
+
+---
+
+### Combined DFT Harmonics vs Combined Bins
+
+The system produces **two different "combined" datasets** from the CW and CCW sweeps:
+
+| Dataset | How it's made | Used for |
+|---|---|---|
+| **Combined DFT harmonics** (`cogging_harmonics[]`) | Average CW & CCW DFT magnitudes; average phases via complex vector (cos+sin → average → atan2). Top 20 by magnitude. | Configurator graph, runtime FF mode 0 (harmonic sum) |
+| **Combined bins** (`cogging_bins_combined[720]`) | Simple average of 720 CW and CCW spatial bins: `(cw_bins[b] + ccw_bins[b]) * 0.5f` | Runtime FF mode 1 (bin LUT) |
+
+The configurator's **Harmonic Editor** graph always shows the **combined DFT harmonics** — it reconstructs a smooth sine wave by summing `amp × sin(order × θ + phase)` for each harmonic. This is why the graph appears centered on the DFT reconstruction (smooth, sinusoidal) rather than the raw bins (jagged, noisy, with friction asymmetry preserved).
 
 ---
 

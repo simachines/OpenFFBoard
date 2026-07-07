@@ -11,9 +11,9 @@ the detent torque profile, then replays it as a Fourier-series feedforward to ca
 1. Open the **Configurator**, select your TMC driver tab.
 2. Click **"Cogging Calibration"** (button below the state indicator). This opens the multi-tab dialog.
 3. In the **"Cogging Calibration"** tab (first tab):
-   - Set the **number of RPM profiles** (read-only — comes from firmware, currently always 3).
-   - PER-PROFILE: set the target RPM and number of DFT iterations.  
-     *One iteration at 3 RPM is usually enough for a clean map.*
+   - Set the **number of RPM profiles** (1–5, default 3 from firmware).
+   - PER-PROFILE: set the target RPM (defaults: 3/10/20 RPM) and number of DFT iterations.  
+     *One iteration at low RPM is usually enough for a clean map.*
    - Check **"Auto Velocity PID Tune"** to let the firmware find the optimal speed-loop P gain for each profile.
    - Keep **"Inertia Acceleration Correction"** OFF unless you have high inertia and see noisy results.  
      *(When ON, the DFT subtracts $J \cdot \alpha$ from the signal. Requires a valid $J$ from SysId.)*
@@ -70,20 +70,37 @@ float mag = sqrtf(re*re + im*im);       // amplitude in torque-command units
 float phase = atan2f(re, im);           // phase in radians
 ```
 
-### 2.4 CW+CCW Averaging (Piccoli Method)
+### 2.4 CW+CCW Averaging (Complex Vector Method)
 
-CW and CCW sweeps produce independent `[mag, phase]` pairs. Directly averaging phases can produce wrong results near ±π due to wrap-around. Instead, the phases are converted to complex vectors and averaged:
+CW and CCW sweeps produce independent `[mag, phase]` pairs. Directly averaging phases can produce wrong results near ±π due to wrap-around. The method uses complex vector averaging for phases:
 
 ```cpp
-float cw_re = cosf(cw_phase), cw_im = sinf(cw_phase);
-float ccw_re = cosf(ccw_phase), ccw_im = sinf(ccw_phase);
+// Average magnitude (cancels AC-neutral friction bias)
+float avg_mag = (cw_harms[k].mag + ccw_harms[k].mag) / 2.0f;
+
+// Convert phases to complex vectors, average, extract combined phase
+// (avoids wrap-around bugs near ±π)
+float cw_re = cosf(cw_harms[k].phase);
+float cw_im = sinf(cw_harms[k].phase);
+float ccw_re = cosf(ccw_harms[k].phase);
+float ccw_im = sinf(ccw_harms[k].phase);
 float avg_re = (cw_re + ccw_re) / 2.0f;
 float avg_im = (cw_im + ccw_im) / 2.0f;
 float avg_phase = atan2f(avg_im, avg_re);
-float avg_mag = (cw_mag + ccw_mag) / 2.0f;
 ```
 
-This cancels friction bias (AC-neutral) and PID tracking-lag delta (phase shifts in opposite directions for CW vs CCW).
+This cancels friction bias (AC-neutral) — friction adds equally in both directions, so averaging cancels it out. It also cancels PID tracking-lag delta (phase shifts in opposite directions for CW vs CCW), leaving only the pure cogging component.
+
+### 2.4b Combined DFT Harmonics vs Combined Bins
+
+The system produces **two different combined datasets** from the CW and CCW sweeps:
+
+| Dataset | How it's made | Purpose |
+|---|---|---|
+| **Combined DFT harmonics** (`cogging_harmonics[]`) | Average CW & CCW DFT magnitudes; complex-vector average of phases. Top 20 by magnitude. | FF mode 0 (harmonic sum), configurator graph |
+| **Combined bins** (`cogging_bins_combined[720]`) | Simple spatial average: `(cw_bins[b] + ccw_bins[b]) * 0.5f` | FF mode 1 (bin LUT) |
+
+The configurator's Harmonic Editor graph reconstructs a waveform from the **combined DFT harmonics** only — summing `amp × sin(order × θ + phase)` for each harmonic. This produces a smooth, sinusoidal curve. The bins (raw spatial torque samples) are noisier and include higher-frequency content that the top-20 DFT truncates.
 
 ### 2.5 Top-N Selection → Compensation Table
 
@@ -136,15 +153,47 @@ The auto-tuned P is stored in `cogging_calib_pidP[rpm_profile]` for the DFT swee
 
 ## 5. Multi-RPM Profile System
 
-Three independent cogging maps, each calibrated at a user-configurable RPM:
+Up to 5 configurable RPM profiles (`COGGING_MAX_CALIB_PROFILES = 5`), each with independent
+RPM target, DFT iterations, and velocity PID settings. The first 3 profiles have dedicated
+flash storage tables; profiles 4+ reuse the last table for PID storage only:
 
-| Profile | Default RPM | Flash Index | RAM Table |
-|:---|:---|:---|:---|
-| Profile 1 (Low) | 3 | `drv-1 + 0×3` | `cogging_harmonics` |
-| Profile 2 (Mid) | 30 | `drv-1 + 1×3` | `cogging_harmonics_rpm2` |
-| Profile 3 (High) | 100 | `drv-1 + 2×3` | `cogging_harmonics_rpm3` |
+| Profile | Default RPM | DFT Iters | Flash Index | RAM Table |
+|:---|:---|:---|:---|:---|
+| Profile 1 (Low) | 3.0 | 1 | `drv-1 + 0×3` | `cogging_harmonics` |
+| Profile 2 (Mid) | 10.0 | 1 | `drv-1 + 1×3` | `cogging_harmonics_rpm2` |
+| Profile 3 (High) | 20.0 | 1 | `drv-1 + 2×3` | `cogging_harmonics_rpm3` |
+| Profile 4+ | user-set | user-set | N/A (PID only) | N/A |
 
-Each profile writes directly into its own target table (`active_tbl` pointer). At runtime, `blendHarmonicTables()` interpolates between adjacent tables based on measured RPM. Below `blend_rpm1` → 100% low; above highest valid → 100% that table.
+### Runtime blending
+
+*Requires `COGGING_DISABLE_BLEND` to be commented out (currently active — blending disabled).*
+
+When enabled, `blendHarmonicTables(measured_rpm, blended)` interpolates between adjacent
+tables at the **harmonic level** — matching orders between tables, then linearly interpolating
+amplitude and phase with unwrapping:
+
+```cpp
+float t = (rpm - blend_rpm1) / (blend_rpm2 - blend_rpm1);
+w_lo = 1.0f - t;  w_hi = t;
+// For each harmonic order found in tab_a:
+out_table[i].amplitude = amp_a * w_lo + amp_b * w_hi;
+out_table[i].phase = ph_a * w_lo + ph_b * w_hi;
+```
+
+Below `blend_rpm1` → 100% low; above highest valid → 100% that table.
+
+### Per-profile DFT targeting
+
+Each profile's DFT measures into a dedicated `active_tbl` pointer:
+
+```cpp
+Harmonic* active_tbl = this->cogging_harmonics;
+if (rpm_profile == 1) active_tbl = this->cogging_harmonics_rpm2;
+else if (rpm_profile >= 2) active_tbl = this->cogging_harmonics_rpm3;
+```
+
+The routine is identical for every profile: `memset(active_tbl, 0)` at start, empty on
+iteration 0 → measures full cogging fresh, phasor-add refines on later iterations.
 
 ---
 
@@ -208,67 +257,46 @@ The global struct `g_tmc4671_cogging_debug` provides live inspection during cali
 
 ---
 
-## 10. Commands Reference
-
-| Command | Access | Description |
-|:---|:---|:---|
-| `calibrateCogging` | GET | Start calibration |
-| `cogging` | GET/SET | Enable/disable (1/0) |
-| `coggingScale` | GET/SET | Global scale (×10000) |
-| `coggingHarmonics` | GET | Harmonic table: `order:amp:phase,…` (adr 0=low, 1=rpm2, 2=rpm3) |
-| `coggingCwCcw` | GET | Raw CW/CCW harmonics |
-| `coggingH3` | GET/SETADR | Set harmonics: adr 3=clear, 4=set amp+order, 5=set phase |
-| `coggingSave` | GET | Save cogging table to flash |
-| `scaleCurve` | GET/SETADR | 24-pt scale curve (×1000) |
-| `phaseAdvCurve` | GET/SETADR | 24-pt phase advance (deg ×100) |
-| `coggingCalibCount` | GET | Number of RPM profiles |
-| `coggingCalibRPM` | GETADR/SETADR | RPM ×10 per profile |
-| `coggingCalibIters` | GETADR/SETADR | DFT iterations per profile |
-| `coggingCalibPidP/I/D` | GETADR/SETADR | Manual PID per profile |
-| `coggingCalibAutoPid` | GET/SET | Auto PID tune (1=auto, 0=manual) |
-| `coggingCalibInertiaCorr` | GET/SET | Inertia acceleration correction (1=on) |
-| `coggingCalibFrictionFF` | GET/SET | Friction feedforward during DFT (1=on) |
-
----
-
-## 11. Key Details & Gotchas
-
-- **Phase is in radians** everywhere in `cogging_harmonics[]`. The configurator receives phase ×1000 in the serial protocol and converts back.
-- **DFT signal source**: With `COGGING_DFT_USE_IQ_CMD` defined, the DFT uses `iq_cmd` (PID output). Without it, `actual_iq_raw` (ADC counts) is used. Both are in the same abstract unit space for a given board.
-- **Warmup excludes data**: The first `cogging_warmup_ms` (default 1500 ms, scales with $J$) is ramp-only — no DFT accumulation during this period.
-- **Return-to-center**: After calibration, the motor automatically returns to position 0 to undo accumulated rotations.
-- **SET commands must NOT push to replies**: For commands with CMDFLAG_SET, the SET branch must return nothing. Pushing to replies from SET causes board resets.
-
 ## 2. Runtime Compensation
 
-### 2.1 Multi-RPM Waveform Blending
+### 2.1 Feed-Forward Source Selection
 
-Implemented in `TMC4671::turn()`. The three maps are reconstructed independently and blended **in the torque domain** (not the harmonic/phasor domain), so the maps do not need to share the same harmonic orders:
+The `cogging_ff_mode` parameter selects the compensation source:
 
-$$ \alpha_{12} = \text{clamp}\!\left(\frac{\text{rpm} - \text{rpm}_{\text{low}}}{\text{rpm}_{\text{hi}} - \text{rpm}_{\text{low}}},\,0,\,1\right) $$
+| Mode | Source | Description |
+| :--- | :--- | :--- |
+| 0 | Harmonic sum (default) | Fourier sum from `cogging_harmonics[]` table |
+| 1 | Combined bin LUT | `cogging_bins_combined[]` — friction-free, pure cogging |
+| 2 | Per-direction bin LUT | `cw_bins[]` or `ccw_bins[]` — includes friction asymmetry |
 
-$$ \alpha_{23} = \text{clamp}\!\left(\frac{\text{rpm} - \text{rpm}_{\text{hi}}}{\text{rpm}_{\text{ultra}} - \text{rpm}_{\text{hi}}},\,0,\,1\right) $$
+### 2.2 Multi-RPM Harmonic Blending
+
+*Requires `COGGING_DISABLE_BLEND` to be commented out (currently active — disabled).*
+
+When enabled, `blendHarmonicTables(measured_rpm, blended)` interpolates between adjacent
+harmonic tables at the **harmonic level** (not torque-domain). Orders present in only one
+table of a blend pair are dropped at the blend midpoint:
 
 | RPM range | Compensation |
 | :--- | :--- |
-| $\text{rpm} \le \text{rpm}_{\text{low}}$ | 100% RPM#1 |
-| $\text{rpm}_{\text{low}} < \text{rpm} \le \text{rpm}_{\text{hi}}$ | $(1-\alpha_{12})\,\text{RPM}\#1 + \alpha_{12}\,\text{RPM}\#2$ |
-| $\text{rpm}_{\text{hi}} < \text{rpm} \le \text{rpm}_{\text{ultra}}$ | $(1-\alpha_{23})\,\text{RPM}\#2 + \alpha_{23}\,\text{RPM}\#3$ |
-| $\text{rpm} > \text{rpm}_{\text{ultra}}$ | 100% RPM#3 |
+| $\text{rpm} \le \text{blend\_rpm1}$ | 100% low table (`cogging_harmonics`) |
+| $\text{blend\_rpm1} < \text{rpm} \le \text{blend\_rpm2}$ | Harmonic lerp low ↔ rpm2 |
+| $\text{blend\_rpm2} < \text{rpm} \le \text{blend\_rpm3}$ | Harmonic lerp rpm2 ↔ rpm3 |
+| $\text{rpm} > \text{blend\_rpm3}$ | 100% highest valid table |
 
-The crossover points (`blend_low_rpm`, `blend_high_rpm`, `blend_ultra_rpm`) default to the calibration sweep speeds but can be retuned live via the configurator or serial commands.
+The crossover points default to the calibration sweep speeds.
 
-### 2.2 Velocity-Based Phase Advance
+### 2.3 Velocity-Based Phase Advance
 
 A position offset proportional to RPM compensates for high-speed loop latency. Stored as a 24-point curve (degrees vs RPM) in EEPROM. Applied before waveform lookup:
 
 $$\theta' = \theta + \text{sign}(\omega) \cdot \frac{\text{adv}(\text{rpm})}{360}$$
 
-### 2.3 Speed-Dependent Scale Curve
+### 2.4 Speed-Dependent Scale Curve
 
 A 24-point curve interpolates `cogging_scale` by measured RPM to counteract current-loop amplitude rolloff at higher speeds. Stored in EEPROM alongside the phase-advance curve.
 
-### 2.4 Harmonic Waveshaping
+### 2.5 Harmonic Waveshaping
 
 A shaping term applied to the dominant harmonic to thin peaks / steepen slopes:
 
@@ -278,7 +306,7 @@ $$T_{\text{shaped}} = T_{\text{comp}} - s \cdot A_{\text{dom}} \cdot \sin\!\big(
 - $m$: harmonic multiplier (default 3)
 - $\phi_{\text{trim}}$: extra phase offset
 
-### 2.5 Full Runtime Formula
+### 2.6 Full Runtime Formula
 
 $$T_{\text{comp}}(\theta, \omega) = \text{scale}(\omega) \cdot \left[ \text{blend}\!\big(T_1(\theta'),\, T_2(\theta'),\, T_3(\theta'),\, \omega\big) - \text{shape}(T_{\text{dom}}) \right]$$
 
@@ -294,9 +322,9 @@ Three maps per TMC driver, stored in a dedicated flash sector (sector 4 at `0x08
 
 | Slot | Contents |
 | :--- | :--- |
-| 0–2 | Low-RPM maps (drv0, drv1, drv2) |
-| 3–5 | Hi-RPM maps |
-| 6–8 | Ultra-RPM maps |
+| 0–2 | Low-RPM maps (drv0, drv1, drv2) — `cogging_harmonics` |
+| 3–5 | Mid-RPM maps (drv0, drv1, drv2) — `cogging_harmonics_rpm2` |
+| 6–8 | High-RPM maps (drv0, drv1, drv2) — `cogging_harmonics_rpm3` |
 
 Each slot: `COGGING_TABLE_SIZE = COGGING_HARMONICS_COUNT × 12 = 240` bytes (20 harmonics × {float amp, float phase, uint16 order}).
 
@@ -312,9 +340,9 @@ Per-driver settings persisted in the EEPROM emulation region:
 | :--- | :--- |
 | `0x32D–0x32F` | Cogging enable, scale, dynamic offset |
 | `0x420–0x4AF` | 24-pt scale curve + 24-pt phase advance curve (all 3 drivers) |
-| `0x4B0–0x4B8` | H3 waveshaping per driver |
-| `0x4B9–0x4BE` | Blend crossover + hi validity per driver |
-| `0x4BF–0x4C4` | Blend crossover + ultra validity per driver |
+| `0x4B0–0x4B8` | H3 waveshaping per driver (`h3Shaping`, `h3PhaseTrim`, `h3Mult`) |
+| `0x4B9–0x4BE` | Blend RPM#2 crossover + valid flag per driver |
+| `0x4BF–0x4C4` | Blend RPM#3 crossover + valid flag per driver |
 
 `NB_OF_VAR = 399`.
 
@@ -323,42 +351,62 @@ Per-driver settings persisted in the EEPROM emulation region:
 | Component | Size | Lifecycle |
 | :--- | :--- | :--- |
 | `cogging_harmonics[]` (low) | 240 B | Permanent |
-| `cogging_harmonics_hi[]` | 240 B | Permanent |
-| `cogging_harmonics_ultra[]` | 240 B | Permanent |
+| `cogging_harmonics_rpm2[]` | 240 B | Permanent |
+| `cogging_harmonics_rpm3[]` | 240 B | Permanent |
 | `cw_store[]` / `ccw_store[]` | 480 B | Permanent |
+| `cw_bins[720]` / `ccw_bins[720]` | 5.6 KB | Permanent |
+| `cogging_bins_combined[720]` | 2.8 KB | Permanent |
 | Scale curve values | 96 B | Permanent |
 | Phase advance curve values | 96 B | Permanent |
 | DFT accumulators (128 harmonics) | ~2 KB | Calibration only (heap) |
-| Full `CoggingCalibData` | ~17 KB | Calibration only (heap) |
-| **Total permanent** | ~1.4 KB | — |
+| Spatial bin accumulators (720 bins) | ~3 KB | Calibration only (heap) |
+| **Total permanent** | ~10 KB | — |
 
 ---
 
 ## 4. Commands Reference
 
+### Calibration Commands
+
+| Command | Access | Description |
+| :--- | :--- | :--- |
+| `calibrateCogging` | GET | Start calibration |
+| `cogging` | GET/SET | Enable/disable (1/0) |
+| `coggingScale` | GET/SET | Global scale (×10000) |
+| `coggingFFMode` | GET/SET | FF source: 0=harmonics, 1=combined bins, 2=per-direction bins |
+| `coggingBins` | GETADR | Spatial bin snapshots (adr 0=CW, 1=CCW, 2=verCW, 3=verCCW, 4=verCWharm, 5=verCCWharm) |
+| `coggingHarmonics` | GET | Harmonic table: `order:amp:phase,…` (adr 0=low, 1=rpm2, 2=rpm3) |
+| `coggingCwCcw` | GET | Raw CW/CCW harmonics (`CW:…|CCW:…`) |
+| `coggingH3` | GET/SETADR | Waveshaping: adr 3=clear, 4=set amp+order, 5=set phase |
+| `coggingSave` | GET | Save cogging table to flash |
+
 ### Multi-RPM Commands
 
 | Command | Access | Format | Description |
 | :--- | :--- | :--- | :--- |
-| `coggingHarmonics` | GET | `order:amp:phase,…` | Low-RPM harmonic table (phase ×1000) |
-| `coggingHarmonicsHi` | GET | `order:amp:phase,…` | Hi-RPM (RPM#2) harmonic table |
-| `coggingHarmonicsUltra` | GET | `order:amp:phase,…` | Ultra-RPM (RPM#3) harmonic table |
-| `coggingBlendHigh` | GET/SET | RPM ×100 | RPM#2 crossover (set 0 or 0xFFFF to ignore) |
-| `coggingBlendUltra` | GET/SET | RPM ×100 | RPM#3 crossover |
-| `coggingHiValid` | GET | `0` or `1` | RPM#2 map validity |
-| `coggingUltraValid` | GET | `0` or `1` | RPM#3 map validity |
-| `coggingClearHi` | GET | — | Clears RPM#2+3 maps & marks invalid |
+| `coggingBlendRpm2` | GET/SET | RPM ×10 | RPM#2 blend crossover |
+| `coggingBlendRpm3` | GET/SET | RPM ×10 | RPM#3 blend crossover |
+| `coggingRpm2Valid` | GET | `0` or `1` | RPM#2 map validity |
+| `coggingRpm3Valid` | GET | `0` or `1` | RPM#3 map validity |
 
-### Tuning Commands
+### Curve Commands
 
 | Command | Access | Description |
 | :--- | :--- | :--- |
 | `scaleCurve` | GET/SETADR | 24-pt scale curve (value ×1000) |
-| `phaseAdvCurve` | GET/SETADR | 24-pt phase advance in degrees (value ×100) |
-| `coggingH3` | GET/SETADR | Waveshaping: `shaping:phaseTrim:mult` |
-| `coggingScale` | GET/SET | Static scale (×10000) |
-| `cogging` | GET/SET | Cogging enable/disable |
-| `calibrateCogging` | GET | Start multi-pass calibration |
+| `phaseAdvCurve` | GET/SETADR | 24-pt phase advance (deg ×100) |
+
+### Per-Profile Calibration Commands
+
+| Command | Access | Description |
+| :--- | :--- | :--- |
+| `coggingCalibCount` | GET/SET | Number of RPM profiles (1–5) |
+| `coggingCalibRPM` | GETADR/SETADR | RPM ×10 per profile |
+| `coggingCalibIters` | GETADR/SETADR | DFT iterations per profile |
+| `coggingCalibPidP/I/D` | GETADR/SETADR | Manual velocity PID per profile |
+| `coggingCalibAutoPid` | GET/SET | Auto PID tune (1=auto, 0=manual) |
+| `coggingCalibInertiaCorr` | GET/SET | Inertia acceleration correction (1=on) |
+| `coggingCalibFrictionFF` | GET/SET | Friction feedforward during DFT (1=on) |
 
 ---
 
@@ -367,11 +415,13 @@ Per-driver settings persisted in the EEPROM emulation region:
 ```c
 // TMC4671.h
 #define COGGING_CALIB_TIME_PER_REV_S    20      // Low-RPM sweep: 60/20 = 3 RPM
-#define COGGING_CALIB_HI_RPM            30.0f   // RPM#2 sweep speed
-#define COGGING_CALIB_ULTRA_RPM         100.0f  // RPM#3 sweep speed
 #define COGGING_CALIB_DFT_HARMONICS     128     // Harmonics analyzed during DFT
+#define COGGING_DFT_BIN_COUNT           720     // Spatial bins for noise-robust DFT (0.5° per bin)
 #define COGGING_HARMONICS_COUNT         20      // Stored in each map
+#define COGGING_MAX_CALIB_PROFILES      5       // Max configurable RPM profiles
 #define COGGING_DFT_USE_IQ_CMD                  // Use iq_cmd (residual) for DFT, not raw ADC
+// #define COGGING_DISABLE_BLEND                  // Uncomment to enable multi-RPM blending
+// #define COGGING_PHASE_SHIFT_MULTIRPM          // Uncomment for 23-point scale/phase curves
 
 // target_constants.h (all targets)
 #define COGGING_TABLE_FLASH_START_ADDRESS 0x08010000
@@ -410,7 +460,10 @@ Analyzes the Id (flux) axis. Significant H3 or H6 energy indicates phase imbalan
 High H1 magnitude on the Iq axis signals rotor eccentricity, bent shaft, or encoder misalignment.
 
 ### Harmonic Anti-Cogging
-The system scans 128 harmonics and selects the top 20 peaks. Orders 1–10 are excluded to capture magnetic detent while ignoring gravitational imbalance from asymmetric wheels.
+The system scans 128 harmonics (`k = 1..127`) and selects the top 20 peaks by magnitude.
+Order 1 is included — it captures residual mechanical imbalance or eccentricity.
+Orders beyond ~20 typically have negligible amplitude on most motors, but the full
+128-order DFT ensures they won't alias into the selected band.
 
 ### Live Debugging
 A global `g_tmc4671_cogging_debug` struct provides ST-Link live-inspection of the current calibration phase, PID rate, position error, `iqPid`, `iqFriction`, `iqInertia`, `iqCompensation`, `iqApplied`, and per-quarter max error.
@@ -423,19 +476,25 @@ A global `g_tmc4671_cogging_debug` struct provides ST-Link live-inspection of th
 
 The **Manual Tuning** dialog (Scale & Phase Advance Curves) includes a **Multi-RPM Blend** tab with:
 
-- **RPM#2 crossover** spinbox (editingFinished → `send_value coggingBlendHigh`)
-- **RPM#3 crossover** spinbox (editingFinished → `send_value coggingBlendUltra`)
+- **RPM#2 crossover** spinbox (editingFinished → `send_value coggingBlendRpm2`)
+- **RPM#3 crossover** spinbox (editingFinished → `send_value coggingBlendRpm3`)
 - **Clear maps** button (sends `coggingClearHi` GET — cannot fire from spinbox Enter due to `setAutoDefault(False)`)
-- **Overlay chart**: low (blue), RPM#2 (red), RPM#3 (orange) — one revolution of each reconstructed waveform
+- **Overlay chart**: profile 1 (blue), RPM#2 (red), RPM#3 (orange) — one revolution of each reconstructed waveform
 - **Validity status**: shows ✓/✗ for both RPM#2 and RPM#3
-
-### Scale & Phase Curve Editors
-
-24 RPM breakpoints: `{0, 5, 7, 10, 12, 15, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200, 225, 256}`. Each point is a spinbox; edits push to firmware immediately. Live RPM dot tracks current velocity on the chart.
 
 ### Harmonic Editor Tab
 
-Slider + spinbox for shaping factor (−1.0 to +1.0), phase trim (−180° to +180°), and multiplier (1–31). Chart previews original vs shaped waveform over one revolution.
+- **RPM profile selector**: Switch between calibrated RPM maps.
+- **Chart view toggle**: Waveform (angle domain) or Harmonic Magnitudes (bar chart).
+- **Per-harmonic magnitude spinboxes**: Edit the amplitude of each harmonic.
+- **"Apply to Firmware" button**: Sends edited magnitudes to the MCU via `coggingH3` setat.
+- **Live position dot + angle readout**: Red dot tracks actual rotor angle.
+- **CW/CCW overlay checkbox**: Shows raw direction-specific waveforms.
+- **Download/Copy/Load/Clear buttons**: Export/import harmonic data as text files.
+
+### Scale & Phase Curve Editors
+
+24 RPM breakpoints: `{3, 5, 7, 10, 12, 15, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200, 225, 256}`. Each point is a spinbox; edits push to firmware immediately. Live RPM dot tracks current velocity on the chart.
 
 ---
 
@@ -443,16 +502,16 @@ Slider + spinbox for shaping factor (−1.0 to +1.0), phase trim (−180° to +1
 
 ### Why Three Maps Instead of One?
 
-A single DFT map captured at 3 RPM is accurate at low speed but degrades as speed increases because the closed-loop torque path introduces:
+A single DFT map captured at low RPM is accurate at low speed but degrades as speed increases because the closed-loop torque path introduces:
 
 1. **Amplitude attenuation**: the TMC4671 current loop has finite bandwidth; at higher electrical frequencies the commanded $i_q$ amplitude rolls off.
 2. **Phase lag**: the main loop read→compute→command latency, TMC4671 internal current-loop delay, and encoder processing delay produce a phase lag proportional to $\omega \cdot \tau$ per harmonic.
 
 A single map cannot compensate for both simultaneously across a wide speed range. The multi-map approach measures the *net* distortion at each speed band and replays it — the map captured at speed $X$ cancels perfectly at speed $X$ and blends smoothly in between.
 
-### Why Blend in Torque Domain?
+### Why Blend at the Harmonic Level?
 
-The three maps may contain different top-20 harmonic orders (a harmonic that dominates at 3 RPM may be buried at 100 RPM, and vice versa). Matching orders across tables for phasor-domain blending is lossy and fiddly. Waveform-domain blending is mathematically equivalent and handles arbitrary harmonic sets.
+The current `blendHarmonicTables()` blends at the **harmonic level** (matching orders between adjacent tables, lerping amplitude and phase). This is simpler than waveform-domain blending and works well when the dominant harmonics are consistent across RPM bands. Orders present in only one table are dropped at the blend midpoint — if this proves lossy, blending could be changed to the waveform/compensation domain instead.
 
 ### Why the Clear Button Uses `setAutoDefault(False)`?
 
