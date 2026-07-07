@@ -5300,19 +5300,13 @@ void TMC4671::handleStateCoggingCalibration() {
 					break;
 				}
 			bool dft_clamped = false;
-
-			// Save base PID gains for per-iteration halving.
-			// As the feedforward table improves with each iteration,
-			// the residual cogging shrinks — gentler gains reduce
-			// PID-induced noise in the DFT measurement.
+            /* 
 			float base_Kp = pid_soft.Kp;
 			float base_Ki = pid_soft.Ki;
 			float base_Kd = pid_soft.Kd;
-
+            */
 			for (uint8_t dft_iter = 0; dft_iter < MAX_DFT_ITERATIONS && !emergency && hasPower(); dft_iter++) {
-				// Halve PID gains for each extra iteration (÷2, ÷4, ÷8, ...).
-				// Iteration 0 uses full gains; higher iterations use
-				// progressively gentler gains tuned to the shrinking residual.
+					/* 
 				if (dft_iter > 0) {
 					float div = (float)(1 << dft_iter);
 					pid_soft.Kp = base_Kp / div;
@@ -5320,14 +5314,14 @@ void TMC4671::handleStateCoggingCalibration() {
 					pid_soft.Kd = base_Kd / div;
 					arm_pid_init_f32(&pid_soft, 1);
 				}
-
+                */
 				total_samples = 0;
 				float iter_max_err_deg = 0.0f;
 
 			broadcastCalibLog(0, "DFT iteration %u/%u (Kp:%.0f Ki:%.0f Kd:%.0f)...",
 				dft_iter + 1, MAX_DFT_ITERATIONS,
 				pid_soft.Kp, pid_soft.Ki, pid_soft.Kd);
-
+                
 				// Separate storage for CW and CCW harmonics — extracted per direction
 				// so they can be averaged after both sweeps complete
 				struct TempHarmonic { float mag; float phase; };
