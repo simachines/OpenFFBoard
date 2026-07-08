@@ -1,6 +1,6 @@
 # OpenFFBoard Anti-Cogging Calibration — Step-by-Step Guide
 
-> **Active defines:** `COGGING_TABLE_FLASH_START_ADDRESS`, `COGGING_DFT_USE_IQ_CMD`, `COGGING_DISABLE_BLEND`
+> **Active defines:** `COGGING_TABLE_FLASH_START_ADDRESS`, `COGGING_DFT_USE_IQ_CMD`, `COGGING_DISABLE_BLEND`, `COGGING_ACCEL_BASED_DFT`
 >
 > **Optional defines:** `COGGING_DISABLE_SCALE_CURVE`, `COGGING_PHASE_SHIFT_MULTIRPM`
 
@@ -12,8 +12,10 @@ The calibration measures motor cogging torque and computes a harmonic Fourier fe
 It runs **up to 5 configurable RPM profiles** (default 3 profiles at 3/10/20 RPM), each with:
 
 1. **P-gain auto-tuning** — finds optimal velocity-loop Kp via trapezoidal sweeps
-2. **DFT acquisition** — CW/CCW constant-speed revolutions while recording IQ torque
-3. **CW+CCW harmonic averaging** — cancels friction bias and PID tracking lag
+2. **DFT acquisition** — CW/CCW constant-speed revolutions while recording IQ torque (PID-based)
+3. **[Optional] Acceleration-based DFT step** — open-loop velocity measurement that replaces the
+   PID-DFT result with a friction-free cogging map (see [Accel DFT Step](#step-4-acceleration-based-dft-step-optional))
+4. **CW+CCW harmonic averaging** — cancels friction bias and PID tracking lag
 
 Total output:
 
@@ -33,6 +35,21 @@ Total output:
 | `COGGING_DISABLE_SCALE_CURVE` | **No scale/phase curves** — `cogging_scale`=1.0 at all RPMs | ✗ Commented out (curves active) |
 | `COGGING_DISABLE_BLEND` | Uses only `cogging_harmonics` base table at all RPMs | ✓ Active |
 | `COGGING_DFT_USE_IQ_CMD` | DFT uses `iq_cmd` (PID+friction effort) instead of raw ADC `actual_iq_raw` | ✓ Active |
+| `COGGING_ACCEL_BASED_DFT` | After PID-DFT, runs open-loop velocity DFT to replace harmonic table with acceleration-based cogging map | ✓ Active |
+
+### `COGGING_ACCEL_BASED_DFT` (currently active)
+
+After the PID-based DFT calibration completes for each RPM profile, an additional **acceleration-based
+DFT step** runs automatically. This step measures velocity ripple during an **open-loop constant-torque
+spin** instead of using the PID controller's torque output (which suffers from $J\dot{\omega}$ distortion).
+The measurement is converted to cogging torque via:
+
+$$A_{cog,k} = J \cdot \omega \cdot k \cdot A_{v,k} \qquad \phi_{cog,k} = \phi_{v,k} + \frac{\pi}{2}$$
+
+This is the Piccoli/Copper method — the velocity ripple IS the cogging signal. It replaces the
+PID-DFT result in `active_tbl` and the configurator graph updates accordingly.
+
+The open-loop torque is set by `cogging_calib_hold_current` (default 200, adjustable per-motor).
 
 ### `COGGING_DISABLE_BLEND` (currently active)
 
@@ -453,7 +470,65 @@ for (;;) {
 
 ---
 
-## STEP 3d — Phase-Lag Extraction
+## STEP 3d — Acceleration-Based DFT (optional)
+
+*Requires `COGGING_ACCEL_BASED_DFT` to be defined (currently active).*
+
+After the PID-based DFT calibration, an **open-loop velocity DFT** runs as a post-calibration step.
+This replaces the PID-DFT result in the harmonic table with a measurement that is free of
+$J\dot{\omega}$ distortion from the P-only velocity controller.
+
+### Principle
+
+The motor is driven at a constant **open-loop torque** (`cogging_calib_hold_current`, default 200)
+with no velocity feedback. Cogging torque causes the rotor to speed up and slow down — this
+velocity ripple **is** the cogging signal. Velocity is recorded into 720 spatial bins, then a
+rectangular DFT extracts the harmonic content. Velocity harmonics are converted to cogging torque:
+
+$$A_{cog,k} = J \cdot \omega \cdot k \cdot A_{v,k} \qquad \phi_{cog,k} = \phi_{v,k} + \frac{\pi}{2}$$
+
+This is the **Piccoli/Copper acceleration-based method** (as opposed to the PID-based method
+which measures $iq_{cmd}$ from a closed-loop velocity controller).
+
+### Flow
+
+1. Coast settle (1 s)
+2. Apply constant open-loop torque in CW direction
+3. Measure velocity vs position, bin into 720 spatial bins
+4. After ~1 revolution, stop and extract velocity harmonics via DFT
+5. Compute average speed from DC bin mean
+6. Convert velocity harmonics to torque harmonics
+7. Repeat for CCW direction
+8. CW+CCW complex-vector average (same as PID-DFT)
+9. Replace profile's `active_tbl` with accel-based result
+10. Broadcast to configurator
+
+### Feedforward during accel sweep
+
+The existing PID-DFT harmonic table is used as feedforward during the open-loop spin.
+On iteration 0 of the profile, the PID-DFT table is empty, so the accel DFT measures
+full cogging. On later iterations, the PID-DFT table has improved, so the accel DFT
+measures a smaller residual, and the phasor-add in the PID-DFT iteration loop refines
+the result further.
+
+### Tuning `cogging_calib_hold_current`
+
+The open-loop torque must be:
+- **High enough** to overcome the worst cogging peak + stiction at every rotor position
+- **Low enough** that the motor spins slowly (more samples per revolution = better resolution)
+
+Start at 200 and increase if the motor stalls during the accel sweep. Decrease if the
+motor spins too fast (less than ~1 s per revolution). A good target is ~3–10 RPM.
+
+### Runtime conversion constants
+
+The conversion uses $J$ (measured during SysId). If $J$ is unreliable (cogging interferes
+with the pulse measurement), the amplitude will be off — but the shape is correct. Multiple
+DFT iterations with feedforward active will converge to the correct amplitude via phasor-add.
+
+---
+
+## STEP 3e — Phase-Lag Extraction
 
 *Requires `COGGING_PHASE_SHIFT_MULTIRPM` to be defined (currently commented out).*
 

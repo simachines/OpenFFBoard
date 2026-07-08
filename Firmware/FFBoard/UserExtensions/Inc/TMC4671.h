@@ -45,6 +45,7 @@
 #define COGGING_DFT_BIN_COUNT           720     // Spatial bin count for noise-robust DFT (0.5 deg per bin)
 //#define COGGING_CALIB_ENABLE_ID_DIAG            // Enable Point 1 diagnostic (Id axis analysis)
 #define COGGING_DFT_USE_IQ_CMD                  //comment out to use adc iq
+#define COGGING_ACCEL_BASED_DFT               // post-calibration: open-loop velocity DFT → torque, replaces harmonic table
 //#define COGGING_BLEND
 //#define COGGING_PHASE_SHIFT_CAL
 //#define COGGING_PHASE_SHIFT_MULTIRPM
@@ -105,6 +106,17 @@ enum class TMC4671CoggingDebugPhase : uint32_t {
 	Aborted,
 	TuneSweepP,
 	TuneSweepI,
+#ifdef COGGING_ACCEL_BASED_DFT
+	AccelDFT_Idle,
+	AccelDFT_NoiseFloor,
+	AccelDFT_FindDmax,
+	AccelDFT_FindDmin,
+	AccelDFT_VerifyDmin,
+	AccelDFT_JPulse,
+	AccelDFT_Sweep,
+	AccelDFT_Extract,
+	AccelDFT_Convert,
+#endif
 };
 
 struct TMC4671CoggingDebugVars {
@@ -131,6 +143,18 @@ struct TMC4671CoggingDebugVars {
 	float sweepScaleSeed = 0.0f;
 	float sweepScaleBest = 0.0f;
 	float sweepP2P = 0.0f;
+#ifdef COGGING_ACCEL_BASED_DFT
+	// Accel-based DFT debug
+	float accel_vel_thresh = 0.0f;
+	float accel_dmax = 0.0f;
+	float accel_dmin = 0.0f;
+	float accel_ver_peak = 0.0f;
+	float accel_J = 0.0f;
+	float accel_omega = 0.0f;
+	float accel_vel_now = 0.0f;
+	float accel_test_current = 0.0f;
+	uint32_t accel_debug_phase = 0;
+#endif
 };
 
 extern volatile TMC4671CoggingDebugVars g_tmc4671_cogging_debug;
@@ -284,7 +308,7 @@ union StatusFlags {
 struct TMC4671MainConfig{
 	TMC4671HardwareTypeConf hwconf;
 	TMC4671MotConf motconf;
-	uint16_t pwmcnt 		= 4095; // PWM resolution is 12 bit internally
+	uint16_t pwmcnt 		= 1999; // PWM resolution is 12 bit internally
 	uint8_t bbmL			= 50;
 	uint8_t bbmH			= 50;
 	uint16_t mdecA 			= 660; // 334 default. 331 recommended by datasheet,662 double. 660 lowest noise
@@ -925,6 +949,9 @@ private:
 	bool cogging_calib_autoPid = true;
 	bool cogging_calib_inertiaCorr;  // Inertia acceleration correction during DFT
 	bool cogging_calib_frictionFF = false; // Friction feedforward during DFT
+#ifdef COGGING_ACCEL_BASED_DFT
+	float cogging_calib_hold_current = 200.0f; // Open-loop hold torque for accel-based DFT step
+#endif
 	void handleStateCoggingCalibration();
 	void blendHarmonicTables(float rpm, Harmonic* out_table);
 #endif

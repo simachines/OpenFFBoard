@@ -528,7 +528,7 @@ bool TMC4671::initialize(){
 	// Write main constants
 
 	writeReg(0x64, 0); // No flux/torque
-	setPwm(0,conf.pwmcnt,conf.bbmL,conf.bbmH); // Set FOC @ 25khz but turn off pwm for now
+	setPwm(0,conf.pwmcnt,conf.bbmL,conf.bbmH); // Set FOC @ 50khz but turn off pwm for now
 	setMotorType(conf.motconf.motor_type,conf.motconf.pole_pairs);
 	setPhiEtype(conf.motconf.phiEsource);
 	setup_HALL(hallconf); // Enables hall filter and masking
@@ -4359,6 +4359,7 @@ void TMC4671::handleStateCoggingCalibration() {
 		CommandHandler::broadcastCommandReply(CommandReply(std::string(buf)), (uint32_t)TMC4671_commands::calibrateCogging, CMDtype::get);
 	};
 	const char* errorMessage = nullptr;
+	bool accelPosWasReset = false;
 	float* iq_acc_cos = nullptr;
 	float* iq_acc_sin = nullptr;
 	// Spatial-bin arrays for noise-robust DFT (see allocation block for rationale).
@@ -4443,6 +4444,33 @@ void TMC4671::handleStateCoggingCalibration() {
 
 	resetDebugWatch();
 
+	// === WIPE ALL PREVIOUS CALIBRATION DATA ===
+	// This must be the first action — before any log, CPR check, or calibration
+	// logic — so the user sees a clean slate as soon as Calibrate is clicked.
+	memset(this->cogging_harmonics, 0, sizeof(this->cogging_harmonics));
+	memset(this->cogging_harmonics_rpm2, 0, sizeof(this->cogging_harmonics_rpm2));
+	memset(this->cogging_harmonics_rpm3, 0, sizeof(this->cogging_harmonics_rpm3));
+	memset(this->cw_bins, 0, sizeof(this->cw_bins));
+	memset(this->ccw_bins, 0, sizeof(this->ccw_bins));
+	memset(this->ver_cw_bins, 0, sizeof(this->ver_cw_bins));
+	memset(this->ver_ccw_bins, 0, sizeof(this->ver_ccw_bins));
+	memset(this->ver_cw_top, 0, sizeof(this->ver_cw_top));
+	memset(this->ver_ccw_top, 0, sizeof(this->ver_ccw_top));
+	memset(this->cw_store, 0, sizeof(this->cw_store));
+	memset(this->ccw_store, 0, sizeof(this->ccw_store));
+	memset(this->cogging_bins_combined, 0, sizeof(this->cogging_bins_combined));
+	memset(this->scale_curve_values, 0, sizeof(this->scale_curve_values));
+	memset(this->phase_advance_curve_values, 0, sizeof(this->phase_advance_curve_values));
+	this->cogging_enabled = false;
+	this->cogging_scale = 0.0f;
+	this->cwccw_data_valid = false;
+	this->bins_data_valid = false;
+	this->rpm2_table_valid = false;
+	this->rpm3_table_valid = false;
+	this->scale_curve_valid = false;
+	this->phase_adv_curve_valid = false;
+	
+
 	broadcastCalibLog(0, "Starting Cogging Calibration: Continuous DFT...");
 	
 	if (this->getCpr() == 0) { 
@@ -4451,15 +4479,7 @@ void TMC4671::handleStateCoggingCalibration() {
 	}
 	
 	allowStateChange = false;
-	
-	// Reset cogging table and scale/phase curves for fresh calibration
-	clearCoggingTable();
-	this->bins_data_valid = false;
-	scale_curve_valid = false;
-	phase_adv_curve_valid = false;
-	memset(scale_curve_values, 0, sizeof(scale_curve_values));
-	memset(phase_advance_curve_values, 0, sizeof(phase_advance_curve_values));
-	// Plateau (index 0): scale=1.0 (full compensation at low RPM), phase=0.0°.
+	// Baseline plateau: full compensation at low RPM, zero phase advance.
 	scale_curve_values[0] = 1.0f;
 	phase_advance_curve_values[0] = 0.0f;
 	
@@ -4704,118 +4724,118 @@ void TMC4671::handleStateCoggingCalibration() {
 			// Declared here so it's visible in the RPM profile loop below.
 			float imc_kp = 50.0f;
 
-			if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
-			// Step 1.1: Break static friction
-			broadcastCalibLog(0, "Step 1.1: Breaking static friction...");
-			while (!friction_broken && tuning_torque < max_test_torque && !emergency) {
-				applySafeTorque(tuning_torque);
-				Delay(BREAKOUT_STEP_MS); 
-				if (fabs(getWrappedError(start_pos, getAbsolutePosition())) > 0.005f) {
-					friction_broken = true;
-					tuning_torque *= 1.1f; 
-				} else {
-					tuning_torque += 100.0f; 
-				}
-			}
-			applySafeTorque(0);
-			Delay(500); 
+	// Default J to 10 so it's available even when using manual PID
+	J = 10.0f;
 
-			// Step 1.2: Measure Inertia (J) using a precise torque pulse
-			broadcastCalibLog(0, "Step 1.2: Measuring Mechanical Inertia (J)...");
-			float j_torque = tuning_torque;
-			start_pos = getAbsolutePosition();
-			uint32_t j_start_us = micros();
-			uint32_t j_target_us = j_start_us + (SYSID_J_PULSE_MS * 1000);
-			
-			applySafeTorque(j_torque);
-			// Strict timing loop: Busy-wait to guarantee precise pulse duration
-			while (((micros() - j_target_us) & 0x80000000) && !emergency) {
-				refreshWatchdog();
+if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
+		// SysId: break friction, measure J, measure B, then compute IMC gains
+		// Step 1.1: Break static friction
+		broadcastCalibLog(0, "Step 1.1: Breaking static friction...");
+		while (!friction_broken && tuning_torque < max_test_torque && !emergency) {
+			applySafeTorque(tuning_torque);
+			Delay(BREAKOUT_STEP_MS); 
+			if (fabs(getWrappedError(start_pos, getAbsolutePosition())) > 0.005f) {
+				friction_broken = true;
+				tuning_torque *= 1.1f; 
+			} else {
+				tuning_torque += 100.0f; 
 			}
-			uint32_t j_end_us = micros();
-			float end_pos = getAbsolutePosition();
-			applySafeTorque(0);
+		}
+		applySafeTorque(0);
+		Delay(500); 
+
+		// Step 1.2: Measure Inertia (J) using a precise torque pulse
+		broadcastCalibLog(0, "Step 1.2: Measuring Mechanical Inertia (J)...");
+		float j_torque = tuning_torque;
+		start_pos = getAbsolutePosition();
+		uint32_t j_start_us = micros();
+		uint32_t j_target_us = j_start_us + (SYSID_J_PULSE_MS * 1000);
+		
+		applySafeTorque(j_torque);
+		// Strict timing loop: Busy-wait to guarantee precise pulse duration
+		while (((micros() - j_target_us) & 0x80000000) && !emergency) {
+			refreshWatchdog();
+		}
+		uint32_t j_end_us = micros();
+		float end_pos = getAbsolutePosition();
+		applySafeTorque(0);
+		
+		float dt_j = (float)(j_end_us - j_start_us) / 1000000.0f;
+		float d_pos_turns = fabs(getWrappedError(start_pos, end_pos));
+		float d_pos_rad = d_pos_turns * 2.0f * PI; 
+		
+		if (d_pos_rad < 0.001f) {
+			errorMessage = "Abort: Motor did not move during inertia measurement";
+			goto cleanup;
+		}
+
+		// Physics Formula: J = (Torque * dt^2) / (2 * delta_pos_rad)
+		// Scale by 100 to map physical J to the abstract TMC integer units
+		J = ((j_torque * dt_j * dt_j) / (2.0f * d_pos_rad)) * 100.0f;
+		Delay(500);
+
+		// Scale warmup time with inertia: heavier motors need longer to reach speed.
+		// J is in abstract TMC units (physical J * 100).  Typical J: K52G~100, Mige~630.
+		// Warmup = max(1500ms, J * calib_rpm / 100 + 1000ms), capped at 8s.
+		{
+			float warmup_from_J = J / 100.0f * calib_rpm + 1000.0f;
+			cogging_warmup_ms = (uint32_t)warmup_from_J;
+			if (cogging_warmup_ms < 1500) cogging_warmup_ms = 1500;
+			if (cogging_warmup_ms > 8000) cogging_warmup_ms = 8000;
+		}
+
+		// Step 1.3: Measure Viscous Friction (B)
+		broadcastCalibLog(0, "Step 1.3: Measuring Viscous Friction (B)...");
+		float test_rpm = 30.0f;
+		float b_target_vel_turns = test_rpm / 60.0f; 
+		float b_target_vel_rad = b_target_vel_turns * 2.0f * PI;
+		float b_pos = getAbsolutePosition();
+		float b_sum_torque = 0.0f;
+		uint32_t b_samples = 0;
+		uint32_t b_start = HAL_GetTick();
+		next_tick = micros();
+		
+		float kp_vel = j_torque * 5.0f; 
+		act_period = getActualCalibPeriod(1000);
+		dt_sec = (float)act_period / 1000000.0f;
+		startCalibTimers(1000);
+		while (HAL_GetTick() - b_start < SYSID_B_DURATION_MS && !emergency) {
+			next_tick += act_period;
+			b_pos += b_target_vel_turns * dt_sec;
+			float err = b_pos - getAbsolutePosition();
+			float cmd = err * kp_vel;
+			cmd = clip<float,float>(cmd, -max_test_torque, max_test_torque);
+			applySafeTorque(cmd);
 			
-			float dt_j = (float)(j_end_us - j_start_us) / 1000000.0f;
-			float d_pos_turns = fabs(getWrappedError(start_pos, end_pos));
-			float d_pos_rad = d_pos_turns * 2.0f * PI; 
-			
-			if (d_pos_rad < 0.001f) {
-				errorMessage = "Abort: Motor did not move during inertia measurement";
-				goto cleanup;
+			// WARMUP: Only integrate torque after half the duration to ensure steady-state velocity
+			if (HAL_GetTick() - b_start > (SYSID_B_DURATION_MS / 2)) { 
+				b_sum_torque += cmd;
+				b_samples++;
 			}
-
-			// Physics Formula: J = (Torque * dt^2) / (2 * delta_pos_rad)
-			// Scale by 100 to map physical J to the abstract TMC integer units
-			J = ((j_torque * dt_j * dt_j) / (2.0f * d_pos_rad)) * 100.0f;
-			Delay(500);
-
-			// Scale warmup time with inertia: heavier motors need longer to reach speed.
-			// J is in abstract TMC units (physical J * 100).  Typical J: K52G~100, Mige~630.
-			// Warmup = max(1500ms, J * calib_rpm / 100 + 1000ms), capped at 8s.
-			{
-				float warmup_from_J = J / 100.0f * calib_rpm + 1000.0f;
-				cogging_warmup_ms = (uint32_t)warmup_from_J;
-				if (cogging_warmup_ms < 1500) cogging_warmup_ms = 1500;
-				if (cogging_warmup_ms > 8000) cogging_warmup_ms = 8000;
-			}
-
-			// Step 1.3: Measure Viscous Friction (B)
-			broadcastCalibLog(0, "Step 1.3: Measuring Viscous Friction (B)...");
-			float test_rpm = 30.0f;
-			float b_target_vel_turns = test_rpm / 60.0f; 
-			float b_target_vel_rad = b_target_vel_turns * 2.0f * PI;
-			float b_pos = getAbsolutePosition();
-			float b_sum_torque = 0.0f;
-			uint32_t b_samples = 0;
-			uint32_t b_start = HAL_GetTick();
-			next_tick = micros();
-			
-			float kp_vel = j_torque * 5.0f; 
-			act_period = getActualCalibPeriod(1000);
-			dt_sec = (float)act_period / 1000000.0f;
-			startCalibTimers(1000);
-			while (HAL_GetTick() - b_start < SYSID_B_DURATION_MS && !emergency) {
-				next_tick += act_period;
-				b_pos += b_target_vel_turns * dt_sec;
-				float err = b_pos - getAbsolutePosition();
-				float cmd = err * kp_vel;
-				cmd = clip<float,float>(cmd, -max_test_torque, max_test_torque);
-				applySafeTorque(cmd);
-				
-				// WARMUP: Only integrate torque after half the duration to ensure steady-state velocity
-				if (HAL_GetTick() - b_start > (SYSID_B_DURATION_MS / 2)) { 
-					b_sum_torque += cmd;
-					b_samples++;
-				}
-				refreshWatchdog();
+			refreshWatchdog();
 #ifdef TIM_CALIBRATION
-				// Yield thread via timer interrupt notifications to avoid busy-waiting, falling back if timer is disabled
-				if (this->calibTimer != nullptr) {
-					this->WaitForNotification();
-				} else
+			if (this->calibTimer != nullptr) {
+				this->WaitForNotification();
+			} else
 #endif
-				{
-					while ((micros() - next_tick) & 0x80000000) {}
-				}
+			{
+				while ((micros() - next_tick) & 0x80000000) {}
 			}
-			stopCalibTimers();
-			applySafeTorque(0);
-			// Scale by 100 to map physical B to the abstract TMC integer units
-			// Subtract Coulomb friction (breakout torque) to isolate true viscous damping
-			dynamic_friction = b_sum_torque / (float)b_samples;
-			B = (dynamic_friction / b_target_vel_rad) * 100.0f;
-			B = clip<float, float>(B, 0.0f, 100000.0f); // Ensure B is positive
-			Delay(500);
+		}
+		stopCalibTimers();
+		applySafeTorque(0);
+		dynamic_friction = b_sum_torque / (float)b_samples;
+		B = (dynamic_friction / b_target_vel_rad) * 100.0f;
+		B = clip<float, float>(B, 0.0f, 100000.0f);
+		Delay(500);
 
-			// Step 1.4: IMC (Internal Model Control) Pole Placement Calculation
-			
-			/* * 1. Continuous Bandwidth (f_bw) Calculation
-			 * Instead of hardcoded steps, we linearly degrade the bandwidth based on inertia (J).
-			 * - Low inertia (e.g., K52G, J ~ 100): High bandwidth (clamped to 15.0 Hz) for maximum responsiveness.
-			 * - High inertia (e.g., Mige, J ~ 630): Lower bandwidth (~13.5 Hz) to prevent Kp saturation and resonance.
-			 * - Extreme/Error inertia (J > 2000): Safe mode bandwidth (clamped to 6.0 Hz) for stability.
-			 */
+		// Step 1.4: IMC (Internal Model Control) Pole Placement Calculation
+		/* * 1. Continuous Bandwidth (f_bw) Calculation
+		 * Instead of hardcoded steps, we linearly degrade the bandwidth based on inertia (J).
+		 * - Low inertia (e.g., K52G, J ~ 100): High bandwidth (clamped to 15.0 Hz) for maximum responsiveness.
+		 * - High inertia (e.g., Mige, J ~ 630): Lower bandwidth (~13.5 Hz) to prevent Kp saturation and resonance.
+		 * - Extreme/Error inertia (J > 2000): Safe mode bandwidth (clamped to 6.0 Hz) for stability.
+		 */
 			float f_bw = clip<float>(16.5f - (0.0047f * J), 6.0f, 15.0f);
 			
 			/* * 2. Continuous Integral Scale (ki_scale) Calculation
@@ -5290,6 +5310,7 @@ void TMC4671::handleStateCoggingCalibration() {
 
 			float prev_iter_err = 999.0f; // track best error for degradation detection
 			Harmonic prev_harmonics[COGGING_HARMONICS_COUNT]; // backup of best table
+			float global_max_iq = 0.0f; // track peak PID torque for accel DFT starting point
 
 			// DFT retry: if the acquisition clamps (Kp too high for this RPM),
 			// lower Kp and restart. Keeps retrying until Kp hits floor (50)
@@ -5591,6 +5612,7 @@ void TMC4671::handleStateCoggingCalibration() {
 								dst[b] = (iq_bin_count[b] > 0) ? (iq_bin_sum[b] / (float)iq_bin_count[b]) : 0.0f;
 						}
 						total_samples += dir_samples;
+						if (max_iq_cmd_used > global_max_iq) global_max_iq = max_iq_cmd_used;
 					}
 				}
 
@@ -6234,6 +6256,533 @@ void TMC4671::handleStateCoggingCalibration() {
 			}
 		}
 
+#ifdef COGGING_ACCEL_BASED_DFT
+			// --- ACCELERATION-BASED DFT STEP (Copper/Piccoli method - continuous ramp) ---
+			if (!emergency && hasPower() && total_samples > 0) {
+				applySafeTorque(0); Delay(500);
+
+				// --- Step A: measure stationary velocity noise → motion threshold ---
+				float vel_thresh = 0.005f;
+				{
+					float v_noise[3] = {};
+					for (int vi = 0; vi < 3 && !emergency && hasPower(); vi++) {
+						float vsum = 0.0f; uint32_t vn = 0;
+						uint32_t v0 = HAL_GetTick();
+						float vp = getFilteredPosition();
+						while (HAL_GetTick() - v0 < 500 && !emergency) {
+							float cp = getFilteredPosition();
+							float dv = fabs(getWrappedError(vp, cp)) / 0.1f; // turns/s
+							vsum += dv; vn++; vp = cp;
+							g_tmc4671_cogging_debug.accel_vel_now = dv * 60.0f;
+							Delay(100); refreshWatchdog();
+						}
+						v_noise[vi] = (vn > 0) ? (vsum / (float)vn) : 0.0f;
+					}
+					float v_mean = (v_noise[0] + v_noise[1] + v_noise[2]) / 3.0f;
+					float v_var = 0.0f;
+					for (int vi = 0; vi < 3; vi++) { float d = v_noise[vi] - v_mean; v_var += d*d; }
+					float v_std = sqrtf(v_var / 2.0f);
+					vel_thresh = fmaxf(0.005f, 9.0f * v_std);
+					g_tmc4671_cogging_debug.accel_vel_thresh = vel_thresh;
+					g_tmc4671_cogging_debug.accel_debug_phase = (uint32_t)TMC4671CoggingDebugPhase::AccelDFT_NoiseFloor;
+					broadcastCalibLog(0, "Accel DFT: vel noise mean=%.5f std=%.5f thresh=%.5f turns/s",
+						v_mean, v_std, vel_thresh);
+				}
+
+
+// --- Step B: find dmax/dmin ---
+			//   dmax = MINIMUM torque that breaks the rotor away from REST (any detent).
+			//   dmin = MINIMUM torque that sustains slow rotation once already moving.
+			//
+			// Why the old code ran the motor away to thousands of RPM:
+			//  - dmax started AT ver_peak (the huge PID-DFT peak torque) and accepted
+			//    the first probe because `rpm > 0` fires on ANY motion. So dmax was
+			//    always == ver_peak, never the real breakaway. Finding a MINIMUM
+			//    requires ramping UP from a small value.
+			//  - dmin then ramped DOWN from ~ver_peak by 1.0 every 500 ms (~400 s to
+			//    reach friction) while the motor, driven by ~ver_peak, accelerated
+			//    without bound. The `rpm < 0.1` stall test never fired because the
+			//    old MEASURE_RPM averaged over the whole window, so coasting inertia
+			//    always read as high RPM.
+			//
+			// New approach:
+			//  - dmax: geometric ramp UP from rest, each probe starting from REST.
+			//    Stops the instant the rotor breaks free, so the motor never sees
+			//    more than ~1.3x its true breakaway torque.
+			//  - dmin: binary search on the SIGN of acceleration (sustain vs
+			//    coast-down), immune to the inertia-coast that defeated the old
+			//    stall detector. Range is small (5..dmax) so the rotor stays slow.
+			float dmax_torque = 0.0f;
+			float dmin_torque = 0.0f;
+			const uint8_t ACCEL_ITERS = MAX_DFT_ITERATIONS;
+			const uint32_t cpr = getEncoder()->getCpr();
+
+			// Instantaneous |speed| (turns/s) over a short window. Resets its
+			// accumulator at the start so two consecutive calls can be compared
+			// (needed for the dmin acceleration-sign test). Keeps accel_vel_now
+			// live for the MCU debug viewer.
+			auto measureSpeedTps = [&](uint32_t duration_ms) -> float {
+				int32_t last_pos = getEncoder()->getPos();
+				uint32_t t0 = HAL_GetTick();
+				uint32_t last_us = micros();
+				float cdist = 0.0f;
+				while (HAL_GetTick() - t0 < duration_ms && !emergency && hasPower()) {
+					int32_t raw = getEncoder()->getPos();
+					uint32_t now_us = micros();
+					float dt = (float)(now_us - last_us) / 1000000.0f;
+					if (dt > 0.0005f) { /* ~2 kHz max sample rate */
+						cdist += fabsf((float)(raw - last_pos) / (float)cpr);
+						last_pos = raw;
+						last_us = now_us;
+					}
+					g_tmc4671_cogging_debug.accel_vel_now =
+						60.0f * cdist / ((float)(HAL_GetTick() - t0 + 1) / 1000.0f);
+					refreshWatchdog();
+				}
+				float elapsed = (float)(HAL_GetTick() - t0) / 1000.0f;
+				return (elapsed > 0.0f) ? (cdist / elapsed) : 0.0f;  // turns/s
+			};
+
+			// Block until the rotor is essentially stationary. Every dmax probe
+			// MUST begin from rest, otherwise residual motion from the previous
+			// probe falsely reads as "broke away".
+			auto waitForRest = [&](void) -> void {
+				uint32_t quietSince = 0;
+				uint32_t t0 = HAL_GetTick();
+				while (HAL_GetTick() - t0 < 4000 && !emergency && hasPower()) {
+					float v = measureSpeedTps(40);
+					if (v < vel_thresh) {
+						if (quietSince == 0) quietSince = HAL_GetTick();
+						else if (HAL_GetTick() - quietSince > 120) { applySafeTorque(0); return; }
+					} else {
+						quietSince = 0;
+					}
+				}
+				applySafeTorque(0);
+			};
+
+			// Apply base torque + cogging feed-forward (parity with the sweep loop).
+			auto applyTorqueFF = [&](float t) -> void {
+				float p = getFilteredPosition();
+				float cog = 0.0f; float ar = p * 2.0f * PI;
+				for (uint8_t h = 0; h < COGGING_HARMONICS_COUNT; h++)
+					if (active_tbl[h].amplitude > 0.0f)
+						cog += active_tbl[h].amplitude * arm_sin_f32(ar * active_tbl[h].order + active_tbl[h].phase);
+				float at = clip<float,float>(t + this->cogging_scale * cog, -max_test_torque, max_test_torque);
+				applySafeTorque(at);
+				g_tmc4671_cogging_debug.accel_test_current = at;
+			};
+
+			{
+				float ver_peak = global_max_iq;
+				if (ver_peak < 50.0f) ver_peak = 50.0f;
+				g_tmc4671_cogging_debug.accel_ver_peak = ver_peak;
+				g_tmc4671_cogging_debug.accel_debug_phase = (uint32_t)TMC4671CoggingDebugPhase::AccelDFT_FindDmax;
+
+				// ---------- dmax: geometric ramp-up from rest ----------
+				// "Broke away" = rotor travelled > BREAKAWAY_TURN in the probe
+				// window. Large enough to reject cogging jitter, small enough to
+				// catch real rotation.
+				const float BREAKAWAY_TURN = 0.005f;   // ~1.8 degrees
+				const float DMAX_CAP = clip<float>(ver_peak, 50.0f, max_test_torque * 0.7f);
+				float test = 10.0f;
+				broadcastCalibLog(0, "Accel DFT: finding dmax (ramp up from %.0f, cap %.0f)...", test, DMAX_CAP);
+				applySafeTorque(0); g_tmc4671_cogging_debug.accel_test_current = 0.0f;
+				while (test < DMAX_CAP && !emergency && hasPower()) {
+					waitForRest();
+					int32_t p0 = getEncoder()->getPos();
+					applyTorqueFF(test);
+					// 350 ms probe: measure travel while keeping accel_vel_now live.
+					uint32_t pt0 = HAL_GetTick();
+					int32_t last = p0; float cdist = 0.0f;
+					while (HAL_GetTick() - pt0 < 350 && !emergency && hasPower()) {
+						int32_t raw = getEncoder()->getPos();
+						cdist += fabsf((float)(raw - last) / (float)cpr);
+						last = raw;
+						g_tmc4671_cogging_debug.accel_vel_now =
+							60.0f * cdist / ((float)(HAL_GetTick() - pt0 + 1) / 1000.0f);
+						refreshWatchdog();
+					}
+					int32_t p1 = getEncoder()->getPos();
+					applySafeTorque(0); g_tmc4671_cogging_debug.accel_test_current = 0.0f;
+					float moved = fabsf((float)(p1 - p0) / (float)cpr);
+					broadcastCalibLog(0, "Accel DFT: dmax probe %.0f -> moved %.4f turn (%.0f RPM avg)",
+						test, moved, g_tmc4671_cogging_debug.accel_vel_now);
+					if (moved > BREAKAWAY_TURN) { dmax_torque = test; break; }
+					test *= 1.3f;   // geometric step: at most ~30% overshoot
+				}
+				if (dmax_torque <= 0.0f) dmax_torque = DMAX_CAP;  // never broke away -> use cap
+				broadcastCalibLog(0, "Accel DFT: dmax = %.0f", dmax_torque);
+
+				// ---------- dmin: per-step spin-up binary search ----------
+				// The continuous ramp-down approach failed because the motor
+				// hits mechanical limits or high-friction spots during a long
+				// sustained spin-up (dmax probe = 350ms/20deg, but 800ms at
+				// dmax = ~45deg → hits endstop → v drops to zero at the first
+				// measurement, even at the same dmax torque).
+				//
+				// Instead: each candidate torque gets its own independent
+				// cycle: rest → spin-up with dmax (guarantee moving) →
+				// switch to candidate → short settle → measure speed.
+				// Binary search over the range [5, dmax]; ~log2(12) ≈ 4-6
+				// iterations.  Each iteration is self-contained so a stall
+				// at one candidate doesn't poison the next.
+				g_tmc4671_cogging_debug.accel_debug_phase = (uint32_t)TMC4671CoggingDebugPhase::AccelDFT_FindDmin;
+				float dmin_lo = 5.0f;
+				float dmin_hi = dmax_torque;
+				broadcastCalibLog(0, "Accel DFT: finding dmin (binary search %.0f..%.0f, per-step spin-up)...",
+					dmin_lo, dmin_hi);
+
+				for (uint8_t it = 0;
+					 it < 10 && (dmin_hi - dmin_lo) > fmaxf(1.5f, dmin_hi * 0.03f) && !emergency && hasPower();
+					 it++) {
+					float mid = (dmin_lo + dmin_hi) * 0.5f;
+
+					// 1. Rest the rotor so the spin-up starts from standstill.
+					applySafeTorque(0); g_tmc4671_cogging_debug.accel_test_current = 0.0f;
+					waitForRest();
+
+					// 2. Spin up with dmax to guarantee motion.
+					applyTorqueFF(dmax_torque);
+					(void)measureSpeedTps(500);
+
+					// 3. Drop to the candidate torque.
+					applyTorqueFF(mid);
+					(void)measureSpeedTps(200);   // let transient settle
+
+					// 4. Measure speed.  If it's still moving after the settle,
+					//    this candidate sustains rotation.
+					float v = measureSpeedTps(250); // turns/s
+					bool sustains = (v > vel_thresh);
+					broadcastCalibLog(0, "Accel DFT: dmin probe %5.0f -> v %.4f t/s (%.1f RPM) %s",
+						mid, v, v * 60.0f, sustains ? "sustain" : "coast-down");
+
+					if (sustains) dmin_hi = mid; else dmin_lo = mid;
+				}
+				dmin_torque = dmin_hi;
+				if (dmin_torque < 5.0f) dmin_torque = 5.0f;
+				if (dmin_torque > dmax_torque) dmin_torque = dmax_torque;
+				broadcastCalibLog(0, "Accel DFT: dmin = %.0f", dmin_torque);
+
+				applySafeTorque(0); g_tmc4671_cogging_debug.accel_test_current = 0.0f;
+				g_tmc4671_cogging_debug.accel_dmax = dmax_torque;
+				g_tmc4671_cogging_debug.accel_dmin = dmin_torque;
+				broadcastCalibLog(0, "Accel DFT: dmax=%.0f dmin=%.0f, %u iterations", dmax_torque, dmin_torque, ACCEL_ITERS);
+			}
+
+				// --- ACCEL DFT ITERATION LOOP ---
+				// Each iteration: sweep CW+CCW with current FF table → extract vel DFT →
+				// convert to torque → update table → broadcast. Residual shrinks each pass.
+				for (uint8_t a_iter = 0; a_iter < ACCEL_ITERS && !emergency && hasPower(); a_iter++) {
+					if (a_iter > 0) {
+						// Residual shrinks each iteration → can decrease dmin
+						dmin_torque *= 0.8f;
+						if (dmin_torque < 5.0f) dmin_torque = 5.0f;
+						dmax_torque = dmin_torque * 1.5f;
+						g_tmc4671_cogging_debug.accel_dmin = dmin_torque;
+						g_tmc4671_cogging_debug.accel_dmax = dmax_torque;
+						broadcastCalibLog(0, "Accel DFT iter %u: scaled dmin=%.0f dmax=%.0f", a_iter, dmin_torque, dmax_torque);
+					}
+
+				// --- Step E: re-measure J (first iteration only) ---
+				float accel_J = J;
+				if (a_iter == 0) {
+				float j_pulse_torque = dmax_torque * 1.5f;
+				if (j_pulse_torque > max_test_torque * 0.6f) j_pulse_torque = max_test_torque * 0.6f;
+				{
+					g_tmc4671_cogging_debug.accel_debug_phase = (uint32_t)TMC4671CoggingDebugPhase::AccelDFT_JPulse;
+					broadcastCalibLog(0, "Accel DFT: re-measuring J with anti-cog FF (pulse=%.0f)...", j_pulse_torque);
+					applySafeTorque(0); Delay(300);
+					g_tmc4671_cogging_debug.accel_test_current = 0.0f;
+
+					// Apply anti-cog FF from PID-DFT table
+					float j_start_pos = getFilteredPosition();
+					uint32_t j_start_us = micros();
+					const uint32_t J_PULSE_US = 150000;
+					uint32_t j_end_target = j_start_us + J_PULSE_US;
+					float j_prev_p = j_start_pos;
+
+					// Apply constant torque + cogging FF for precise pulse
+					while (((micros() - j_end_target) & 0x80000000) && !emergency) {
+						float jp = getFilteredPosition();
+						float j_vel = getWrappedError(j_prev_p, jp) / 0.15f; // turns/s over ~150ms window
+						j_prev_p = jp;
+						g_tmc4671_cogging_debug.accel_vel_now = 60.0f * fabs(j_vel);
+						float j_cog = 0.0f;
+						{ float jr = jp * 2.0f * PI;
+						  for (uint8_t h = 0; h < COGGING_HARMONICS_COUNT; h++)
+							if (active_tbl[h].amplitude > 0.0f)
+								j_cog += active_tbl[h].amplitude * arm_sin_f32(jr * active_tbl[h].order + active_tbl[h].phase); }
+						float j_torque = j_pulse_torque + (this->cogging_scale * j_cog);
+						j_torque = clip<float,float>(j_torque, -max_test_torque, max_test_torque);
+						applySafeTorque(j_torque);
+						g_tmc4671_cogging_debug.accel_test_current = j_pulse_torque;  // base, not FF-compensated
+						refreshWatchdog();
+					}
+					uint32_t j_end_us = micros();
+					float j_end_pos = getFilteredPosition();
+					applySafeTorque(0);
+					g_tmc4671_cogging_debug.accel_test_current = 0.0f;
+
+					float j_dt = (float)(j_end_us - j_start_us) / 1000000.0f;
+					float j_dpos = fabs(getWrappedError(j_start_pos, j_end_pos));
+					if (j_dpos > 0.0005f) {
+						float j_dpos_rad = j_dpos * 2.0f * PI;
+						accel_J = ((j_pulse_torque * j_dt * j_dt) / (2.0f * j_dpos_rad)) * 100.0f;
+						g_tmc4671_cogging_debug.accel_J = accel_J;
+						broadcastCalibLog(0, "Accel DFT: J_with_FF=%.2f (dt=%.3fs, dpos=%.4f turns, pulse=%.0f)",
+							accel_J, j_dt, j_dpos, j_pulse_torque);
+					} else {
+						broadcastCalibLog(0, "Accel DFT: J pulse failed (dpos=%.4f), using SysId J=%.2f", j_dpos, J);
+					}
+					Delay(500);
+					} // J pulse body
+				} // a_iter == 0 (J pulse)
+
+				struct { float mag; float phase; } av_cw[COGGING_CALIB_DFT_HARMONICS];
+				struct { float mag; float phase; } av_ccw[COGGING_CALIB_DFT_HARMONICS];
+				memset(av_cw, 0, sizeof(av_cw)); memset(av_ccw, 0, sizeof(av_ccw));
+				float ao_cw = 0.0f, ao_ccw = 0.0f;
+
+				g_tmc4671_cogging_debug.accel_debug_phase = (uint32_t)TMC4671CoggingDebugPhase::AccelDFT_Sweep;
+
+				for (int8_t pd : {1, -1}) {
+					const uint8_t MAX_STALL_RETRIES = 4;
+					uint8_t stall_retries = 0;
+					bool sweep_ok = false;
+
+					while (!sweep_ok && stall_retries < MAX_STALL_RETRIES && !emergency && hasPower()) {
+						applySafeTorque(0); g_tmc4671_cogging_debug.accel_test_current = 0.0f;
+						{ uint32_t s0 = HAL_GetTick(); float sp0 = getFilteredPosition(); float cdist_rest = 0.0f;
+						  while (HAL_GetTick() - s0 < 1000 && !emergency) { float scp = getFilteredPosition(); cdist_rest += fabs(getWrappedError(sp0, scp)); sp0 = scp; g_tmc4671_cogging_debug.accel_vel_now = 60.0f * cdist_rest / ((float)(HAL_GetTick() - s0 + 1) / 1000.0f); Delay(100); refreshWatchdog(); } }
+						float restart_t = dmax_torque * (float)pd;
+						float sustain_t = dmin_torque * (float)pd;
+						applySafeTorque(restart_t);
+						g_tmc4671_cogging_debug.accel_test_current = restart_t;
+						const char* dir = (pd==1)?"CW":"CCW";
+						if (stall_retries == 0)
+							broadcastCalibLog(0, "Accel DFT: %s sweep dmax=%.0f dmin=%.0f", dir, dmax_torque, dmin_torque);
+						else
+							broadcastCalibLog(0, "Accel DFT: %s retry %u dmax=%.0f dmin=%.0f", dir, stall_retries, dmax_torque, dmin_torque);
+						// Wait for motor to get moving
+				{ uint32_t r0 = HAL_GetTick(); float rp = getFilteredPosition();
+				  while (HAL_GetTick() - r0 < 800 && !emergency) { float rcp = getFilteredPosition(); g_tmc4671_cogging_debug.accel_vel_now = 60.0f * fabs(getWrappedError(rp, rcp)) / 0.02f; rp = rcp; refreshWatchdog(); Delay(20); } }
+				// Drop to dmin for sustained slow rotation
+				applySafeTorque(sustain_t);
+				g_tmc4671_cogging_debug.accel_test_current = sustain_t;
+
+				memset(iq_bin_sum, 0, COGGING_DFT_BIN_COUNT * sizeof(float));
+				memset(iq_bin_count, 0, COGGING_DFT_BIN_COUNT * sizeof(uint16_t));
+
+				uint32_t astart = HAL_GetTick();
+				uint32_t ap_us = getActualCalibPeriod(TIM_TMC_ARR);
+				uint32_t ant = micros(); float adt = (float)ap_us / 1000000.0f;
+				float aprev_p = getFilteredPosition(), aprev_v = 0.0f;
+				uint32_t aec = 0, adc = 0; float adist = 0.0f;
+				const uint32_t AWM = 1500, ASTALL = 3000, AREV = 20000;
+
+				startCalibTimers(TIM_TMC_ARR);
+				while (HAL_GetTick() - astart < AREV && !emergency && hasPower()) {
+					ant += ap_us;
+					float ap = getFilteredPosition(), av = 0.0f;
+					// Compute velocity every iteration for debug visibility
+					av = getWrappedError(aprev_p, ap) / adt;
+					aprev_p = ap;
+					g_tmc4671_cogging_debug.accel_vel_now = 60.0f * av;
+					if (aec % 2 == 0) aprev_v = av; // decimated velocity for DFT
+
+					// FF from existing PID-DFT table
+					float acog = 0.0f;
+					{ float ar = ap * 2.0f * PI;
+					  for (uint8_t h = 0; h < COGGING_HARMONICS_COUNT; h++)
+						if (active_tbl[h].amplitude > 0.0f)
+							acog += active_tbl[h].amplitude * arm_sin_f32(ar * active_tbl[h].order + active_tbl[h].phase); }
+					float at = sustain_t + (this->cogging_scale * acog);
+					at = clip<float,float>(at, -max_test_torque, max_test_torque);
+					applySafeTorque(at);
+					g_tmc4671_cogging_debug.accel_test_current = at;
+
+					if (HAL_GetTick() - astart > AWM && adist < 1.0f) {
+						adist += fabs(av * adt);
+						if (adc % 2 == 0) {
+							uint32_t ab = (uint32_t)(ap * (float)COGGING_DFT_BIN_COUNT);
+							if (ab >= COGGING_DFT_BIN_COUNT) ab = COGGING_DFT_BIN_COUNT - 1;
+							iq_bin_sum[ab] += av; if (iq_bin_count[ab] != 0xFFFF) iq_bin_count[ab]++;
+						} adc++;
+					}
+					// Stall check: ramp dmax and dmin +1 so sustain torque also increases
+					if (HAL_GetTick() - astart > AWM + ASTALL && adist < 0.05f) {
+						stopCalibTimers(); applySafeTorque(0);
+						dmax_torque += 1.0f;
+						dmin_torque += 1.0f;
+						g_tmc4671_cogging_debug.accel_dmax = dmax_torque;
+						g_tmc4671_cogging_debug.accel_dmin = dmin_torque;
+						goto sweep_retry;
+					}
+					aec++;
+					refreshWatchdog();
+#ifdef TIM_CALIBRATION
+					if (this->calibTimer != nullptr) { this->WaitForNotification(); } else
+#endif
+					{ while ((micros() - ant) & 0x80000000) { } }
+				}
+				stopCalibTimers(); applySafeTorque(0);
+				// If we collected enough data, sweep is OK
+				sweep_ok = (adist >= 0.05f);
+				if (!sweep_ok) {
+					dmax_torque += 1.0f;
+					dmin_torque += 1.0f;
+					g_tmc4671_cogging_debug.accel_dmax = dmax_torque;
+					g_tmc4671_cogging_debug.accel_dmin = dmin_torque;
+				}
+				sweep_retry:
+				stall_retries++;
+				} // while retry loop
+				if (!sweep_ok) {
+					broadcastCalibLog(0, "Accel DFT: %s sweep failed after %u retries", (pd==1)?"CW":"CCW", MAX_STALL_RETRIES);
+					continue; // skip DFT extraction for this direction
+				}
+
+					// Extract velocity harmonics via DFT on binned means
+					float an = 2.0f / (float)COGGING_DFT_BIN_COUNT;
+					for (int k = 1; k < COGGING_CALIB_DFT_HARMONICS; k++) {
+						float re=0, im=0, ss, sc, s1, c1;
+						arm_sin_cos_f32((float)k*180.0f/(float)COGGING_DFT_BIN_COUNT, &ss, &sc);
+						arm_sin_cos_f32((float)k*360.0f/(float)COGGING_DFT_BIN_COUNT, &s1, &c1);
+						float cs=ss, cc=sc;
+						for (uint32_t b = 0; b < COGGING_DFT_BIN_COUNT; b++) {
+							if (iq_bin_count[b] > 0) { float m = iq_bin_sum[b]/(float)iq_bin_count[b]; re+=m*cc; im+=m*cs; }
+							float nc = cc*c1 - cs*s1, ns = cc*s1 + cs*c1; cc=nc; cs=ns;
+						}
+						if (pd == 1) { av_cw[k].mag = sqrtf(re*re+im*im)*an; av_cw[k].phase = atan2f(re, im); }
+						else         { av_ccw[k].mag = sqrtf(re*re+im*im)*an; av_ccw[k].phase = atan2f(re, im); }
+					}
+					// Avg speed from DC bin
+					{ float sv=0; uint32_t n=0;
+					  for (uint32_t b=0; b<COGGING_DFT_BIN_COUNT; b++) if (iq_bin_count[b]>0) { sv+=iq_bin_sum[b]/(float)iq_bin_count[b]; n++; }
+					  if (n>0) { if (pd==1) ao_cw = sv/(float)n*2.0f*PI; else ao_ccw = sv/(float)n*2.0f*PI; } }
+				}
+
+				// Convert velocity → torque: A_cog = J·ω·k·A_v, φ_cog = φ_v + π/2
+				float aom = (ao_cw + ao_ccw) * 0.5f; if (aom < 0.01f) aom = 0.01f;
+				g_tmc4671_cogging_debug.accel_omega = aom;
+				g_tmc4671_cogging_debug.accel_debug_phase = (uint32_t)TMC4671CoggingDebugPhase::AccelDFT_Convert;
+
+				// J validity check: SysId measures J = physical_J * 100.
+				// Typical motors: physical J 0.0005–0.05 → code J 0.05–5.
+				// If SysId failed (cogging interference), J may be near zero.
+				float J_raw = accel_J;
+				if (J_raw < 0.01f) {
+					broadcastCalibLog(0, "Accel DFT: WARNING — accel_J=%.2f near zero. Trying SysId J=%.2f as fallback.", J_raw, J);
+					J_raw = (J > 0.01f) ? J : 0.1f;
+				}
+				float Jc = (J_raw > 0.01f) ? (J_raw / 100.0f) : 0.001f;
+				broadcastCalibLog(0, "Accel DFT: ω=%.1f rad/s, J_raw=%.2f, J_phys=%.6f, converting...",
+					aom, J_raw, Jc);
+				for (int k = 1; k < COGGING_CALIB_DFT_HARMONICS; k++) {
+					// Convert velocity (turns/s) → torque: T = J·α = J · (A_v·2π) · k · ω
+					float s = Jc * aom * (float)k * 2.0f * PI;
+					av_cw[k].mag *= s; av_cw[k].phase += PI/2.0f;
+					av_ccw[k].mag *= s; av_ccw[k].phase += PI/2.0f;
+					while (av_cw[k].phase > PI) av_cw[k].phase -= 2.0f*PI; while (av_cw[k].phase < -PI) av_cw[k].phase += 2.0f*PI;
+					while (av_ccw[k].phase > PI) av_ccw[k].phase -= 2.0f*PI; while (av_ccw[k].phase < -PI) av_ccw[k].phase += 2.0f*PI;
+				}
+
+				// CW+CCW combination (complex-vector phase averaging)
+				struct { float m; uint16_t o; float p; } ab[COGGING_HARMONICS_COUNT]; memset(ab,0,sizeof(ab));
+				for (int k = 1; k < COGGING_CALIB_DFT_HARMONICS; k++) {
+					float am = (av_cw[k].mag + av_ccw[k].mag)/2.0f;
+					float ar = (cosf(av_cw[k].phase)+cosf(av_ccw[k].phase))/2.0f;
+					float ai = (sinf(av_cw[k].phase)+sinf(av_ccw[k].phase))/2.0f;
+					for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+						if (am > ab[n].m) {
+							for (int s = COGGING_HARMONICS_COUNT-1; s > n; s--) ab[s]=ab[s-1];
+							ab[n].m=am; ab[n].o=(uint16_t)k; ab[n].p=atan2f(ai,ar); break;
+						}
+					}
+				}
+
+				// Merge accel DFT harmonics into existing PID-DFT table.
+				// Don't wipe the table — the PID-DFT results have better SNR for many
+				// harmonics. For each order: keep the larger amplitude.
+				for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+					if (ab[n].m <= 0.0f) continue;
+					// Find existing slot for this order
+					int slot = -1, empty = -1;
+					for (int i = 0; i < COGGING_HARMONICS_COUNT; i++) {
+						if (active_tbl[i].order == ab[n].o && active_tbl[i].amplitude > 0.0f) { slot = i; break; }
+						if (empty < 0 && active_tbl[i].amplitude <= 0.0f) empty = i;
+					}
+					if (slot >= 0) {
+						// Same order exists: keep the larger amplitude
+						if (ab[n].m > active_tbl[slot].amplitude) {
+							active_tbl[slot].amplitude = ab[n].m;
+							active_tbl[slot].phase = ab[n].p;
+						}
+					} else if (empty >= 0) {
+						// New order, insert into empty slot
+						active_tbl[empty].order = ab[n].o;
+						active_tbl[empty].amplitude = ab[n].m;
+						active_tbl[empty].phase = ab[n].p;
+					} else {
+						// Table full: replace the weakest harmonic if accel DFT is stronger
+						float wmin = 1e9f; int wi = 0;
+						for (int i = 0; i < COGGING_HARMONICS_COUNT; i++) {
+							if (active_tbl[i].amplitude < wmin) { wmin = active_tbl[i].amplitude; wi = i; }
+						}
+						if (ab[n].m > wmin) {
+							active_tbl[wi].order = ab[n].o;
+							active_tbl[wi].amplitude = ab[n].m;
+							active_tbl[wi].phase = ab[n].p;
+						}
+					}
+				}
+
+				// Merge CW/CCW stores: only populate empty slots, don't overwrite PID-DFT data.
+				// PID-DFT verification passes populated these with CW/CCW harmonic data.
+				if (!cwccw_data_valid) {
+					struct Top { float m; uint16_t o; float p; };
+					Top cw_top[COGGING_HARMONICS_COUNT]; memset(cw_top,0,sizeof(cw_top));
+					Top ccw_top[COGGING_HARMONICS_COUNT]; memset(ccw_top,0,sizeof(ccw_top));
+					for (int k = 1; k < COGGING_CALIB_DFT_HARMONICS; k++) {
+						{ float m = av_cw[k].mag; float p = av_cw[k].phase;
+						  for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+							if (m > cw_top[n].m) {
+								for (int t = COGGING_HARMONICS_COUNT-1; t > n; t--) cw_top[t]=cw_top[t-1];
+								cw_top[n].m=m; cw_top[n].o=(uint16_t)k; cw_top[n].p=p; break;
+							} } }
+						{ float m = av_ccw[k].mag; float p = av_ccw[k].phase;
+						  for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+							if (m > ccw_top[n].m) {
+								for (int t = COGGING_HARMONICS_COUNT-1; t > n; t--) ccw_top[t]=ccw_top[t-1];
+								ccw_top[n].m=m; ccw_top[n].o=(uint16_t)k; ccw_top[n].p=p; break;
+							} } }
+					}
+					for (int n = 0; n < COGGING_HARMONICS_COUNT; n++) {
+						if (cw_top[n].m > 0.0f) { cw_store[n].order=cw_top[n].o; cw_store[n].amplitude=cw_top[n].m; cw_store[n].phase=cw_top[n].p; }
+						if (ccw_top[n].m > 0.0f) { ccw_store[n].order=ccw_top[n].o; ccw_store[n].amplitude=ccw_top[n].m; ccw_store[n].phase=ccw_top[n].p; }
+					}
+					cwccw_data_valid = true;
+				}
+
+				// Broadcast
+				{ uint8_t pa = (rpm_profile >= 2) ? 2 : rpm_profile;
+				  std::string hs = "profile:"; hs += std::to_string(rpm_profile+1); hs += ":";
+				  bool any=false;
+				  for (uint8_t i=0; i<COGGING_HARMONICS_COUNT; i++) {
+					if (active_tbl[i].amplitude > 0.0f || active_tbl[i].order > 0) {
+						if (any) hs += ","; any=true;
+						hs += std::to_string(active_tbl[i].order) + ":";
+						hs += std::to_string((int16_t)active_tbl[i].amplitude) + ":";
+						hs += std::to_string((int16_t)(active_tbl[i].phase * 1000.0f));
+					} }
+				  if (!any) hs += "0:0:0";
+				  CommandHandler::broadcastCommandReply(CommandReply(hs, pa), (uint32_t)TMC4671_commands::coggingHarmonics, CMDtype::get);
+				  broadcastCalibLog(0, "Accel DFT: table replaced and broadcast"); }
+				} // accel iter loop
+			}
+#endif
+
 			} // end DFT iteration loop
 			} // end multi-RPM profile loop
 
@@ -6361,163 +6910,32 @@ void TMC4671::handleStateCoggingCalibration() {
 			pid_soft.Ki = 0.0f;
 				pid_soft.Kd = 0.0f;
 
-			// Compute return RPM from distance first so we can look up
-			// the correct Kp for the ACTUAL return speed (not calib_rpm).
-			actual_pos_f = getAbsolutePosition();
-			float distance_turns = fabs(actual_pos_f);
-			float ret_rpm = distance_turns * 6.0f; // 10-second return
-			if (ret_rpm < 0.5f) ret_rpm = 0.5f;
-
-#ifdef COGGING_PHASE_SHIFT_MULTIRPM
-			// Look up Kp tuned for the nearest RPM breakpoint AT OR BELOW ret_rpm.
-			// Using a Kp tuned for a lower speed is safe; using one for a higher
-			// speed would oscillate.
+			// --- PRESERVE CURRENT ANGLE ---
+			// Calibration may have left the motor many turns from zero.
+			// The Axis out-of-bounds check (abs(scaledEnc) > 0xffff) uses
+			// getEncoder()->getPos_f() to compute the angle.  Instead of
+			// physically dragging the motor back, we read the current
+			// position modulo one turn (= the angle we are at right now)
+			// and set that as the new multi-turn position via the same
+			// setPos() path the Axis "pos" command uses.
 			{
-				uint8_t ret_idx = 0;
-				float best_dist = 999999.0f;
-				for (uint8_t i = 0; i < SCALE_CURVE_POINTS; i++) {
-					float dist = scale_curve_rpm_points[i] - ret_rpm;
-					if (dist <= 0.0f && fabsf(dist) < best_dist) {
-						best_dist = fabsf(dist);
-						ret_idx = i;
-					}
-				}
-				// ret_idx now points to the breakpoint ≤ ret_rpm (or 0 if none found)
-				uint8_t store_src = (ret_idx > 0 && ret_idx - 1 < COGGING_MAX_CALIB_PROFILES)
-					? (ret_idx - 1) : 0;
-				uint32_t stored_kp = this->cogging_calib_pidP[store_src];
-				if (stored_kp > 0) pid_soft.Kp = (float)stored_kp;
-				else pid_soft.Kp = this->coggingSpeedP;
-			}
-#else
-			pid_soft.Kp = (float)this->cogging_calib_pidP[this->cogging_calib_count - 1];
-			if (pid_soft.Kp < 50.0f) pid_soft.Kp = this->coggingSpeedP;
-#endif
-
-			// Return-to-center with clamp retry: if the PID saturates torque
-			// during the return, Kp is too high for ret_rpm.
-			// Lower Kp and restart from the current position (no retry limit).
-			uint8_t ret_clamp_try = 0;
-			for (;;) {
-				if (!hasPower() || emergency) {
-					broadcastCalibLog(0, "Abort: power lost or emergency during return");
-					goto cleanup;
-				}
-				bool ret_clamped = false;
-				arm_pid_init_f32(&pid_soft, 1);
-
-				// Re-read position (may have changed from previous retry)
-				actual_pos_f = getAbsolutePosition();
-				if (ret_clamp_try == 0) {
-					broadcastCalibLog(0, "Return to center: dist=%.1f turn%s ret_rpm=%.1f Kp=%.0f",
-						distance_turns, (distance_turns==1.0f?"":"s"), ret_rpm, pid_soft.Kp);
+				Encoder* enc = getEncoder();  // same encoder the Axis reads
+				float frac_pos = getFilteredPosition(); // 0..1 turns
+				int32_t cpr = enc->getCpr();
+				if (cpr > 0) {
+					int32_t new_pos = (int32_t)(frac_pos * (float)cpr);
+					enc->setPos(new_pos);
+					accelPosWasReset = true;
+					broadcastCalibLog(0, "Calibration complete. Angle preserved: %.1f deg (pos=%d).",
+						(double)(frac_pos * 360.0), (int)new_pos);
 				} else {
-					broadcastCalibLog(0, "Return retry %u: Kp=%.0f pos=%.3f",
-						ret_clamp_try, pid_soft.Kp, actual_pos_f);
+					// CPR unknown — fall back to old setTmcPos(0)
+					setTmcPos(0);
+					accelPosWasReset = true;
+					broadcastCalibLog(0, "Calibration complete. Position reset to 0 (CPR=0).");
 				}
-
-				float target_pos_f = actual_pos_f;
-				uint32_t period_us = getActualCalibPeriod(TIM_TMC_ARR); 
-				// Recalculate distance/RPM from current position (may differ from
-				// pre-loop values on retry after a clamped attempt).
-				float cur_distance = fabs(actual_pos_f);
-				float cur_ret_rpm = cur_distance * 6.0f;
-				if (cur_ret_rpm < 0.5f) cur_ret_rpm = 0.5f;
-				const float full_ret_rpm = (actual_pos_f > 0.0f) ? -cur_ret_rpm : cur_ret_rpm;
-				target_rpm = full_ret_rpm;
-				// Timeout: 10s travel + 5s safety margin
-				uint32_t dynamic_timeout_ms = 15000;
-				
-				uint32_t return_start = HAL_GetTick();
-				uint32_t next_tick = micros();
-				startCalibTimers(TIM_TMC_ARR);
-				while (fabs(actual_pos_f) > 0.005f && !emergency && hasPower() && !ret_clamped) {
-					next_tick += period_us;
-					
-					// Ramp velocity from 0 to full to prevent torque slam
-					float ret_elapsed_ms = (float)(HAL_GetTick() - return_start);
-					float ret_ramp = (ret_elapsed_ms < (float)cogging_warmup_ms) ? (ret_elapsed_ms / (float)cogging_warmup_ms) : 1.0f;
-					float active_rpm = full_ret_rpm * ret_ramp;
-					target_pos_f += (active_rpm / 60.0f) * ((float)period_us / 1000000.0f);
-
-					// Clamp at zero
-					if (target_rpm < 0 && target_pos_f < 0.0f) target_pos_f = 0.0f;
-					if (target_rpm > 0 && target_pos_f > 0.0f) target_pos_f = 0.0f;
-
-					// Read the raw absolute position
-					actual_pos_f = getAbsolutePosition();
-					
-					// Get raw error towards 0
-					float error = target_pos_f - actual_pos_f;
-					
-					// Calculate torque via the CMSIS PID
-					float iq_pid = arm_pid_f32(&pid_soft, error);
-				float iq_ff = this->cogging_calib_frictionFF ? calcFrictionFF(target_rpm) : 0.0f;
-				float iq_cmd = iq_pid + iq_ff;
-					
-					// Anti-cogging compensation (uses table extracted by DFT)
-					float cog_comp = 0.0f;
-					if (this->cogging_enabled) {
-						float angle_rad = actual_pos_f * 2.0f * PI;
-						for (uint8_t h = 0; h < COGGING_HARMONICS_COUNT; h++) {
-							if (cogging_harmonics[h].amplitude > 0.0f) {
-								cog_comp += cogging_harmonics[h].amplitude * arm_sin_f32(angle_rad * cogging_harmonics[h].order + cogging_harmonics[h].phase);
-							}
-						}
-						cog_comp *= this->cogging_scale;
-					}
-					float iq_applied = iq_cmd + cog_comp;
-					
-					// Use full test torque limit (standard for all phases)
-					iq_applied = clip<float,float>(iq_applied, -max_test_torque, max_test_torque);
-					
-					// Clamp check: if saturated, abort this return attempt.
-					if (fabsf(iq_applied) >= max_test_torque * 0.99f) {
-						ret_clamped = true;
-					}
-					
-					captureDebug(TMC4671CoggingDebugPhase::ReturnToCenter, target_rpm, target_pos_f, actual_pos_f, error, iq_pid, 0.0f, cog_comp, iq_cmd, iq_applied, 0.0f, 0.0f, J, B, dynamic_friction);
-					applySafeTorque(iq_applied);
-					
-					refreshWatchdog();
-					if (HAL_GetTick() - return_start > dynamic_timeout_ms) {
-						broadcastCalibLog(0, "Return to center timeout");
-						break; // safety timeout
-					}
-#ifdef TIM_CALIBRATION
-					// Yield thread via timer interrupt notifications to avoid busy-waiting, falling back if timer is disabled
-					if (this->calibTimer != nullptr) {
-						this->WaitForNotification();
-					} else
-#endif
-					{
-						while ((micros() - next_tick) & 0x80000000) { }
-					}
-				}
-				stopCalibTimers();
-				applySafeTorque(0);
-
-				// --- CLAMP RETRY ---
-				if (ret_clamped) {
-					float lowered_kp = pid_soft.Kp / 1.25f;
-					if (lowered_kp < 50.0f) {
-						broadcastCalibLog(0, "Return clamped at Kp:%.0f — hit floor 50. Continuing at Kp=50.", pid_soft.Kp);
-					} else {
-						broadcastCalibLog(0, "Return clamped at Kp:%.0f! Retrying with Kp:%.0f.",
-							pid_soft.Kp, lowered_kp);
-					}
-					pid_soft.Kp = lowered_kp;
-					if (pid_soft.Kp < 50.0f) pid_soft.Kp = 50.0f;
-					ret_clamp_try++;
-					Delay(250); // let motor settle before retry
-					continue;
-				}
-				break; // success — exit retry loop
-			} // end return clamp retry loop
-
-				broadcastCalibLog(0, "Centering done. Re-aligning encoder...");
-				
-				goto cleanup;
+			}
+			goto cleanup;
 		}
 	}
 
@@ -6547,8 +6965,11 @@ cleanup:
 	setMotionMode(prevCalibMode, true);
 
 	allowStateChange = true;
-	// Transition to a stable state instead of potentially jumping to uninitialized
+	// Transition to a stable state; skip EncoderInit if position was reset
+	// (encoderInit would undo setTmcPos by calling setTmcPos(getPosAbs()-offset))
 	if (errorMessage) {
+		changeState(hasPower() ? TMC_ControlState::Running : TMC_ControlState::waitPower);
+	} else if (accelPosWasReset) {
 		changeState(hasPower() ? TMC_ControlState::Running : TMC_ControlState::waitPower);
 	} else {
 		changeState(TMC_ControlState::EncoderInit);
