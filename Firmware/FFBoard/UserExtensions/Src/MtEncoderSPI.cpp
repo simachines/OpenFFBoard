@@ -254,12 +254,12 @@ bool MtEncoderSPI::updateAngleStatusCb(){
 	return parity_ok; // ok if both bytes have even parity
 }
 
-int32_t MtEncoderSPI::getPos(){
+int32_t MtEncoderSPI::getPosHardware() {
 
-	return getPosAbs() - offset;
+	return getPosAbsHardware() - offset;
 }
 
-int32_t MtEncoderSPI::getPosAbs(){
+int32_t MtEncoderSPI::getPosAbsHardware() {
 	if(updateInProgress){ // If a transfer is still in progress return the last result
 		return curPos;
 	}

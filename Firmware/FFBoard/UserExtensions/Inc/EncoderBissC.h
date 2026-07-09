@@ -32,8 +32,8 @@ public:
 	EncoderType getEncoderType();
 	static bool isCreatable();
 	bool updateFrame();
-	int32_t getPos();
-	int32_t getPosAbs();
+	int32_t getPosHardware();
+	int32_t getPosAbsHardware();
 	void setPos(int32_t pos);
 	uint32_t getCpr();
 

@@ -72,7 +72,7 @@ EncoderType EncoderLocal::getEncoderType(){
 }
 
 
-int32_t EncoderLocal::getPos(){
+int32_t EncoderLocal::getPosHardware() {
 	return getTimerCount() + pos;
 }
 

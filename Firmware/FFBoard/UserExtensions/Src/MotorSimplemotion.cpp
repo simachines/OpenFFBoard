@@ -111,7 +111,7 @@ Encoder* MotorSimplemotion::getEncoder(){
 /**
  * In order to get a position update the fast update must be sent first by updating a torque value
  */
-int32_t MotorSimplemotion::getPos(){
+int32_t MotorSimplemotion::getPosHardware() {
 	if(HAL_GetTick()-lastUpdateTime>100){
 		this->turn(lastTorque); // Sending torque updates the position
 	}

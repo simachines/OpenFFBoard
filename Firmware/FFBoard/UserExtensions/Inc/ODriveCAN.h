@@ -75,7 +75,7 @@ public:
 
 	float getPos_f() override;
 	uint32_t getCpr() override;
-	int32_t getPos() override;
+	int32_t getPosHardware() override;
 	void setPos(int32_t pos) override;
 	EncoderType getEncoderType() override;
 

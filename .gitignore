@@ -4,3 +4,6 @@ doc/anticogging.md
 # CocoIndex Code (ccc)
 /.cocoindex_code/
 check_braces.py
+doc/position_sampler_plan.md
+doc/sampler_audit.md
+doc/sampler_crash_fix.md

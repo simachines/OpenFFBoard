@@ -718,8 +718,8 @@ public:
 	void setEncoder(std::shared_ptr<Encoder>& encoder) override;
 	bool hasIntegratedEncoder() override;
 	inline bool usingExternalEncoder(){return conf.motconf.enctype == EncoderType_TMC::ext && drvEncoder != nullptr && drvEncoder->getEncoderType() != EncoderType::NONE;}
-	int32_t getPos() override;
-	int32_t getPosAbs() override;
+	int32_t getPosHardware() override;
+	int32_t getPosAbsHardware() override;
 	void setPos(int32_t pos) override;
 	void setTmcPos(int32_t pos);
 	//uint32_t getPosCpr();
@@ -777,6 +777,20 @@ protected:
 		TMC4671* tmc;
 	};
 
+	// Sampler thread: TIM_TMC ISR notifies this thread via NotifyFromISR().
+	// The thread calls Encoder::sampleNow() in thread context, where blocking
+	// SPI reads (readReg) are legal. Prio 34 = above TMCENC(33) so the
+	// position cache is always fresh before phiE updates use it.
+	class TMC_SamplerThread : public cpp_freertos::Thread {
+	public:
+		TMC_SamplerThread(TMC4671* tmc);
+		void Run();
+		void triggerFromIsr();   // called from TIM_TMC ISR — just NotifyFromISR
+	private:
+		TMC4671* tmc;
+	};
+	std::unique_ptr<TMC_SamplerThread> samplerThread = nullptr;
+
 	static std::span<const TMC4671HardwareTypeConf> tmc4671_hw_configs; // Can override in external target file
 
 private:
@@ -826,7 +840,6 @@ private:
 	static constexpr uint8_t ENC_RETRY_MAX = 3;
 
 	uint32_t lastStatTime = 0;
-	int32_t cached_pos = 0;
 
 	uint8_t spi_buf[5] = {0};
 
@@ -877,7 +890,8 @@ private:
 	float prev_filtered_pos = 0.0f;   // previous position for RPM calculation
 	float measured_rpm = 0.0f;        // EMA-filtered velocity in RPM
 	uint32_t last_vel_tick = 0;       // timestamp for velocity measurement
-	// Note: magnitude scale removed — vertical offset is configurator-only visualization
+
+	// Note: velocity sampling now lives in Encoder base (sampleNow, TMC_SamplerThread).
 
 	void recomputeCoggingFromCwCcw(); // rebuilds cogging_harmonics from cw_store/ccw_store + offsets
 
@@ -991,6 +1005,11 @@ private:
 	float getAbsolutePosition();
 	float getWrappedError(float target, float actual);
 	float getFilteredPosition();
+	// Velocity (turns/s) from successive getFilteredPosition() samples,
+	// sharing the same state as turn() so both report identical values.
+	// Returns signed turns/s; updates measured_rpm/measured_rpm_signed.
+	// First call after a long gap returns 0 (no valid delta).
+	float get_velocity();
 
 	void encoderInit();
 	void errorCallback(const Error &error, bool cleared);

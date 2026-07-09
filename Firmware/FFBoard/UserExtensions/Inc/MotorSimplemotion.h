@@ -68,7 +68,7 @@ public:
 	bool hasIntegratedEncoder() {return true;}
 
 
-	int32_t getPos() override;
+	int32_t getPosHardware() override;
 	void setPos(int32_t pos) override;
 	EncoderType getEncoderType() override;
 	uint32_t getCpr() override;

@@ -162,7 +162,7 @@ uint32_t RmdMotorCAN::getCpr(){
 	return 36000;
 }
 
-int32_t RmdMotorCAN::getPos(){
+int32_t RmdMotorCAN::getPosHardware() {
 	if(activerequests && HAL_GetTick() - lastAngleUpdate > angleUpdateMs){
 		// pos outdated. Should be sent without request
 		sendCmd(0x92); // request multiturn pos 0x92, 0x60

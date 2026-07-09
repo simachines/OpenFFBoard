@@ -40,10 +40,10 @@ public:
 	void restoreFlash() override;
 	void saveFlash() override;
 
-	int32_t getPos() override;
+	int32_t getPosHardware() override;
 	uint32_t getCpr() override; // Encoder counts per rotation
 
-	int32_t getPosAbs() override;
+	int32_t getPosAbsHardware() override;
 
 	void setPos(int32_t pos);
 

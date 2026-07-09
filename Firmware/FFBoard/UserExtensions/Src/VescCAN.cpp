@@ -208,7 +208,7 @@ float VescCAN::getPos_f() {
 	return lastPos - posOffset;
 }
 
-int32_t VescCAN::getPos() {
+int32_t VescCAN::getPosHardware() {
 	return getCpr() * getPos_f();
 }
 

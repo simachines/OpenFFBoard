@@ -82,6 +82,10 @@ TMC4671::TMC4671(SPIPort& spiport,OutputPin cspin,uint8_t address) :
 
 	this->restoreFlash();
 	CommandHandler::setCommandsEnabled(true);
+
+	// Start the sampler thread (woken by TIM_TMC ISR, does SPI in thread context).
+	if (samplerThread == nullptr)
+		samplerThread = std::make_unique<TMC_SamplerThread>(this);
 }
 
 
@@ -90,6 +94,36 @@ TMC4671::~TMC4671() {
 	//recordSpiAddrUsed(0);
 }
 
+// --- Sampler thread: ISR-safe position sampling ---
+// TIM_TMC ISR calls triggerFromIsr() which does NotifyFromISR().
+// This wakes the thread, which calls Encoder::sampleNow() in thread
+// context where blocking SPI (readReg → takeSemaphore) is legal.
+
+TMC4671::TMC_SamplerThread::TMC_SamplerThread(TMC4671* tmc)
+	: cpp_freertos::Thread("TMCSAMP", 80, 34), tmc(tmc) {
+	this->Start();
+}
+
+void TMC4671::TMC_SamplerThread::triggerFromIsr() {
+	// Pause sampling during encoder alignment — the alignment sequence
+	// reads/writes TMC registers on the same SPI bus and the sampler's
+	// interleaved reads would disrupt the timing/sequence.
+	if (tmc->initialized && tmc->encoderAligned) this->NotifyFromISR();
+}
+
+void TMC4671::TMC_SamplerThread::Run() {
+	while (true) {
+		this->WaitForNotification();
+		// Double-check: encoderAligned may have gone false between
+		// triggerFromIsr and now (race is harmless — just one extra sample).
+		if (!tmc->encoderAligned) continue;
+		Encoder* enc = tmc->getEncoder();
+		if (enc != nullptr) {
+			if (!enc->isSamplerActive()) enc->activateSampler();
+			enc->sampleNow();
+		}
+	}
+}
 
 const ClassIdentifier TMC4671::getInfo() {
 
@@ -1803,20 +1837,10 @@ void TMC4671::turn(int16_t power){
 	if (cogging_enabled && !this->isCalibrationInProgress()) {
 		float pos_f = this->getFilteredPosition();
 
-		// Measure RPM from position delta (runs in turn() at firmware speed)
-		uint32_t now = micros();
-		float signed_rpm = 0.0f;
-		if (last_vel_tick > 0) {
-			float dt_sec = (float)(now - last_vel_tick) / 1000000.0f;
-			float delta = pos_f - prev_filtered_pos;
-			if (delta > 0.5f) delta -= 1.0f;
-			if (delta < -0.5f) delta += 1.0f;
-			signed_rpm = (delta / dt_sec) * 60.0f;
-			measured_rpm = fabsf(signed_rpm);
-			measured_rpm_signed = signed_rpm;
-		}
-		prev_filtered_pos = pos_f;
-		last_vel_tick = now;
+		// Measure RPM from position delta (runs in turn() at firmware speed).
+		// get_velocity() updates measured_rpm / measured_rpm_signed and
+		// advances the shared last_vel_tick / prev_filtered_pos state.
+		(void)this->get_velocity();
 
 		// --- DO NOT SHIFT pos_f ---
 		// Leave pos_f as the pure, raw spatial position.
@@ -1830,7 +1854,7 @@ void TMC4671::turn(int16_t power){
 		float adv_mech_rad = 0.0f;
 		if (phase_adv_curve_valid) {
 			float adv_deg = interpolatePhaseAdvance(measured_rpm);
-			float dir = (signed_rpm >= 0.0f) ? 1.0f : -1.0f;
+			float dir = (measured_rpm_signed >= 0.0f) ? 1.0f : -1.0f;
 			adv_mech_rad = dir * (adv_deg / 360.0f) * 2.0f * PI;
 		}
 
@@ -1864,10 +1888,10 @@ void TMC4671::turn(int16_t power){
 				// direction to avoid the FF flipping and creating a torque step.
 				// The deadband is intentionally tiny (0.05 RPM) so it only bites
 				// at true standstill.
-				if (fabsf(signed_rpm) < 0.05f) {
+				if (fabsf(measured_rpm_signed) < 0.05f) {
 					bin_src = (this->cogging_last_dir >= 0) ? this->cw_bins : this->ccw_bins;
 				} else {
-					if (signed_rpm >= 0.0f) {
+					if (measured_rpm_signed >= 0.0f) {
 						bin_src = this->cw_bins;
 						this->cogging_last_dir = +1;
 					} else {
@@ -2116,14 +2140,13 @@ void TMC4671::setTmcPos(int32_t pos){
 	writeReg(0x6B, pos);
 }
 
-int32_t TMC4671::getPos(){
+int32_t TMC4671::getPosHardware() {
 
 	int32_t pos = (int32_t)readReg(0x6B);
-	this->cached_pos = pos;
 	return pos;
 }
 
-int32_t TMC4671::getPosAbs(){
+int32_t TMC4671::getPosAbsHardware() {
 	int16_t pos;
 	if(this->conf.motconf.enctype == EncoderType_TMC::abn){
 		pos = (int16_t)readReg(0x2A) & 0xffff; // read phiM
@@ -2132,7 +2155,7 @@ int32_t TMC4671::getPosAbs(){
 	}else if(this->conf.motconf.enctype == EncoderType_TMC::sincos || this->conf.motconf.enctype == EncoderType_TMC::uvw){
 		pos = (int16_t)readReg(0x46) & 0xffff; // read phiM
 	}else{
-		pos = getPos(); // read phiM
+		pos = getPosHardware(); // read phiM
 	}
 
 	return pos;
@@ -2675,7 +2698,8 @@ float TMC4671::getPwmFreq(){
  *
  */
 void TMC4671::setPwmMaxCnt(uint16_t maxcnt){
-	maxcnt = clip(maxcnt, 255, 4095);
+	int clipped = clip((int)maxcnt, 255, 4095);
+	maxcnt = (uint16_t)clipped;
 	this->conf.pwmcnt = maxcnt;
 	writeReg(0x18, maxcnt);
 }
@@ -3850,6 +3874,13 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 #endif
 #ifdef TIM_TMC
 		if(htim == this->externalEncoderTimer){
+			// === Notify sampler thread to read position at TIM_TMC rate ===
+			// The ISR only signals the thread via NotifyFromISR (FreeRTOS-safe).
+			// The thread does the SPI read in thread context where semaphores are legal.
+			if (this->initialized && this->encoderAligned && samplerThread != nullptr) {
+				samplerThread->triggerFromIsr();
+			}
+
 			// Read encoder and send to tmc
 			if(usingExternalEncoder() && externalEncoderAllowed() && this->conf.motconf.phiEsource == PhiE::extEncoder && extEncUpdater != nullptr){
 				//setPhiE_ext(getPhiEfromExternalEncoder());
@@ -4114,8 +4145,7 @@ float TMC4671::getWrappedError(float target, float actual) {
 }
 
 float TMC4671::getAbsolutePosition() {
-	Encoder* activeEnc = usingExternalEncoder() ? drvEncoder.get() : static_cast<Encoder*>(this);
-	return activeEnc->getPos_f();
+	return getPosAbs_f();
 }
 
 float TMC4671::interpolateScale(float rpm) {
@@ -4155,16 +4185,24 @@ float TMC4671::interpolatePhaseAdvance(float rpm) {
 
 float TMC4671::getFilteredPosition() {
 	Encoder* activeEnc = usingExternalEncoder() ? drvEncoder.get() : static_cast<Encoder*>(this);
-	
 	int32_t cpr = activeEnc->getCpr();
 	if (cpr == 0) return 0.0f;
-	
-	// Integer modulo BEFORE float conversion guarantees zero precision loss
-	// By ignoring full turns, we maintain 100% of the encoder's fractional resolution forever.
+	// Integer modulo BEFORE float conversion guarantees zero precision loss.
+	// When sampler is active, getPos() returns the cache (raw counts).
+	// When inactive, it falls through to getPosHardware().
+	// Either way, modulo wrapping ensures 0..1 turns output.
 	int32_t remainder = activeEnc->getPos() % cpr;
-	if (remainder < 0) remainder += cpr; // Mathematical modulo (always positive)
-	
+	if (remainder < 0) remainder += cpr; // mathematical modulo (always positive)
 	return (float)remainder / (float)cpr;
+}
+
+float TMC4671::get_velocity() {
+	// Returns the latest sampler-thread velocity (turns/s), updated at
+	// TIM_TMC rate by Encoder::sampleNow().
+	float v_turns_s = getVelocity();       // from Encoder base
+	measured_rpm = fabsf(v_turns_s) * 60.0f;
+	measured_rpm_signed = v_turns_s * 60.0f;
+	return v_turns_s;
 }
 
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
@@ -4385,10 +4423,8 @@ void TMC4671::handleStateCoggingCalibration() {
 	const uint32_t COGGING_WARMUP_MS = 1500;
 	uint32_t cogging_warmup_ms = COGGING_WARMUP_MS; // may be scaled by inertia later
 	const uint32_t GAIN_SWEEP_WARMUP_MS = 750;
-	const uint32_t GAIN_SWEEP_SETTLE_MS = 250; // (sweep disabled — preserved)
 
 	arm_pid_instance_f32 pid_soft;
-	char dbg_buf[128];
 	float max_test_torque = bangInitPower > 0 ? (float)bangInitPower * 0.8f : 2000.0f; 
 	volatile TMC4671CoggingDebugVars& dbg = g_tmc4671_cogging_debug;
 
@@ -5308,7 +5344,6 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 			memset(active_tbl, 0, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
 			this->cogging_scale = 1.0f;
 
-			float prev_iter_err = 999.0f; // track best error for degradation detection
 			Harmonic prev_harmonics[COGGING_HARMONICS_COUNT]; // backup of best table
 			float global_max_iq = 0.0f; // track peak PID torque for accel DFT starting point
 			float cw_dc_avg = 0.0f;   // DC avg from CW sweep (friction), saved for Step B start
@@ -5420,8 +5455,10 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 						float iq_cmd = 0.0f;
 						float iq_inertia = 0.0f;
 						float iq_pid = 0.0f;
+#ifndef COGGING_DFT_USE_IQ_CMD
 						int32_t actual_iq_raw = 0;
-						
+#endif
+
 						startCalibTimers(TIM_TMC_ARR);
 						while (HAL_GetTick() - calibStartTime < REVOLUTION_TIME_MS && !dft_clamped && !emergency && hasPower()) {
 							next_tick += period_us;
@@ -5822,7 +5859,6 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				// }
 				// Save backup of current best table (this profile's table)
 				memcpy(prev_harmonics, active_tbl, sizeof(prev_harmonics));
-				prev_iter_err = iter_max_err_deg;
 			}
 
 			// --- DFT CLAMP RETRY ---
@@ -6288,11 +6324,9 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 					for (int vi = 0; vi < 3 && !emergency && hasPower(); vi++) {
 						float vsum = 0.0f; uint32_t vn = 0;
 						uint32_t v0 = HAL_GetTick();
-						float vp = getFilteredPosition();
 						while (HAL_GetTick() - v0 < 500 && !emergency) {
-							float cp = getFilteredPosition();
-							float dv = fabs(getWrappedError(vp, cp)) / 0.1f; // turns/s
-							vsum += dv; vn++; vp = cp;
+							float dv = fabsf(getVelocity()); // turns/s, from ISR
+							vsum += dv; vn++;
 							g_tmc4671_cogging_debug.accel_vel_now = dv * 60.0f;
 							Delay(100); refreshWatchdog();
 						}
@@ -6327,6 +6361,9 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 			const uint32_t cpr = getEncoder()->getCpr();
 
 			// Apply base torque + cogging feed-forward + update debug.
+			// Motor receives t + FF so cogging doesn't fight the probe,
+			// but accel_test_current = t (base only) — the logged dmax
+			// is the base torque, not the FF-inflated value.
 			auto applyTorqueFF = [&](float t) -> void {
 				float p = getFilteredPosition();
 				float cog = 0.0f; float ar = p * 2.0f * PI;
@@ -6359,7 +6396,6 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				float start_torque = fabsf(cw_dc_avg);
 				const float DMAX_STEP = 1.0f;
 				const float DMAX_CAP = max_test_torque * 0.7f;
-				const float TRAVEL_THRESH = 0.002f;  // ~0.36° — catch any real motion
 
 				g_tmc4671_cogging_debug.accel_ver_peak = start_torque;
 				g_tmc4671_cogging_debug.accel_debug_phase = (uint32_t)TMC4671CoggingDebugPhase::AccelDFT_FindDmax;
@@ -6380,18 +6416,33 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				while (same_count < CONVERGE_COUNT && test < DMAX_CAP && !emergency && hasPower()) {
 					// ---- Ramp up from current test level to find next sustained breakaway ----
 					while (test < DMAX_CAP && !emergency && hasPower()) {
-						int32_t p0 = getEncoder()->getPos();
 						applyTorqueFF(test);
 
-						// Stage 1: did the rotor move at all in 1 s?
-						float moved = measureTravel(p0, 1000);
-						broadcastCalibLog(0, "Accel DFT: dmax probe %.0f -> moved %.3f turn, %.0f RPM",
-							test, moved, g_tmc4671_cogging_debug.accel_vel_now);
+						// Stage 1: wait 1 s, then measure instantaneous
+						// velocity over a 100 ms window at the end.
+						{
+							uint32_t wait_end = HAL_GetTick() + 1000;
+							while (HAL_GetTick() < wait_end && !emergency && hasPower()) {
+								refreshWatchdog(); Delay(100);
+							}
+						}
+						bool moving = false;
+						if (!emergency && hasPower()) {
+							int32_t p_a = getEncoder()->getPos();
+							float moved = measureTravel(p_a, 100);
+							float v = moved / 0.1f; // turns/s
+							// accel_vel_now already set by measureTravel (RPM)
+							moving = (v > vel_thresh);
+						}
+						broadcastCalibLog(0, "Accel DFT: dmax probe %.0f -> %.0f RPM %s",
+							test, g_tmc4671_cogging_debug.accel_vel_now,
+							moving ? "moving" : "still");
 
-						if (moved > TRAVEL_THRESH) {
-							// Stage 2: wait full 5 s, then measure velocity at the end.
+						if (moving) {
+							// Stage 2: wait full 5 s, then measure velocity at the end
+							// over 100 ms — same method as Stage 1.
 							{
-								uint32_t wait_end = HAL_GetTick() + 5000;
+								uint32_t wait_end = HAL_GetTick() + 2000;
 								while (HAL_GetTick() < wait_end && !emergency && hasPower()) {
 									refreshWatchdog(); Delay(100);
 								}
@@ -6399,11 +6450,10 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 							bool sustained = false;
 							if (!emergency && hasPower()) {
 								int32_t p_a = getEncoder()->getPos();
-								refreshWatchdog(); Delay(250);
-								int32_t p_b = getEncoder()->getPos();
-								float v_end = fabsf((float)(p_b - p_a) / (float)cpr) / 0.25f;
-								g_tmc4671_cogging_debug.accel_vel_now = 60.0f * v_end;
-								sustained = (v_end > 0.0005f);
+								float moved = measureTravel(p_a, 100);
+								float v = moved / 0.1f; // turns/s
+								// accel_vel_now already set by measureTravel
+								sustained = (v > vel_thresh);
 							}
 							if (sustained) {
 								dmax_torque = test;
@@ -6436,28 +6486,29 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 
 					if (same_count >= CONVERGE_COUNT) break;
 
-					// ---- Spin down: apply 0 torque, wait for speed below thresh ----
+					// ---- Spin down: coast, wait for speed below vel_thresh ----
 					applySafeTorque(0); g_tmc4671_cogging_debug.accel_test_current = 0.0f;
 					{
+						// get_velocity() reads the 5 kHz ISR-sampled
+						// velocity (TIM_TMC rate); just poll at a relaxed cadence.
 						uint32_t spin_down_start = HAL_GetTick();
 						while (HAL_GetTick() - spin_down_start < 8000 && !emergency && hasPower()) {
-							int32_t pa = getEncoder()->getPos();
-							refreshWatchdog(); Delay(250);
-							int32_t pb = getEncoder()->getPos();
-							float v = fabsf((float)(pb - pa) / (float)cpr) / 0.25f;
-							g_tmc4671_cogging_debug.accel_vel_now = 60.0f * v;
-							if (v < 0.0005f) break;
+							Delay(150);
+							float v = fabsf(this->get_velocity()); // turns/s
+							g_tmc4671_cogging_debug.accel_vel_now = v * 60.0f; // RPM
+							if (v < vel_thresh) break;
+							refreshWatchdog();
 						}
 					}
+					
 
-					// Start next ramp from the working dmax (with a small back-off
-					// to catch cases where the new detent position requires slightly
-					// less torque).
-					test = fmaxf(dmax_torque - DMAX_STEP * 2.0f, start_torque);
-					broadcastCalibLog(0, "Accel DFT: re-testing dmax from %.0f (was %.0f)",
-						test, dmax_torque);
+					// Start next ramp from the working dmax.  The rotor is at a
+					// new position after spinning down — test the same torque
+					// that broke away last time.
+					test = dmax_torque;
+					broadcastCalibLog(0, "Accel DFT: re-testing dmax from %.0f",
+						test);
 				}
-				if (dmax_torque < 25.0f) dmax_torque = 25.0f;
 
 				// ---------- dmin: per-step spin-up binary search ----------
 				// Each candidate torque gets its own independent cycle:
@@ -6624,8 +6675,10 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 						else
 							broadcastCalibLog(0, "Accel DFT: %s retry %u dmax=%.0f dmin=%.0f", dir, stall_retries, dmax_torque, dmin_torque);
 						// Wait for motor to get moving
-				{ uint32_t r0 = HAL_GetTick(); float rp = getFilteredPosition();
-				  while (HAL_GetTick() - r0 < 800 && !emergency) { float rcp = getFilteredPosition(); g_tmc4671_cogging_debug.accel_vel_now = 60.0f * fabs(getWrappedError(rp, rcp)) / 0.02f; rp = rcp; refreshWatchdog(); Delay(20); } }
+				{ uint32_t r0 = HAL_GetTick();
+				  while (HAL_GetTick() - r0 < 800 && !emergency) {
+					g_tmc4671_cogging_debug.accel_vel_now = fabsf(getVelocity()) * 60.0f;
+					refreshWatchdog(); Delay(20); } }
 				// Drop to dmin for sustained slow rotation
 				applySafeTorque(sustain_t);
 				g_tmc4671_cogging_debug.accel_test_current = sustain_t;
@@ -6636,19 +6689,16 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				uint32_t astart = HAL_GetTick();
 				uint32_t ap_us = getActualCalibPeriod(TIM_TMC_ARR);
 				uint32_t ant = micros(); float adt = (float)ap_us / 1000000.0f;
-				float aprev_p = getFilteredPosition(), aprev_v = 0.0f;
 				uint32_t aec = 0, adc = 0; float adist = 0.0f;
 				const uint32_t AWM = 1500, ASTALL = 3000, AREV = 20000;
 
 				startCalibTimers(TIM_TMC_ARR);
 				while (HAL_GetTick() - astart < AREV && !emergency && hasPower()) {
 					ant += ap_us;
-					float ap = getFilteredPosition(), av = 0.0f;
-					// Compute velocity every iteration for debug visibility
-					av = getWrappedError(aprev_p, ap) / adt;
-					aprev_p = ap;
+					float ap = getFilteredPosition();
+					// Use ISR-computed velocity — guaranteed-correct dt, synchronized with position
+					float av = getVelocity();
 					g_tmc4671_cogging_debug.accel_vel_now = 60.0f * av;
-					if (aec % 2 == 0) aprev_v = av; // decimated velocity for DFT
 
 					// FF from existing PID-DFT table
 					float acog = 0.0f;
@@ -6743,8 +6793,10 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 					float s = Jc * aom * (float)k * 2.0f * PI;
 					av_cw[k].mag *= s; av_cw[k].phase += PI/2.0f;
 					av_ccw[k].mag *= s; av_ccw[k].phase += PI/2.0f;
-					while (av_cw[k].phase > PI) av_cw[k].phase -= 2.0f*PI; while (av_cw[k].phase < -PI) av_cw[k].phase += 2.0f*PI;
-					while (av_ccw[k].phase > PI) av_ccw[k].phase -= 2.0f*PI; while (av_ccw[k].phase < -PI) av_ccw[k].phase += 2.0f*PI;
+					while (av_cw[k].phase > PI)  av_cw[k].phase -= 2.0f*PI;
+					while (av_cw[k].phase < -PI) av_cw[k].phase += 2.0f*PI;
+					while (av_ccw[k].phase > PI)  av_ccw[k].phase -= 2.0f*PI;
+					while (av_ccw[k].phase < -PI) av_ccw[k].phase += 2.0f*PI;
 				}
 
 				// CW+CCW combination (complex-vector phase averaging)
@@ -6830,7 +6882,8 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				  bool any=false;
 				  for (uint8_t i=0; i<COGGING_HARMONICS_COUNT; i++) {
 					if (active_tbl[i].amplitude > 0.0f || active_tbl[i].order > 0) {
-						if (any) hs += ","; any=true;
+						if (any) hs += ",";
+						any = true;
 						hs += std::to_string(active_tbl[i].order) + ":";
 						hs += std::to_string((int16_t)active_tbl[i].amplitude) + ":";
 						hs += std::to_string((int16_t)(active_tbl[i].phase * 1000.0f));
@@ -6943,10 +6996,6 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 #endif
 
 				// --- 3.5 SCALE CALIBRATION (Position Error Grid Search) ---
-				// Get the raw absolute position (no modulo 1.0 wrapping)
-				float actual_pos_f = getAbsolutePosition();
-				float target_rpm = (actual_pos_f > 0.0f) ? -calib_rpm : calib_rpm;
-
 				int main_h = -1;
 				float max_amp = 0;
 				for(int n=0; n<COGGING_HARMONICS_COUNT; n++){

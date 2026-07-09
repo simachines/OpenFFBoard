@@ -260,7 +260,7 @@ float ODriveCAN::getPos_f(){
 bool ODriveCAN::motorReady(){
 	return state == ODriveLocalState::RUNNING && (odriveCurrentState == ODriveState::AXIS_STATE_CLOSED_LOOP_CONTROL);
 }
-int32_t ODriveCAN::getPos(){
+int32_t ODriveCAN::getPosHardware() {
 	return getCpr() * getPos_f();
 }
 

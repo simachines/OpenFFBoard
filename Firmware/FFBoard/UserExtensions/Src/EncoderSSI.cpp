@@ -156,7 +156,7 @@ EncoderType EncoderSSI::getEncoderType(){
 }
 
 
-int32_t EncoderSSI::getPosAbs(){
+int32_t EncoderSSI::getPosAbsHardware() {
 	if(!waitData){ // If a transfer is still in progress return the last result
 		spiPort.receive_DMA(spi_buf, transferlen, this); // Receive next frame
 
@@ -164,8 +164,8 @@ int32_t EncoderSSI::getPosAbs(){
 	return pos + mtpos * getCpr();
 }
 
-int32_t EncoderSSI::getPos(){
-	return getPosAbs()-posOffset;
+int32_t EncoderSSI::getPosHardware() {
+	return getPosAbsHardware()-posOffset;
 }
 
 void EncoderSSI::setPos(int32_t newpos){

@@ -38,7 +38,7 @@ public:
 
 	void registerCommands();
 
-	int32_t getPos();
+	int32_t getPosHardware();
 	void setPos(int32_t pos);
 	//void setOffset(int32_t offset);
 	void setPeriod(uint32_t period);

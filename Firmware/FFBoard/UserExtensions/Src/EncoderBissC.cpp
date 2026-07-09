@@ -203,7 +203,7 @@ bool EncoderBissC::updateFrame(){
 	return crc_ok;
 }
 
-int32_t EncoderBissC::getPosAbs(){
+int32_t EncoderBissC::getPosAbsHardware() {
 	if(!waitData){ // If a transfer is still in progress return the last result
 		requestNewDataSem.Give(); // Start transfer
 		if(useWaitSem && HAL_GetTick() - lastUpdateTick > waitThresh)
@@ -213,11 +213,11 @@ int32_t EncoderBissC::getPosAbs(){
 	return invertDirection ? -curpos : curpos;
 }
 
-int32_t EncoderBissC::getPos(){
+int32_t EncoderBissC::getPosHardware() {
 	if(invertDirection){
-		return getPosAbs()+posOffset;
+		return getPosAbsHardware()+posOffset;
 	}else{
-		return getPosAbs()-posOffset;
+		return getPosAbsHardware()-posOffset;
 	}
 
 }
