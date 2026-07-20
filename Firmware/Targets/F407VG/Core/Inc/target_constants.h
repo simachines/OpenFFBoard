@@ -72,7 +72,7 @@
 #define TIM_CALIBRATION htim9
 #define TIM_TMC htim6 // Timer running at half clock speed
 #define TIM_TMC_BCLK SystemCoreClock / 2
-#define TIM_TMC_ARR 200
+#define TIM_TMC_ARR 500
 #define TIM_FFB htim13
 
 extern UART_HandleTypeDef huart1;

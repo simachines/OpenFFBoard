@@ -100,7 +100,7 @@ TMC4671::~TMC4671() {
 // context where blocking SPI (readReg → takeSemaphore) is legal.
 
 TMC4671::TMC_SamplerThread::TMC_SamplerThread(TMC4671* tmc)
-	: cpp_freertos::Thread("TMCSAMP", 80, 34), tmc(tmc) {
+	: cpp_freertos::Thread("TMCSAMP", 80, 24), tmc(tmc) {
 	this->Start();
 }
 
@@ -121,6 +121,7 @@ void TMC4671::TMC_SamplerThread::Run() {
 		if (enc != nullptr) {
 			if (!enc->isSamplerActive()) enc->activateSampler();
 			enc->sampleNow();
+
 		}
 	}
 }
@@ -1828,6 +1829,24 @@ int16_t TMC4671::controlFluxDissipate(){
 void TMC4671::turn(int16_t power){
 	if(!(this->motorReady() && motorEnabledRequested))
 		return;
+
+	// --- Position diagnostics (every turn, independent of cogging) ---
+	// Lets MCU Viewer compare what Axis sees (getEncAngle) vs the raw
+	// hardware reads vs the sampler cache, to locate the 360deg wrap.
+	{
+		Encoder* enc = this->getEncoder();
+		if (enc != nullptr) {
+			float pf = enc->getPos_f();
+			g_tmc4671_cogging_debug.pos_rt_posf       = this->getFilteredPosition();
+			g_tmc4671_cogging_debug.pos_rt_encangle_deg = 360.0f * pf;
+			g_tmc4671_cogging_debug.pos_hw_posf        = pf;
+			g_tmc4671_cogging_debug.pos_hw_posabsf     = enc->getPosAbs_f();
+			g_tmc4671_cogging_debug.pos_hw_raw         = enc->getPos();
+			g_tmc4671_cogging_debug.pos_hw_rawabs      = enc->getPosAbs();
+			g_tmc4671_cogging_debug.pos_cpr            = enc->getCpr();
+			g_tmc4671_cogging_debug.pos_sampler_active = enc->isSamplerActive() ? 1 : 0;
+		}
+	}
 
 	int32_t flux = 0;
 	int32_t totalPower = power;
@@ -4134,6 +4153,20 @@ void TMC4671::applySafeTorque(float torque_cmd) {
 	setFluxTorque(0, pwr);
 }
 
+// INTERNAL — only called by TMC_SamplerThread. Caller never uses this.
+float TMC4671::computeCoggingFF(float pos_f) {
+	if (active_tbl == nullptr) return 0.0f;
+	float cog = 0.0f;
+	float ar = pos_f * 2.0f * PI;
+	for (uint8_t h = 0; h < COGGING_HARMONICS_COUNT; h++) {
+		if (active_tbl[h].amplitude > 0.0f) {
+			cog += active_tbl[h].amplitude *
+			       arm_sin_f32(ar * active_tbl[h].order + active_tbl[h].phase);
+		}
+	}
+	return this->cogging_scale * cog;
+}
+
 // Helper: Calculate wrapped error between 0 and 1 turn
 float TMC4671::getWrappedError(float target, float actual) {
 	target = target - (float)((int32_t)target); 
@@ -4197,9 +4230,31 @@ float TMC4671::getFilteredPosition() {
 }
 
 float TMC4671::get_velocity() {
-	// Returns the latest sampler-thread velocity (turns/s), updated at
-	// TIM_TMC rate by Encoder::sampleNow().
-	float v_turns_s = getVelocity();       // from Encoder base
+	// Returns velocity (turns/s) computed from position deltas, which
+	// works for ALL encoder types (internal ABN/AENC/hall, external).
+	// The old code relied on Encoder::getVelocity() which only updated
+	// when the TIM_TMC sampler was active (enctype == ext), leaving
+	// measured_rpm / measured_rpm_signed permanently at 0 for internal
+	// encoders.  That broke phase advance, per-direction FF bin selection,
+	// and scale-curve interpolation at runtime.
+	//
+	// We now compute velocity directly from two getFilteredPosition()
+	// samples and a micros() timestamp, using the same pattern as every
+	// calibration velocity loop in this file.
+	float pos = getFilteredPosition();
+	uint32_t now_us = micros();
+
+	float v_turns_s = 0.0f;
+	if (last_vel_tick != 0) {
+		float dt = (float)(now_us - last_vel_tick) / 1e6f;
+		if (dt > 0.0001f && dt < 1.0f) {
+			float delta = getWrappedError(prev_filtered_pos, pos);
+			v_turns_s = delta / dt;
+		}
+	}
+	prev_filtered_pos = pos;
+	last_vel_tick = now_us;
+
 	measured_rpm = fabsf(v_turns_s) * 60.0f;
 	measured_rpm_signed = v_turns_s * 60.0f;
 	return v_turns_s;
@@ -5341,8 +5396,15 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 			Harmonic* active_tbl = this->cogging_harmonics;
 			if (rpm_profile == 1) active_tbl = this->cogging_harmonics_rpm2;
 			else if (rpm_profile >= 2) active_tbl = this->cogging_harmonics_rpm3;
+			this->active_tbl = active_tbl;
 			memset(active_tbl, 0, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
 			this->cogging_scale = 1.0f;
+			// Background FF stays OFF during PID-DFT — the DFT loop applies
+			// torque directly via applySafeTorque(). If FF were ON, the
+			// sampler thread would fight the DFT loop during WaitForNotification()
+			// by applying (0 + FF) between DFT iterations.
+			this->calib_ff_active = false;
+			this->calib_ff_base_torque = 0.0f;
 
 			Harmonic prev_harmonics[COGGING_HARMONICS_COUNT]; // backup of best table
 			float global_max_iq = 0.0f; // track peak PID torque for accel DFT starting point
@@ -6315,6 +6377,10 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 #ifdef COGGING_ACCEL_BASED_DFT
 			// --- ACCELERATION-BASED DFT STEP (Copper/Piccoli method - continuous ramp) ---
 			if (!emergency && hasPower() && total_samples > 0) {
+				// FF is now applied inline by ffWait() and measureTravel() —
+				// no background thread dependency. Works for all encoder types.
+				this->calib_max_torque = max_test_torque;
+				this->calib_ff_base_torque = 0.0f;
 				applySafeTorque(0); Delay(500);
 
 				// --- Step A: measure stationary velocity noise → motion threshold ---
@@ -6324,10 +6390,20 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 					for (int vi = 0; vi < 3 && !emergency && hasPower(); vi++) {
 						float vsum = 0.0f; uint32_t vn = 0;
 						uint32_t v0 = HAL_GetTick();
+						float prev_pos = getFilteredPosition();
+						uint32_t prev_us = micros();
 						while (HAL_GetTick() - v0 < 500 && !emergency) {
-							float dv = fabsf(getVelocity()); // turns/s, from ISR
+							float pos = getFilteredPosition();
+							uint32_t now_us = micros();
+							float dt = (float)(now_us - prev_us) / 1e6f;
+							float dv = 0.0f;
+							if (dt > 0.0001f && dt < 0.1f)
+								dv = fabsf(getWrappedError(prev_pos, pos) / dt);
 							vsum += dv; vn++;
 							g_tmc4671_cogging_debug.accel_vel_now = dv * 60.0f;
+							g_tmc4671_cogging_debug.accel_vel_rpm = dv * 60.0f;
+							g_tmc4671_cogging_debug.accel_vel_turns_s = dv;
+							prev_pos = pos; prev_us = now_us;
 							Delay(100); refreshWatchdog();
 						}
 						v_noise[vi] = (vn > 0) ? (vsum / (float)vn) : 0.0f;
@@ -6365,6 +6441,7 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 			// but accel_test_current = t (base only) — the logged dmax
 			// is the base torque, not the FF-inflated value.
 			auto applyTorqueFF = [&](float t) -> void {
+				calib_ff_base_torque = t;   // so ffWait()/measureTravel() use the right base
 				float p = getFilteredPosition();
 				float cog = 0.0f; float ar = p * 2.0f * PI;
 				for (uint8_t h = 0; h < COGGING_HARMONICS_COUNT; h++)
@@ -6375,26 +6452,82 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				g_tmc4671_cogging_debug.accel_test_current = t;
 			};
 
+			// Active FF wait: continuously apply (base + FF) while waiting.
+			auto ffWait = [&](uint32_t duration_ms) {
+				uint32_t wait_end = HAL_GetTick() + duration_ms;
+				float prev_pos = getFilteredPosition();
+				uint32_t prev_us = micros();
+				while (HAL_GetTick() < wait_end && !emergency && hasPower()) {
+					float pos = getFilteredPosition();
+					float ff = computeCoggingFF(pos);
+					float total = clip<float,float>(
+						calib_ff_base_torque + ff,
+						-max_test_torque, max_test_torque);
+					applySafeTorque(total);
+					g_tmc4671_cogging_debug.accel_test_current = calib_ff_base_torque;
+
+					uint32_t now_us = micros();
+					float dt = (float)(now_us - prev_us) / 1e6f;
+					if (dt > 0.0001f && dt < 0.1f) {
+						float delta = getWrappedError(prev_pos, pos);
+						float v_turns_s = delta / dt;
+						float v_rpm = v_turns_s * 60.0f;
+						g_tmc4671_cogging_debug.accel_vel_now = fabsf(v_rpm);
+						g_tmc4671_cogging_debug.accel_vel_rpm = fabsf(v_rpm);
+						g_tmc4671_cogging_debug.accel_vel_turns_s = v_turns_s;
+					}
+					prev_pos = pos;
+					prev_us = now_us;
+
+					refreshWatchdog();
+				Delay(1);  // 1 tick = 1ms = ~1kHz FF update (was Delay(5)=200Hz)
+			}
+		};
+
 			// Cumulative distance travelled (turns) since a given encoder count.
-			// Updates accel_vel_now live for the MCU debug viewer.
+			// Applies FF inline during travel so cogging doesn't fight the probe.
 			auto measureTravel = [&](int32_t ref_pos, uint32_t duration_ms) -> float {
 				uint32_t t0 = HAL_GetTick();
 				int32_t last = ref_pos;
 				float cdist = 0.0f;
+				float prev_pos_inst = getFilteredPosition();
+				uint32_t prev_us_inst = micros();
 				while (HAL_GetTick() - t0 < duration_ms && !emergency && hasPower()) {
 					int32_t raw = getEncoder()->getPos();
 					cdist += fabsf((float)(raw - last) / (float)cpr);
 					last = raw;
-					g_tmc4671_cogging_debug.accel_vel_now =
-						60.0f * cdist / ((float)(HAL_GetTick() - t0 + 1) / 1000.0f);
+
+					// Instantaneous velocity: position delta / time delta.
+					// This shows "is it moving right now?" vs cumulative average.
+					float pos = getFilteredPosition();
+					uint32_t now_us = micros();
+					float dt_inst = (float)(now_us - prev_us_inst) / 1e6f;
+					if (dt_inst > 0.0001f && dt_inst < 1.0f) {
+						float delta_inst = getWrappedError(prev_pos_inst, pos);
+						float v_inst_rpm = (delta_inst / dt_inst) * 60.0f;
+						g_tmc4671_cogging_debug.accel_vel_now = fabsf(v_inst_rpm);
+						g_tmc4671_cogging_debug.accel_vel_rpm = fabsf(v_inst_rpm);
+						g_tmc4671_cogging_debug.accel_vel_turns_s = delta_inst / dt_inst;
+					}
+					prev_pos_inst = pos;
+					prev_us_inst = now_us;
+
+					float ff = computeCoggingFF(pos);
+					float total = clip<float,float>(
+						calib_ff_base_torque + ff,
+						-max_test_torque, max_test_torque);
+					applySafeTorque(total);
+					g_tmc4671_cogging_debug.accel_test_current = calib_ff_base_torque;
+
 					refreshWatchdog();
+					Delay(1);
 				}
 				return cdist;
 			};
 
 			{
 				float start_torque = fabsf(cw_dc_avg);
-				const float DMAX_STEP = 1.0f;
+				const float DMAX_STEP = 1.00f;
 				const float DMAX_CAP = max_test_torque * 0.7f;
 
 				g_tmc4671_cogging_debug.accel_ver_peak = start_torque;
@@ -6407,53 +6540,35 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				uint8_t same_count = 0;
 				static constexpr uint8_t CONVERGE_COUNT = 5;
 				applySafeTorque(0); g_tmc4671_cogging_debug.accel_test_current = 0.0f;
-				// Brief settle before first probe so the rotor isn't coasting
-				// from the end of the PID-DFT verification pass.
-				{ uint32_t s0 = HAL_GetTick();
-				  while (HAL_GetTick() - s0 < 1000 && !emergency && hasPower()) {
-					refreshWatchdog(); Delay(10); } }
+				// Brief settle before first probe (base=0, FF-only)
+				calib_ff_base_torque = 0.0f;
+				ffWait(1000);
 
 				while (same_count < CONVERGE_COUNT && test < DMAX_CAP && !emergency && hasPower()) {
 					// ---- Ramp up from current test level to find next sustained breakaway ----
 					while (test < DMAX_CAP && !emergency && hasPower()) {
 						applyTorqueFF(test);
 
-						// Stage 1: wait 1 s, then measure instantaneous
-						// velocity over a 100 ms window at the end.
-						{
-							uint32_t wait_end = HAL_GetTick() + 1000;
-							while (HAL_GetTick() < wait_end && !emergency && hasPower()) {
-								refreshWatchdog(); Delay(100);
-							}
-						}
+						// Stage 1: wait 1 s with active FF, then measure velocity
+						ffWait(1000);
 						bool moving = false;
 						if (!emergency && hasPower()) {
-							int32_t p_a = getEncoder()->getPos();
-							float moved = measureTravel(p_a, 100);
-							float v = moved / 0.1f; // turns/s
-							// accel_vel_now already set by measureTravel (RPM)
-							moving = (v > vel_thresh);
+							(void)measureTravel(getEncoder()->getPos(), 100);
+							// Decision from instantaneous velocity (accel_vel_now in RPM).
+							// vel_thresh is in turns/s; convert RPM → turns/s.
+							moving = (g_tmc4671_cogging_debug.accel_vel_now / 60.0f > vel_thresh);
 						}
 						broadcastCalibLog(0, "Accel DFT: dmax probe %.0f -> %.0f RPM %s",
 							test, g_tmc4671_cogging_debug.accel_vel_now,
 							moving ? "moving" : "still");
 
 						if (moving) {
-							// Stage 2: wait full 5 s, then measure velocity at the end
-							// over 100 ms — same method as Stage 1.
-							{
-								uint32_t wait_end = HAL_GetTick() + 2000;
-								while (HAL_GetTick() < wait_end && !emergency && hasPower()) {
-									refreshWatchdog(); Delay(100);
-								}
-							}
+							// Stage 2: wait 2 s with active FF, then measure velocity
+							ffWait(2000);
 							bool sustained = false;
 							if (!emergency && hasPower()) {
-								int32_t p_a = getEncoder()->getPos();
-								float moved = measureTravel(p_a, 100);
-								float v = moved / 0.1f; // turns/s
-								// accel_vel_now already set by measureTravel
-								sustained = (v > vel_thresh);
+								(void)measureTravel(getEncoder()->getPos(), 100);
+								sustained = (g_tmc4671_cogging_debug.accel_vel_now / 60.0f > vel_thresh);
 							}
 							if (sustained) {
 								dmax_torque = test;
@@ -6486,16 +6601,24 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 
 					if (same_count >= CONVERGE_COUNT) break;
 
-					// ---- Spin down: coast, wait for speed below vel_thresh ----
+					// ---- Spin down: coast with zero torque, poll position-based velocity ----
 					applySafeTorque(0); g_tmc4671_cogging_debug.accel_test_current = 0.0f;
 					{
-						// get_velocity() reads the 5 kHz ISR-sampled
-						// velocity (TIM_TMC rate); just poll at a relaxed cadence.
 						uint32_t spin_down_start = HAL_GetTick();
+						float sd_prev_pos = getFilteredPosition();
+						uint32_t sd_prev_us = micros();
 						while (HAL_GetTick() - spin_down_start < 8000 && !emergency && hasPower()) {
 							Delay(150);
-							float v = fabsf(this->get_velocity()); // turns/s
+							float sd_pos = getFilteredPosition();
+							uint32_t sd_now_us = micros();
+							float sd_dt = (float)(sd_now_us - sd_prev_us) / 1e6f;
+							float v = 0.0f;
+							if (sd_dt > 0.0001f && sd_dt < 1.0f)
+								v = fabsf(getWrappedError(sd_prev_pos, sd_pos) / sd_dt);
 							g_tmc4671_cogging_debug.accel_vel_now = v * 60.0f; // RPM
+							g_tmc4671_cogging_debug.accel_vel_rpm = v * 60.0f;
+							g_tmc4671_cogging_debug.accel_vel_turns_s = v;
+							sd_prev_pos = sd_pos; sd_prev_us = sd_now_us;
 							if (v < vel_thresh) break;
 							refreshWatchdog();
 						}
@@ -6535,42 +6658,70 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 					applySafeTorque(0);
 				};
 
-				float dmin_lo = 5.0f;
-				float dmin_hi = dmax_torque;
-				broadcastCalibLog(0, "Accel DFT: finding dmin (binary search %.0f..%.0f, per-step spin-up)...",
-					dmin_lo, dmin_hi);
+				// dmin: linear scan with dmax spin-up per step.
+				//   Phase 1 — descend: candidate = dmax-1, step -1 until first coast-down.
+				//              Records the stall boundary (one false stop is expected at a cogging peak).
+				//   Phase 2 — ascend:  candidate = stall_point+1, step +1 until first sustained.
+				//              Re-spins from dmax each step so a transient detent doesn't mask the true floor.
+				// dmin = the lowest value that reliably sustains rotation.
+				const float DMIN_FLOOR = 5.0f;
+				const float DMIN_VEL_THRESH = 0.05f;
+				float dmin_torque_local = dmax_torque; // default if descent never stalls
 
-				for (uint8_t it = 0;
-					 it < 10 && (dmin_hi - dmin_lo) > fmaxf(1.5f, dmin_hi * 0.03f) && !emergency && hasPower();
-					 it++) {
-					float mid = (dmin_lo + dmin_hi) * 0.5f;
-
+				// Single probe at a candidate torque. Returns true if sustained.
+				auto probeCandidate = [&](float candidate) -> bool {
 					// 1. Rest the rotor so the spin-up starts from standstill.
 					applySafeTorque(0); g_tmc4671_cogging_debug.accel_test_current = 0.0f;
 					waitForRest();
 
-					// 2. Spin up with dmax to guarantee motion.
-					applyTorqueFF(dmax_torque);
+				// 2. Spin up with BREAKAWAY torque (dmax only sustains — it can't reliably
+				//    free a rotor parked at the worst cogging detent from standstill).
+					float spinup = dmax_torque * 1.5f;
+					if (spinup > max_test_torque * 0.6f) spinup = max_test_torque * 0.6f;
+					applyTorqueFF(spinup);
 					(void)measureTravel(getEncoder()->getPos(), 500);
 
-					// 3. Drop to the candidate torque.
-					applyTorqueFF(mid);
+					// 3. Drop to the candidate torque and let the transient settle.
+					applyTorqueFF(candidate);
 					int32_t p_settle = getEncoder()->getPos();
-					(void)measureTravel(p_settle, 200);   // let transient settle
+					(void)measureTravel(p_settle, 200);
 
-					// 4. Measure speed.  If the rotor is still moving after
-					//    the settle, this candidate sustains rotation.
-					int32_t p_meas = getEncoder()->getPos();
-					float moved = measureTravel(p_meas, 250);
-					float v = moved / 0.25f;  // turns/s over 250 ms window
-					bool sustains = (v > 0.0005f);  // ~0.03 RPM
-					broadcastCalibLog(0, "Accel DFT: dmin probe %5.0f -> v %.4f t/s (%.1f RPM) %s",
-						mid, v, v * 60.0f, sustains ? "sustain" : "coast-down");
+					// 4. Measure: still moving after settle means candidate sustains.
+					(void)measureTravel(getEncoder()->getPos(), 250);
+					float v_rpm = g_tmc4671_cogging_debug.accel_vel_now;
+					bool sustains = (v_rpm / 60.0f > DMIN_VEL_THRESH);
+					broadcastCalibLog(0, "Accel DFT: dmin probe %5.0f -> %.0f RPM %s",
+						candidate, v_rpm, sustains ? "sustain" : "coast-down");
+					return sustains;
+				};
 
-					if (sustains) dmin_hi = mid; else dmin_lo = mid;
+				// --- Phase 1: descend from dmax-1 until first coast-down ---
+				broadcastCalibLog(0, "Accel DFT: finding dmin (descend from %.0f, step -1)...", dmax_torque);
+				float stall_point = dmax_torque;
+				for (float candidate = dmax_torque - 1.0f;
+					 candidate >= DMIN_FLOOR && !emergency && hasPower();
+					 candidate -= 1.0f) {
+					if (!probeCandidate(candidate)) {
+						stall_point = candidate;
+						break;
+					}
 				}
-				dmin_torque = dmin_hi;
-				if (dmin_torque < 5.0f) dmin_torque = 5.0f;
+
+				// --- Phase 2: ascend from stall_point+1 until first sustain ---
+				if (stall_point < dmax_torque) {
+					broadcastCalibLog(0, "Accel DFT: dmin verifying ascent from %.0f...", stall_point + 1.0f);
+					for (float candidate = stall_point + 1.0f;
+						 candidate <= dmax_torque && !emergency && hasPower();
+						 candidate += 1.0f) {
+						if (probeCandidate(candidate)) {
+							dmin_torque_local = candidate;
+							break;
+						}
+					}
+				}
+
+				dmin_torque = dmin_torque_local;
+				if (dmin_torque < DMIN_FLOOR) dmin_torque = DMIN_FLOOR;
 				if (dmin_torque > dmax_torque) dmin_torque = dmax_torque;
 				broadcastCalibLog(0, "Accel DFT: dmin = %.0f", dmin_torque);
 
@@ -6618,6 +6769,8 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 						float j_vel = getWrappedError(j_prev_p, jp) / 0.15f; // turns/s over ~150ms window
 						j_prev_p = jp;
 						g_tmc4671_cogging_debug.accel_vel_now = 60.0f * fabs(j_vel);
+						g_tmc4671_cogging_debug.accel_vel_rpm = 60.0f * fabs(j_vel);
+						g_tmc4671_cogging_debug.accel_vel_turns_s = j_vel;
 						float j_cog = 0.0f;
 						{ float jr = jp * 2.0f * PI;
 						  for (uint8_t h = 0; h < COGGING_HARMONICS_COUNT; h++)
@@ -6657,31 +6810,31 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				g_tmc4671_cogging_debug.accel_debug_phase = (uint32_t)TMC4671CoggingDebugPhase::AccelDFT_Sweep;
 
 				for (int8_t pd : {1, -1}) {
-					const uint8_t MAX_STALL_RETRIES = 4;
-					uint8_t stall_retries = 0;
+					// No retry cap: dmax climbs until the motor breaks free of the worst
+					// cogging detent. The only ceiling is DMAX_CAP (max_test_torque*0.7).
+					const float SWEEP_DMAX_CAP = max_test_torque * 0.7f;
+					uint16_t stall_retries = 0;
 					bool sweep_ok = false;
 
-					while (!sweep_ok && stall_retries < MAX_STALL_RETRIES && !emergency && hasPower()) {
+					while (!sweep_ok && dmax_torque < SWEEP_DMAX_CAP && !emergency && hasPower()) {
 						applySafeTorque(0); g_tmc4671_cogging_debug.accel_test_current = 0.0f;
 						{ uint32_t s0 = HAL_GetTick(); float sp0 = getFilteredPosition(); float cdist_rest = 0.0f;
 						  while (HAL_GetTick() - s0 < 1000 && !emergency) { float scp = getFilteredPosition(); cdist_rest += fabs(getWrappedError(sp0, scp)); sp0 = scp; g_tmc4671_cogging_debug.accel_vel_now = 60.0f * cdist_rest / ((float)(HAL_GetTick() - s0 + 1) / 1000.0f); Delay(100); refreshWatchdog(); } }
-						float restart_t = dmax_torque * (float)pd;
-						float sustain_t = dmin_torque * (float)pd;
-						applySafeTorque(restart_t);
-						g_tmc4671_cogging_debug.accel_test_current = restart_t;
+					float restart_t = dmax_torque * 1.5f * (float)pd;
+					float sustain_t = dmin_torque * (float)pd;
 						const char* dir = (pd==1)?"CW":"CCW";
 						if (stall_retries == 0)
 							broadcastCalibLog(0, "Accel DFT: %s sweep dmax=%.0f dmin=%.0f", dir, dmax_torque, dmin_torque);
 						else
 							broadcastCalibLog(0, "Accel DFT: %s retry %u dmax=%.0f dmin=%.0f", dir, stall_retries, dmax_torque, dmin_torque);
-						// Wait for motor to get moving
-				{ uint32_t r0 = HAL_GetTick();
-				  while (HAL_GetTick() - r0 < 800 && !emergency) {
-					g_tmc4671_cogging_debug.accel_vel_now = fabsf(getVelocity()) * 60.0f;
-					refreshWatchdog(); Delay(20); } }
-				// Drop to dmin for sustained slow rotation
-				applySafeTorque(sustain_t);
-				g_tmc4671_cogging_debug.accel_test_current = sustain_t;
+					// Spin-up: continuously apply (breakaway + FF) for 800ms.
+					// ffWait applies calib_ff_base_torque + cogging FF every 5ms,
+					// tracking position so the detent is canceled as the rotor moves.
+					// A one-shot applyTorqueFF() leaves torque stale during the wait.
+					calib_ff_base_torque = restart_t;
+					ffWait(800);
+			// Drop to dmin for sustained slow rotation
+			calib_ff_base_torque = sustain_t;
 
 				memset(iq_bin_sum, 0, COGGING_DFT_BIN_COUNT * sizeof(float));
 				memset(iq_bin_count, 0, COGGING_DFT_BIN_COUNT * sizeof(uint16_t));
@@ -6692,13 +6845,32 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				uint32_t aec = 0, adc = 0; float adist = 0.0f;
 				const uint32_t AWM = 1500, ASTALL = 3000, AREV = 20000;
 
+				// Per-sweep velocity-delta state (resets each direction sweep).
+				float prev_ap_accel = 0.0f; bool prev_ap_valid_accel = false;
+				float prev_av = 0.0f; bool prev_av_valid = false;
+
 				startCalibTimers(TIM_TMC_ARR);
 				while (HAL_GetTick() - astart < AREV && !emergency && hasPower()) {
 					ant += ap_us;
 					float ap = getFilteredPosition();
-					// Use ISR-computed velocity — guaranteed-correct dt, synchronized with position
-					float av = getVelocity();
+					// Velocity from position delta — works for all encoder types
+					float av = 0.0f;
+					if (prev_ap_valid_accel) {
+						av = getWrappedError(prev_ap_accel, ap) / adt;
+					} else { prev_ap_valid_accel = true; }
+					prev_ap_accel = ap;
 					g_tmc4671_cogging_debug.accel_vel_now = 60.0f * av;
+					g_tmc4671_cogging_debug.accel_vel_rpm = 60.0f * fabsf(av);
+					g_tmc4671_cogging_debug.accel_vel_turns_s = av;
+					// Acceleration: change in velocity / delta-t between sweeps.
+					{
+						float accel = 0.0f;
+						if (prev_av_valid) {
+							accel = (av - prev_av) / adt;
+						}
+						prev_av = av; prev_av_valid = true;
+						g_tmc4671_cogging_debug.accel_accel_rad = accel * 2.0f * PI;
+					}
 
 					// FF from existing PID-DFT table
 					float acog = 0.0f;
@@ -6719,13 +6891,14 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 							iq_bin_sum[ab] += av; if (iq_bin_count[ab] != 0xFFFF) iq_bin_count[ab]++;
 						} adc++;
 					}
-					// Stall check: ramp dmax and dmin +1 so sustain torque also increases
+					// Stall check: increase dmax ONLY (dmin stays at its calibrated value).
+					// A stall is a breakaway failure — the worst cogging detent needs more
+					// torque than dmax currently provides. The sustain (dmin) is unaffected.
 					if (HAL_GetTick() - astart > AWM + ASTALL && adist < 0.05f) {
 						stopCalibTimers(); applySafeTorque(0);
 						dmax_torque += 1.0f;
-						dmin_torque += 1.0f;
+						if (dmax_torque > SWEEP_DMAX_CAP) dmax_torque = SWEEP_DMAX_CAP;
 						g_tmc4671_cogging_debug.accel_dmax = dmax_torque;
-						g_tmc4671_cogging_debug.accel_dmin = dmin_torque;
 						goto sweep_retry;
 					}
 					aec++;
@@ -6739,16 +6912,15 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				// If we collected enough data, sweep is OK
 				sweep_ok = (adist >= 0.05f);
 				if (!sweep_ok) {
-					dmax_torque += 1.0f;
-					dmin_torque += 1.0f;
+					dmax_torque += 1.0f;   // dmax only — sustain torque unchanged
+					if (dmax_torque > SWEEP_DMAX_CAP) dmax_torque = SWEEP_DMAX_CAP;
 					g_tmc4671_cogging_debug.accel_dmax = dmax_torque;
-					g_tmc4671_cogging_debug.accel_dmin = dmin_torque;
 				}
 				sweep_retry:
 				stall_retries++;
 				} // while retry loop
 				if (!sweep_ok) {
-					broadcastCalibLog(0, "Accel DFT: %s sweep failed after %u retries", (pd==1)?"CW":"CCW", MAX_STALL_RETRIES);
+					broadcastCalibLog(0, "Accel DFT: %s sweep failed after %u retries", (pd==1)?"CW":"CCW", stall_retries);
 					continue; // skip DFT extraction for this direction
 				}
 
@@ -7048,6 +7220,12 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 	}
 
 cleanup:
+	// Stop background cogging FF before restoring hardware state.
+	this->calib_ff_active = false;
+	this->calib_ff_base_torque = 0.0f;
+	this->active_tbl = nullptr;
+	applySafeTorque(0);
+
 	dbg.phase = static_cast<uint32_t>((errorMessage != nullptr || emergency) ? TMC4671CoggingDebugPhase::Aborted : TMC4671CoggingDebugPhase::Completed);
 	if (errorMessage) {
 		broadcastCalibLog(1, errorMessage);

@@ -7,3 +7,8 @@ check_braces.py
 doc/position_sampler_plan.md
 doc/sampler_audit.md
 doc/sampler_crash_fix.md
+doc/background_ff_issues.md
+doc/background_ff_plan.md
+doc/sampler_velocity_fix_v2.md
+doc/sampler_velocity_fix.md
+.vscode/mcp.json

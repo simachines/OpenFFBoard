@@ -152,9 +152,25 @@ struct TMC4671CoggingDebugVars {
 	float accel_J = 0.0f;
 	float accel_omega = 0.0f;
 	float accel_vel_now = 0.0f;
+	float accel_vel_rpm = 0.0f;
+	float accel_vel_turns_s = 0.0f;
+	float accel_accel_rad = 0.0f;
 	float accel_test_current = 0.0f;
 	uint32_t accel_debug_phase = 0;
 #endif
+
+	// --- Position diagnostics (populated every turn() for MCU Viewer) ---
+	// Compares multi-turn hardware read vs sampler cache to locate the
+	// single-turn wrap bug at runtime. rt_* = runtime, hw_* = hardware read.
+	float pos_rt_posf = 0.0f;        // getFilteredPosition() — what cogging uses
+	float pos_rt_encangle_deg = 0.0f; // 360 * getPos_f() — what Axis uses
+	float pos_hw_posf = 0.0f;        // getPos_f() directly (multi-turn if mtpos works)
+	float pos_hw_posabsf = 0.0f;     // getPosAbs_f() directly
+	int32_t pos_hw_raw = 0;          // getPos() raw counts
+	int32_t pos_hw_rawabs = 0;       // getPosAbs() raw counts
+	uint32_t pos_cpr = 0;            // encoder counts per rev
+	uint32_t pos_sampler_active = 0; // 1 = cache active, 0 = passthrough
+	float pos_cache_posf = 0.0f;     // cached_pos_f (the sampler's stored value)
 };
 
 extern volatile TMC4671CoggingDebugVars g_tmc4671_cogging_debug;
@@ -791,6 +807,15 @@ protected:
 	};
 	std::unique_ptr<TMC_SamplerThread> samplerThread = nullptr;
 
+	// Background cogging FF for calibration.
+	// Caller writes calib_ff_base_torque; the sampler thread applies (base + FF) at 5 kHz.
+	volatile float calib_ff_base_torque = 0.0f;
+	volatile bool calib_ff_active = false;
+	// Pointer to the active harmonic table (cogging_harmonics / _rpm2 / _rpm3).
+	// Set at top of RPM profile loop. Null = FF computes zero.
+	Harmonic* active_tbl = nullptr;
+	volatile float calib_max_torque = 2000.0f;
+
 	static std::span<const TMC4671HardwareTypeConf> tmc4671_hw_configs; // Can override in external target file
 
 private:
@@ -1002,6 +1027,8 @@ private:
 
 	// Calibration helpers
 	void applySafeTorque(float torque_cmd);
+	// INTERNAL — only the sampler thread calls this.
+	float computeCoggingFF(float pos_f);
 	float getAbsolutePosition();
 	float getWrappedError(float target, float actual);
 	float getFilteredPosition();

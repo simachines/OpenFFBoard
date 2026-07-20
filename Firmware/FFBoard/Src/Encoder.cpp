@@ -115,9 +115,16 @@ void Encoder::sampleNow() {
 	uint32_t now = micros();
 
 	int32_t rem = raw % icpr;
-	if (rem < 0) rem += icpr;
-	float pos_f = (float)rem / (float)icpr;
 	int32_t turns = raw / icpr;
+	// C++ / and % truncate toward zero, not floor. For negative raw the
+	// remainder is negative; adjusting it to positive WITHOUT decrementing
+	// turns shifts the multi-turn position by +1 rev, causing a full 360°
+	// discontinuity every time raw crosses zero. Correct to floor semantics.
+	if (rem < 0) {
+		rem += icpr;
+		turns -= 1;
+	}
+	float pos_f = (float)rem / (float)icpr;
 	float pos_abs_f = (float)turns + pos_f;
 
 	// dt = actual elapsed microseconds (absorbs thread-wake jitter).
