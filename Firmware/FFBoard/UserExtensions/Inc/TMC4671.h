@@ -536,7 +536,10 @@ coggingCalibCount, coggingCalibRPM, coggingCalibIters, coggingCalibPidP, cogging
 coggingCalibInertiaCorr,
 coggingCalibFrictionFF,
 coggingBins,
-coggingFFMode
+coggingFFMode,
+coggingAccelDFT, coggingAccelDmax, coggingAccelDmin,
+coggingSkipAccelDFT,
+coggingAbort, coggingTestTorque
 #endif
 	};
 
@@ -988,8 +991,17 @@ private:
 	bool cogging_calib_autoPid = true;
 	bool cogging_calib_inertiaCorr;  // Inertia acceleration correction during DFT
 	bool cogging_calib_frictionFF = false; // Friction feedforward during DFT
+	bool cogging_skip_accel_dft = false;   // Skip accel DFT in calibration, finish after PID-DFT
 #ifdef COGGING_ACCEL_BASED_DFT
 	float cogging_calib_hold_current = 200.0f; // Open-loop hold torque for accel-based DFT step
+	// Standalone accel DFT mode: when set, handleStateCoggingCalibration() skips
+	// PID-DFT and runs only the accel DFT sweep using existing harmonic tables.
+	bool cogging_accel_only_mode = false;
+	float cogging_accel_dmax_override = 0.0f;  // User-supplied dmax (0 = auto-detect)
+	float cogging_accel_dmin_override = 0.0f;  // User-supplied dmin (0 = auto-detect)
+	// Manual torque injection test: apply a constant current and hold until stopped.
+	bool cogging_test_torque_active = false;
+	float cogging_test_torque_value = 0.0f;
 #endif
 	void handleStateCoggingCalibration();
 	void blendHarmonicTables(float rpm, Harmonic* out_table);

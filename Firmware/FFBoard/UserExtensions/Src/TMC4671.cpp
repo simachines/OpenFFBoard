@@ -3091,6 +3091,12 @@ void TMC4671::registerCommands(){
 	registerCommand("coggingCalibFrictionFF", TMC4671_commands::coggingCalibFrictionFF, "Get/Set friction feedforward during DFT (1=on,0=off)",CMDFLAG_GET | CMDFLAG_SET);
 	registerCommand("coggingBins", TMC4671_commands::coggingBins, "Get spatial bin snapshots (adr 0=CW 1=CCW 2=verCW 3=verCCW 4=verCWharm 5=verCCWharm)",CMDFLAG_GET | CMDFLAG_GETADR);
 	registerCommand("coggingFFMode", TMC4671_commands::coggingFFMode, "FF source: 0=harmonics 1=combined bins 2=per-direction bins",CMDFLAG_GET | CMDFLAG_SET);
+	registerCommand("coggingAccelDFT", TMC4671_commands::coggingAccelDFT, "Run standalone accel DFT sweep (requires existing harmonic table)",CMDFLAG_GET);
+	registerCommand("coggingAccelDmax", TMC4671_commands::coggingAccelDmax, "Get/Set manual dmax override for accel DFT (0=auto)",CMDFLAG_GET | CMDFLAG_SET);
+	registerCommand("coggingAccelDmin", TMC4671_commands::coggingAccelDmin, "Get/Set manual dmin override for accel DFT (0=auto)",CMDFLAG_GET | CMDFLAG_SET);
+	registerCommand("coggingSkipAccelDFT", TMC4671_commands::coggingSkipAccelDFT, "Get/Set skip-accel-DFT flag (1=skip accel DFT after PID-DFT)",CMDFLAG_GET | CMDFLAG_SET);
+	registerCommand("coggingAbort", TMC4671_commands::coggingAbort, "Abort current cogging calibration / accel DFT",CMDFLAG_GET);
+	registerCommand("coggingTestTorque", TMC4671_commands::coggingTestTorque, "Manual torque injection: adr=1 val=mA to start, adr=0 to stop",CMDFLAG_SETADR);
 #endif
 }
 
@@ -3099,7 +3105,13 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 #ifdef COGGING_TABLE_FLASH_START_ADDRESS
 	// During cogging calibration, block all poll commands to avoid SPI contention
 	// and serial log flooding. Only calibration progress broadcasts are allowed through.
-	if (state == TMC_ControlState::CoggingCalibration && static_cast<TMC4671_commands>(cmd.cmdId) != TMC4671_commands::calibrateCogging) {
+	// Allow abort and accel DFT commands to pass through during calibration.
+	if (state == TMC_ControlState::CoggingCalibration
+		&& static_cast<TMC4671_commands>(cmd.cmdId) != TMC4671_commands::calibrateCogging
+		&& static_cast<TMC4671_commands>(cmd.cmdId) != TMC4671_commands::coggingAbort
+		&& static_cast<TMC4671_commands>(cmd.cmdId) != TMC4671_commands::coggingAccelDFT
+		&& static_cast<TMC4671_commands>(cmd.cmdId) != TMC4671_commands::coggingTestTorque
+		&& static_cast<TMC4671_commands>(cmd.cmdId) != TMC4671_commands::acttrq) {
 		return CommandStatus::NO_REPLY;
 	}
 #endif
@@ -3872,6 +3884,75 @@ CommandStatus TMC4671::command(const ParsedCommand& cmd,std::vector<CommandReply
 			this->cogging_ff_mode = m;
 		}
 		break;
+
+	case TMC4671_commands::coggingAccelDFT:
+		// Standalone accel DFT sweep: runs only the velocity-based DFT,
+		// using the existing harmonic table as feedforward. Requires that
+		// a PID-DFT calibration has already populated the table.
+		if (emergency && hasPower()) {
+			replies.emplace_back("Accel DFT aborted: Emergency stop engaged", 0);
+		} else if (conf.motconf.motor_type == MotorType::NONE) {
+			replies.emplace_back("Accel DFT aborted: No motor type set", 0);
+		} else {
+			this->cogging_accel_only_mode = true;
+			this->cogging_skip_accel_dft = false;
+			changeState(TMC_ControlState::CoggingCalibration);
+			return CommandStatus::NO_REPLY;
+		}
+		break;
+
+	case TMC4671_commands::coggingAccelDmax:
+		handleGetSet(cmd, replies, this->cogging_accel_dmax_override);
+		break;
+
+	case TMC4671_commands::coggingAccelDmin:
+		handleGetSet(cmd, replies, this->cogging_accel_dmin_override);
+		break;
+
+	case TMC4671_commands::coggingSkipAccelDFT:
+		handleGetSet(cmd, replies, this->cogging_skip_accel_dft);
+		break;
+
+	case TMC4671_commands::coggingTestTorque:
+		// Manual torque injection: adr=1 val=mA starts, adr=0 stops.
+		// Enters CoggingCalibration state in a simple hold loop.
+		if (cmd.type == CMDtype::setat) {
+			if (cmd.adr == 0) {
+				// Stop test torque
+				this->cogging_test_torque_active = false;
+				replies.emplace_back("Test torque stopped", 0);
+			} else if (cmd.adr == 1) {
+				// Start test torque
+				if (emergency && hasPower()) {
+					replies.emplace_back("Cannot start: emergency stop engaged", 0);
+				} else if (conf.motconf.motor_type == MotorType::NONE) {
+					replies.emplace_back("Cannot start: No motor type set", 0);
+				} else {
+					this->cogging_test_torque_value = (float)(int16_t)cmd.val;
+					this->cogging_test_torque_active = true;
+					this->cogging_accel_only_mode = false;
+					this->cogging_skip_accel_dft = false;
+					changeState(TMC_ControlState::CoggingCalibration);
+					return CommandStatus::NO_REPLY;
+				}
+			}
+		}
+		break;
+
+	case TMC4671_commands::coggingAbort:
+		// Abort any running cogging calibration or accel DFT.
+		// Sets emergency flag so all calibration loops exit cleanly.
+		// Does NOT release the motor enable pin (gentle abort).
+		if (state == TMC_ControlState::CoggingCalibration) {
+			CommandHandler::broadcastCommandReply(
+				CommandReply("(\"Calibration aborted by user\",1)"),
+				(uint32_t)TMC4671_commands::calibrateCogging, CMDtype::get);
+			this->emergency = true;
+			replies.emplace_back("Aborted", 0);
+		} else {
+			replies.emplace_back("No calibration running", 0);
+		}
+		break;
 #endif
 
 		default:
@@ -4563,12 +4644,73 @@ void TMC4671::handleStateCoggingCalibration() {
 	
 
 	broadcastCalibLog(0, "Starting Cogging Calibration: Continuous DFT...");
+
+	// Broadcast empty harmonic tables so the configurator clears its display.
+	// Each profile (0=base,1=RPM2,2=RPM3) gets an empty "profile:N:0:0:0" packet.
+	for (uint8_t pa = 0; pa < 3; pa++) {
+		CommandHandler::broadcastCommandReply(
+			CommandReply("profile:" + std::to_string(pa + 1) + ":0:0:0", pa),
+			(uint32_t)TMC4671_commands::coggingHarmonics, CMDtype::get);
+	}
+	// Also clear CW/CCW raw display
+	CommandHandler::broadcastCommandReply(
+		CommandReply("CWD:0:0:0", 0),
+		(uint32_t)TMC4671_commands::coggingCwCcw, CMDtype::get);
+	CommandHandler::broadcastCommandReply(
+		CommandReply("CCWD:0:0:0", 0),
+		(uint32_t)TMC4671_commands::coggingCwCcw, CMDtype::get);
 	
 	if (this->getCpr() == 0) { 
 		errorMessage = "Abort: CPR is 0"; 
 		goto cleanup; 
 	}
-	
+
+#ifdef COGGING_ACCEL_BASED_DFT
+	// --- MANUAL TORQUE INJECTION TEST ---
+	// Simple hold loop: apply a constant current and broadcast RPM
+	// until the user stops it or emergency is triggered.
+	if (this->cogging_test_torque_active) {
+		broadcastCalibLog(0, "Test torque: applying %.0f mA...", (double)this->cogging_test_torque_value);
+		dbg.phase = static_cast<uint32_t>(TMC4671CoggingDebugPhase::AccelDFT_Idle);
+
+		// Switch to torque mode (same as calibration does)
+		setMotionMode(MotionMode::torque, true);
+
+		applySafeTorque(this->cogging_test_torque_value);
+		float prev_pos = getFilteredPosition();
+		uint32_t lastRpmReport = HAL_GetTick();
+
+		while (this->cogging_test_torque_active && !emergency && hasPower()) {
+			applySafeTorque(this->cogging_test_torque_value);
+			refreshWatchdog();
+
+			// Compute RPM from position delta and broadcast every 200ms
+			if (HAL_GetTick() - lastRpmReport >= 200) {
+				float pos = getFilteredPosition();
+				float dt_min = (float)(HAL_GetTick() - lastRpmReport) / 60000.0f;
+				float rpm = 0.0f;
+				if (dt_min > 0.0f) {
+					rpm = fabsf(getWrappedError(prev_pos, pos)) / dt_min;
+				}
+				prev_pos = pos;
+				lastRpmReport = HAL_GetTick();
+				broadcastCalibLog(0, "RPM: %.1f  Torque: %.0f mA", (double)rpm, (double)this->cogging_test_torque_value);
+			}
+
+			Delay(10);
+		}
+
+		applySafeTorque(0);
+		broadcastCalibLog(0, "Test torque stopped");
+
+		// Restore motion mode
+		setMotionMode(prevCalibMode, true);
+
+		dbg.phase = static_cast<uint32_t>(TMC4671CoggingDebugPhase::Completed);
+		goto cleanup;
+	}
+#endif
+
 	allowStateChange = false;
 	// Baseline plateau: full compensation at low RPM, zero phase advance.
 	scale_curve_values[0] = 1.0f;
@@ -5094,12 +5236,38 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 			}
 			arm_pid_init_f32(&pid_soft, 1);
 
+#ifdef COGGING_ACCEL_BASED_DFT
+			// Standalone accel DFT mode: skip PID-DFT, run only the accel sweep.
+			// total_samples and any_profile_succeeded are set so the post-profile
+			// checks pass; the accel DFT guard (total_samples > 0) also passes.
+			if (this->cogging_accel_only_mode) {
+				total_samples = 1;
+				any_profile_succeeded = true;
+				// Override dmax/dmin from user input if provided. The accel DFT
+				// code below reads these from dbg.accel_dmax/dmin or computes
+				// them auto; we preload the overrides here.
+				if (this->cogging_accel_dmax_override > 0.0f)
+					g_tmc4671_cogging_debug.accel_dmax = this->cogging_accel_dmax_override;
+				if (this->cogging_accel_dmin_override > 0.0f)
+					g_tmc4671_cogging_debug.accel_dmin = this->cogging_accel_dmin_override;
+				broadcastCalibLog(0, "Standalone Accel DFT: %.1f RPM, dmax=%.0f dmin=%.0f",
+					calib_rpm,
+					g_tmc4671_cogging_debug.accel_dmax,
+					g_tmc4671_cogging_debug.accel_dmin);
+			}
+#endif
+
 // --- P-GAIN AUTO-TUNING SEQUENCE ---
 			// Run per RPM profile when cogging_calib_autoPid is enabled.
 			// Uses trapezoidal velocity sweeps (accel → cruise → decel) to find
 			// the optimal proportional gain that minimizes position tracking error
 			// without inducing oscillation. I and D are held at zero during tuning.
-			if (this->cogging_calib_autoPid) {
+			// Skipped in standalone accel DFT mode.
+			if (this->cogging_calib_autoPid
+#ifdef COGGING_ACCEL_BASED_DFT
+				&& !this->cogging_accel_only_mode
+#endif
+				) {
 				broadcastCalibLog(0, "Auto-tuning Kp for %.1f RPM...", calib_rpm);
 				dbg.phase = static_cast<uint32_t>(TMC4671CoggingDebugPhase::TuneSweepP);
 
@@ -5428,7 +5596,12 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 			float base_Ki = pid_soft.Ki;
 			float base_Kd = pid_soft.Kd;
 
-			for (uint8_t dft_iter = 0; dft_iter < MAX_DFT_ITERATIONS && !emergency && hasPower(); dft_iter++) {
+			for (uint8_t dft_iter = 0;
+				 dft_iter < MAX_DFT_ITERATIONS && !emergency && hasPower()
+#ifdef COGGING_ACCEL_BASED_DFT
+				 && !this->cogging_accel_only_mode
+#endif
+				 ; dft_iter++) {
 				// Halve PID gains for each extra iteration (÷2, ÷4, ÷8, ...).
 				// Iteration 0 uses full gains; higher iterations use
 				// progressively gentler gains tuned to the shrinking residual.
@@ -6161,7 +6334,12 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 			// Runs CW and CCW sweeps using the finalized table as feedforward,
 			// then prints the detected harmonics per direction so the user can see
 			// how much cogging remains after compensation in each direction.
-			if (!emergency && hasPower() && total_samples > 0) {
+			// Skipped in standalone accel DFT mode.
+			if (!emergency && hasPower() && total_samples > 0
+#ifdef COGGING_ACCEL_BASED_DFT
+				&& !this->cogging_accel_only_mode
+#endif
+				) {
 				broadcastCalibLog(0, "Verification pass: measuring residual with feedforward...");
 				applySafeTorque(0);
 				Delay(500);
@@ -6376,7 +6554,8 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 
 #ifdef COGGING_ACCEL_BASED_DFT
 			// --- ACCELERATION-BASED DFT STEP (Copper/Piccoli method - continuous ramp) ---
-			if (!emergency && hasPower() && total_samples > 0) {
+			// Skipped when cogging_skip_accel_dft is set (user wants to finish after PID-DFT).
+			if (!emergency && hasPower() && total_samples > 0 && !this->cogging_skip_accel_dft) {
 				// FF is now applied inline by ffWait() and measureTravel() —
 				// no background thread dependency. Works for all encoder types.
 				this->calib_max_torque = max_test_torque;
@@ -6418,6 +6597,9 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 					broadcastCalibLog(0, "Accel DFT: vel noise mean=%.5f std=%.5f thresh=%.5f turns/s",
 						v_mean, v_std, vel_thresh);
 				}
+
+			// If user supplied both dmax and dmin overrides, skip auto-detection.
+			bool accel_use_manual_dmaxdmin = (this->cogging_accel_dmax_override > 0.0f && this->cogging_accel_dmin_override > 0.0f);
 
 
 // --- Step B: find dmax/dmin ---
@@ -6524,6 +6706,15 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				}
 				return cdist;
 			};
+
+			// If user supplied both dmax and dmin, skip auto-detection.
+			if (accel_use_manual_dmaxdmin) {
+				dmax_torque = this->cogging_accel_dmax_override;
+				dmin_torque = this->cogging_accel_dmin_override;
+				broadcastCalibLog(0, "Accel DFT: using manual dmax=%.0f dmin=%.0f",
+					dmax_torque, dmin_torque);
+				goto accel_dft_skip_detect;
+			}
 
 			{
 				float start_torque = fabsf(cw_dc_avg);
@@ -6681,13 +6872,11 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 					applyTorqueFF(spinup);
 					(void)measureTravel(getEncoder()->getPos(), 500);
 
-					// 3. Drop to the candidate torque and let the transient settle.
+					// 3. Drop to the candidate torque and measure for 2 s.
+					//    The first part absorbs the mechanical transient (no explicit settle needed);
+					//    instantaneous velocity at the end tells us whether the candidate sustains.
 					applyTorqueFF(candidate);
-					int32_t p_settle = getEncoder()->getPos();
-					(void)measureTravel(p_settle, 200);
-
-					// 4. Measure: still moving after settle means candidate sustains.
-					(void)measureTravel(getEncoder()->getPos(), 250);
+					(void)measureTravel(getEncoder()->getPos(), 3000);
 					float v_rpm = g_tmc4671_cogging_debug.accel_vel_now;
 					bool sustains = (v_rpm / 60.0f > DMIN_VEL_THRESH);
 					broadcastCalibLog(0, "Accel DFT: dmin probe %5.0f -> %.0f RPM %s",
@@ -6730,6 +6919,8 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				g_tmc4671_cogging_debug.accel_dmin = dmin_torque;
 				broadcastCalibLog(0, "Accel DFT: dmax=%.0f dmin=%.0f, %u iterations", dmax_torque, dmin_torque, ACCEL_ITERS);
 			}
+
+			accel_dft_skip_detect:
 
 				// --- ACCEL DFT ITERATION LOOP ---
 				// Each iteration: sweep CW+CCW with current FF table → extract vel DFT →
@@ -6813,6 +7004,9 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 					// No retry cap: dmax climbs until the motor breaks free of the worst
 					// cogging detent. The only ceiling is DMAX_CAP (max_test_torque*0.7).
 					const float SWEEP_DMAX_CAP = max_test_torque * 0.7f;
+					// Instant-velocity stall thresholds. Below SWEEP_STALL_RPM = "dropped to 0".
+					const float SWEEP_STALL_RPM = 0.5f;
+					const uint32_t SWEEP_STALL_CONFIRM_MS = 400;  // 0-vel must persist this long
 					uint16_t stall_retries = 0;
 					bool sweep_ok = false;
 
@@ -6833,8 +7027,21 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 					// A one-shot applyTorqueFF() leaves torque stale during the wait.
 					calib_ff_base_torque = restart_t;
 					ffWait(800);
-			// Drop to dmin for sustained slow rotation
+					// DMAX-PHASE STALL CHECK: read the instant velocity left in
+					// accel_vel_now by ffWait. If it's still ~0 after the dmax*1.5
+					// spin-up, breakaway torque is too low -> boost dmax by 1.
+					if (g_tmc4671_cogging_debug.accel_vel_now < SWEEP_STALL_RPM) {
+						applySafeTorque(0); g_tmc4671_cogging_debug.accel_test_current = 0.0f;
+						dmax_torque += 1.0f;
+						if (dmax_torque > SWEEP_DMAX_CAP) dmax_torque = SWEEP_DMAX_CAP;
+						g_tmc4671_cogging_debug.accel_dmax = dmax_torque;
+						broadcastCalibLog(0, "Accel DFT: %s dmax-phase stall (vel %.1f RPM after spinup), boost dmax -> %.0f",
+							dir, g_tmc4671_cogging_debug.accel_vel_now, dmax_torque);
+						goto sweep_retry;
+					}
 			calib_ff_base_torque = sustain_t;
+				{  // scope guard: keeps dmax-check goto from crossing the
+				   // variable initializations below (C++ jump-past-init error)
 
 				memset(iq_bin_sum, 0, COGGING_DFT_BIN_COUNT * sizeof(float));
 				memset(iq_bin_count, 0, COGGING_DFT_BIN_COUNT * sizeof(uint16_t));
@@ -6843,11 +7050,15 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				uint32_t ap_us = getActualCalibPeriod(TIM_TMC_ARR);
 				uint32_t ant = micros(); float adt = (float)ap_us / 1000000.0f;
 				uint32_t aec = 0, adc = 0; float adist = 0.0f;
-				const uint32_t AWM = 1500, ASTALL = 3000, AREV = 20000;
+				const uint32_t AWM = 1500, AREV = 20000;
 
 				// Per-sweep velocity-delta state (resets each direction sweep).
 				float prev_ap_accel = 0.0f; bool prev_ap_valid_accel = false;
 				float prev_av = 0.0f; bool prev_av_valid = false;
+				// Instant-velocity stall tracking: refreshed whenever the rotor is
+				// moving above SWEEP_STALL_RPM. If HAL_GetTick()-last_moving_ms
+				// exceeds SWEEP_STALL_CONFIRM_MS, velocity has been ~0 constantly.
+				uint32_t last_moving_ms = HAL_GetTick();
 
 				startCalibTimers(TIM_TMC_ARR);
 				while (HAL_GetTick() - astart < AREV && !emergency && hasPower()) {
@@ -6859,9 +7070,19 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 						av = getWrappedError(prev_ap_accel, ap) / adt;
 					} else { prev_ap_valid_accel = true; }
 					prev_ap_accel = ap;
-					g_tmc4671_cogging_debug.accel_vel_now = 60.0f * av;
+					// accel_vel_now is |RPM| (consistent with ffWait, measureTravel,
+					// J-pulse, spin-down — ALL other writers use fabsf). Signed
+					// velocity is still in accel_vel_turns_s for anyone who needs it.
+					// Was 60.0f*av (signed) which made the CW/CCW stall checks below
+					// read negative RPM as "below threshold" in one direction.
+					g_tmc4671_cogging_debug.accel_vel_now = 60.0f * fabsf(av);
 					g_tmc4671_cogging_debug.accel_vel_rpm = 60.0f * fabsf(av);
 					g_tmc4671_cogging_debug.accel_vel_turns_s = av;
+					// Constant instant-velocity monitoring: refresh last_moving_ms
+					// whenever the rotor is actually turning.
+					if (g_tmc4671_cogging_debug.accel_vel_now > SWEEP_STALL_RPM) {
+						last_moving_ms = HAL_GetTick();
+					}
 					// Acceleration: change in velocity / delta-t between sweeps.
 					{
 						float accel = 0.0f;
@@ -6881,7 +7102,7 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 					float at = sustain_t + (this->cogging_scale * acog);
 					at = clip<float,float>(at, -max_test_torque, max_test_torque);
 					applySafeTorque(at);
-					g_tmc4671_cogging_debug.accel_test_current = at;
+					g_tmc4671_cogging_debug.accel_test_current = sustain_t;
 
 					if (HAL_GetTick() - astart > AWM && adist < 1.0f) {
 						adist += fabs(av * adt);
@@ -6891,14 +7112,20 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 							iq_bin_sum[ab] += av; if (iq_bin_count[ab] != 0xFFFF) iq_bin_count[ab]++;
 						} adc++;
 					}
-					// Stall check: increase dmax ONLY (dmin stays at its calibrated value).
-					// A stall is a breakaway failure — the worst cogging detent needs more
-					// torque than dmax currently provides. The sustain (dmin) is unaffected.
-					if (HAL_GetTick() - astart > AWM + ASTALL && adist < 0.05f) {
+					// DMIN-PHASE STALL CHECK: instant velocity is monitored constantly
+					// (last_moving_ms refreshed above every loop tick when vel > threshold).
+					// If it has been ~0 for SWEEP_STALL_CONFIRM_MS after warmup, the
+					// sustain torque (dmin) is too low -> boost dmin by 1. (dmax-phase
+					// failures are caught by the spin-up check, so any stall here is dmin.)
+					if (HAL_GetTick() - astart > AWM &&
+						HAL_GetTick() - last_moving_ms > SWEEP_STALL_CONFIRM_MS) {
 						stopCalibTimers(); applySafeTorque(0);
-						dmax_torque += 1.0f;
-						if (dmax_torque > SWEEP_DMAX_CAP) dmax_torque = SWEEP_DMAX_CAP;
-						g_tmc4671_cogging_debug.accel_dmax = dmax_torque;
+						dmin_torque += 1.0f;
+						if (dmin_torque > dmax_torque) dmin_torque = dmax_torque;
+						g_tmc4671_cogging_debug.accel_dmin = dmin_torque;
+						broadcastCalibLog(0, "Accel DFT: %s dmin-phase stall (vel %.1f RPM, still %.0f ms), boost dmin -> %.0f",
+							dir, g_tmc4671_cogging_debug.accel_vel_now,
+							(float)(HAL_GetTick() - last_moving_ms), dmin_torque);
 						goto sweep_retry;
 					}
 					aec++;
@@ -6912,10 +7139,16 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				// If we collected enough data, sweep is OK
 				sweep_ok = (adist >= 0.05f);
 				if (!sweep_ok) {
-					dmax_torque += 1.0f;   // dmax only — sustain torque unchanged
-					if (dmax_torque > SWEEP_DMAX_CAP) dmax_torque = SWEEP_DMAX_CAP;
-					g_tmc4671_cogging_debug.accel_dmax = dmax_torque;
+					// Sweep ended (AREV timeout) without enough data. dmax already
+					// passed the spin-up check, so the failure is in the sustain
+					// phase -> boost dmin by 1.
+					dmin_torque += 1.0f;
+					if (dmin_torque > dmax_torque) dmin_torque = dmax_torque;
+					g_tmc4671_cogging_debug.accel_dmin = dmin_torque;
+					broadcastCalibLog(0, "Accel DFT: %s sweep-end dmin-phase stall (vel %.1f RPM), boost dmin -> %.0f",
+						dir, g_tmc4671_cogging_debug.accel_vel_now, dmin_torque);
 				}
+				}  // end scope guard
 				sweep_retry:
 				stall_retries++;
 				} // while retry loop
@@ -7064,6 +7297,14 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				  CommandHandler::broadcastCommandReply(CommandReply(hs, pa), (uint32_t)TMC4671_commands::coggingHarmonics, CMDtype::get);
 				  broadcastCalibLog(0, "Accel DFT: table replaced and broadcast"); }
 				} // accel iter loop
+			}
+#endif
+
+			// In standalone accel DFT mode, run only one profile then exit loop.
+#ifdef COGGING_ACCEL_BASED_DFT
+			if (this->cogging_accel_only_mode) {
+				this->cogging_accel_only_mode = false; // clear for next run
+				break;
 			}
 #endif
 
