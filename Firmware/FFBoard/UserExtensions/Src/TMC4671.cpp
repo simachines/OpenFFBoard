@@ -4236,7 +4236,7 @@ void TMC4671::applySafeTorque(float torque_cmd) {
 
 // INTERNAL — only called by TMC_SamplerThread. Caller never uses this.
 float TMC4671::computeCoggingFF(float pos_f) {
-	if (active_tbl == nullptr) return 0.0f;
+	if (!this->cogging_enabled || active_tbl == nullptr) return 0.0f;
 	float cog = 0.0f;
 	float ar = pos_f * 2.0f * PI;
 	for (uint8_t h = 0; h < COGGING_HARMONICS_COUNT; h++) {
@@ -4619,6 +4619,8 @@ void TMC4671::handleStateCoggingCalibration() {
 	// === WIPE ALL PREVIOUS CALIBRATION DATA ===
 	// This must be the first action — before any log, CPR check, or calibration
 	// logic — so the user sees a clean slate as soon as Calibrate is clicked.
+	// Skip the wipe for test-torque mode (needs the existing harmonic table for FF).
+	if (!this->cogging_test_torque_active && !this->cogging_accel_only_mode) {
 	memset(this->cogging_harmonics, 0, sizeof(this->cogging_harmonics));
 	memset(this->cogging_harmonics_rpm2, 0, sizeof(this->cogging_harmonics_rpm2));
 	memset(this->cogging_harmonics_rpm3, 0, sizeof(this->cogging_harmonics_rpm3));
@@ -4641,8 +4643,13 @@ void TMC4671::handleStateCoggingCalibration() {
 	this->rpm3_table_valid = false;
 	this->scale_curve_valid = false;
 	this->phase_adv_curve_valid = false;
+	}
 	
 
+	// Skip the startup-broadcast-and-CPR-check block for test-torque and
+	// accel-only modes.  Those modes need the existing harmonic table intact
+	// for feedforward and must not clear the Configurator's graph display.
+	if (!this->cogging_test_torque_active && !this->cogging_accel_only_mode) {
 	broadcastCalibLog(0, "Starting Cogging Calibration: Continuous DFT...");
 
 	// Broadcast empty harmonic tables so the configurator clears its display.
@@ -4659,6 +4666,7 @@ void TMC4671::handleStateCoggingCalibration() {
 	CommandHandler::broadcastCommandReply(
 		CommandReply("CCWD:0:0:0", 0),
 		(uint32_t)TMC4671_commands::coggingCwCcw, CMDtype::get);
+	}
 	
 	if (this->getCpr() == 0) { 
 		errorMessage = "Abort: CPR is 0"; 
@@ -4667,26 +4675,52 @@ void TMC4671::handleStateCoggingCalibration() {
 
 #ifdef COGGING_ACCEL_BASED_DFT
 	// --- MANUAL TORQUE INJECTION TEST ---
-	// Simple hold loop: apply a constant current and broadcast RPM
+	// Simple hold loop: apply a constant current + anti-cogging FF and broadcast RPM
 	// until the user stops it or emergency is triggered.
 	if (this->cogging_test_torque_active) {
-		broadcastCalibLog(0, "Test torque: applying %.0f mA...", (double)this->cogging_test_torque_value);
+		broadcastCalibLog(0, "Test torque: applying %.0f mA (+ anti-cogging FF)...", (double)this->cogging_test_torque_value);
 		dbg.phase = static_cast<uint32_t>(TMC4671CoggingDebugPhase::AccelDFT_Idle);
 
 		// Switch to torque mode (same as calibration does)
 		setMotionMode(MotionMode::torque, true);
 
-		applySafeTorque(this->cogging_test_torque_value);
+		float test_max_torque = bangInitPower > 0 ? (float)bangInitPower * 0.8f : 2000.0f;
+
+		// Ensure active_tbl points to a valid harmonic table for FF computation
+		Harmonic* saved_active_tbl = this->active_tbl;
+		this->active_tbl = this->cogging_harmonics;
+
 		float prev_pos = getFilteredPosition();
 		uint32_t lastRpmReport = HAL_GetTick();
 
 		while (this->cogging_test_torque_active && !emergency && hasPower()) {
-			applySafeTorque(this->cogging_test_torque_value);
+			float pos = getFilteredPosition();
+			// Compute anti-cogging feedforward from the active harmonic table
+			float cog_ff = 0.0f;
+			if (this->cogging_enabled && this->active_tbl) {
+				float ar = pos * 2.0f * PI;
+				for (uint8_t h = 0; h < COGGING_HARMONICS_COUNT; h++) {
+					if (this->active_tbl[h].amplitude > 0.0f) {
+						cog_ff += this->active_tbl[h].amplitude *
+							arm_sin_f32(ar * this->active_tbl[h].order + this->active_tbl[h].phase);
+					}
+				}
+				cog_ff *= this->cogging_scale;
+			}
+
+			float total_torque = this->cogging_test_torque_value + cog_ff;
+			total_torque = clip<float,float>(total_torque, -test_max_torque, test_max_torque);
+			applySafeTorque(total_torque);
+
+			// Update configurator-visible diagnostics
+			this->last_anticogging_torque = (int16_t)cog_ff;
+			this->last_power_setpoint = (int16_t)this->cogging_test_torque_value;
+			this->last_cogging_scale = this->cogging_scale;
+
 			refreshWatchdog();
 
 			// Compute RPM from position delta and broadcast every 200ms
 			if (HAL_GetTick() - lastRpmReport >= 200) {
-				float pos = getFilteredPosition();
 				float dt_min = (float)(HAL_GetTick() - lastRpmReport) / 60000.0f;
 				float rpm = 0.0f;
 				if (dt_min > 0.0f) {
@@ -4694,13 +4728,17 @@ void TMC4671::handleStateCoggingCalibration() {
 				}
 				prev_pos = pos;
 				lastRpmReport = HAL_GetTick();
-				broadcastCalibLog(0, "RPM: %.1f  Torque: %.0f mA", (double)rpm, (double)this->cogging_test_torque_value);
+				this->measured_rpm = (int16_t)rpm;
+				broadcastCalibLog(0, "RPM: %.1f  Base: %.0f mA  FF: %.0f mA  Total: %.0f mA",
+					(double)rpm, (double)this->cogging_test_torque_value,
+					(double)cog_ff, (double)total_torque);
 			}
 
 			Delay(10);
 		}
 
 		applySafeTorque(0);
+		this->active_tbl = saved_active_tbl;
 		broadcastCalibLog(0, "Test torque stopped");
 
 		// Restore motion mode
@@ -4960,7 +4998,11 @@ void TMC4671::handleStateCoggingCalibration() {
 	// Default J to 10 so it's available even when using manual PID
 	J = 10.0f;
 
-if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
+if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f
+#ifdef COGGING_ACCEL_BASED_DFT
+		&& !this->cogging_accel_only_mode
+#endif
+		) {
 		// SysId: break friction, measure J, measure B, then compute IMC gains
 		// Step 1.1: Break static friction
 		broadcastCalibLog(0, "Step 1.1: Breaking static friction...");
@@ -5138,6 +5180,23 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 			this->cogging_calib_pidD[0] = 0;
 			} else {
 				float dt_soft = (float)TIM_TMC_ARR / 1000000.0f;
+#ifdef COGGING_ACCEL_BASED_DFT
+				// Accel-only mode without stored PID gains: compute IMC defaults from J=10
+				if (this->cogging_accel_only_mode && coggingSpeedP == 0.0f) {
+					float f_bw = clip<float>(16.5f - (0.0047f * J), 6.0f, 15.0f);
+					float freq_khz = 1000.0f / (float)TIM_TMC_ARR;
+					float ki_scale = clip<float>(0.3f / J, 0.0002f, 0.001f) / freq_khz;
+					float wn = 2.0f * PI * f_bw;
+					pid_soft.Kp = (2.0f * wn * J) * resolution_penalty;
+					pid_soft.Ki = wn * wn * J * ki_scale;
+					pid_soft.Kd = 0.0f;
+					pid_soft.Kp = clip<float,float>(pid_soft.Kp, 50.0f, 250000.0f);
+					pid_soft.Ki = clip<float,float>(pid_soft.Ki, 1.0f, 100000.0f);
+					imc_kp = pid_soft.Kp;
+					broadcastCalibLog(0, "Accel DFT: IMC defaults (J=10) -> Kp:%.0f Ki:%.0f", pid_soft.Kp, pid_soft.Ki);
+				} else
+#endif
+				{
 				pid_soft.Kp = coggingSpeedP;
 				pid_soft.Ki = coggingSpeedI;
 				pid_soft.Kd = coggingSpeedD / dt_soft;
@@ -5150,6 +5209,7 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 				this->cogging_calib_pidD[0] = (uint32_t)coggingSpeedD;
 #endif
 				broadcastCalibLog(0, "Manual PID Override -> Kp:%.0f Ki:%.0f Kd:%.0f", pid_soft.Kp, pid_soft.Ki, pid_soft.Kd);
+				}
 			}
 			arm_pid_init_f32(&pid_soft, 1);
 			Delay(250);
@@ -5565,8 +5625,15 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 			if (rpm_profile == 1) active_tbl = this->cogging_harmonics_rpm2;
 			else if (rpm_profile >= 2) active_tbl = this->cogging_harmonics_rpm3;
 			this->active_tbl = active_tbl;
-			memset(active_tbl, 0, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
-			this->cogging_scale = 1.0f;
+#ifdef COGGING_ACCEL_BASED_DFT
+			// Accel-only mode preserves the existing harmonic table for merging.
+			// The PID-DFT wipe would erase the baseline that the accel DFT refines.
+			if (!this->cogging_accel_only_mode)
+#endif
+			{
+				memset(active_tbl, 0, COGGING_HARMONICS_COUNT * sizeof(Harmonic));
+				this->cogging_scale = 1.0f;
+			}
 			// Background FF stays OFF during PID-DFT — the DFT loop applies
 			// torque directly via applySafeTorque(). If FF were ON, the
 			// sampler thread would fight the DFT loop during WaitForNotification()
@@ -7295,7 +7362,7 @@ if (coggingSpeedP == 0.0f && coggingSpeedI == 0.0f) {
 					} }
 				  if (!any) hs += "0:0:0";
 				  CommandHandler::broadcastCommandReply(CommandReply(hs, pa), (uint32_t)TMC4671_commands::coggingHarmonics, CMDtype::get);
-				  broadcastCalibLog(0, "Accel DFT: table replaced and broadcast"); }
+				  broadcastCalibLog(0, "Accel DFT: table merged and broadcast"); }
 				} // accel iter loop
 			}
 #endif
@@ -7490,6 +7557,27 @@ cleanup:
 	curFilters.flux.params.enable = true;
 	setBiquadFlux(curFilters.flux);
 	setMotionMode(prevCalibMode, true);
+
+	// Preserve current angle so position stays inbounds (within one turn).
+	// The normal completion path above sets accelPosWasReset=true after
+	// wrapping. If we reach cleanup without that (emergency abort, error,
+	// or any other early exit), do the wrapping here so the Axis
+	// out-of-bounds check doesn't fire.
+	if (!accelPosWasReset) {
+		Encoder* enc = getEncoder();
+		if (enc != nullptr) {
+			float frac_pos = getFilteredPosition();
+			int32_t cpr = enc->getCpr();
+			if (cpr > 0) {
+				int32_t new_pos = (int32_t)(frac_pos * (float)cpr);
+				enc->setPos(new_pos);
+				accelPosWasReset = true;
+			} else {
+				setTmcPos(0);
+				accelPosWasReset = true;
+			}
+		}
+	}
 
 	allowStateChange = true;
 	// Transition to a stable state; skip EncoderInit if position was reset
